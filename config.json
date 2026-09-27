@@ -1,0 +1,10 @@
+{
+  "chrome_path": "",
+  "headless": true,
+  "course_delay": 1.2,
+  "page_wait": 3.0,
+  "max_courses": 0,
+  "open_report": true,
+  "cpi": "",
+  "user_agent": ""
+}
