@@ -1090,8 +1090,11 @@ def _open_course_page(page, c, cpi, cfg) -> dict:
             return {'ok': True, 'reason': ''}
         why = ((page.evaluate(JS_PAGE_HEALTH) or {}).get('why')) or '页面未加载出课程导航'
         if attempt == 1:
-            log('  ⚠ 课程页没有渲染出导航（%s），隔 2 秒重试一次…' % why, 'warn')
-            time.sleep(2.0)
+            # 重试前等多久要看原因：单纯慢 2 秒就够；
+            # 撞了风控 2 秒根本缓不过来（实测连续 28 门全挂），必须长冷却
+            wait = 20.0 if '安全验证' in why or '频繁' in why else 2.0
+            log('  ⚠ 课程页没有渲染出导航（%s），隔 %d 秒重试一次…' % (why, wait), 'warn')
+            time.sleep(wait)
     return {'ok': False, 'reason': why}
 
 
@@ -1145,9 +1148,10 @@ def fetch_exam(page, c, cpi, cfg) -> dict:
         if res['items'] or '暂无考试' in body or (len(body) >= 200 and not why):
             break
         if attempt == 1:
-            log('  ⚠ 考试页疑似没有加载出来（%s），隔 2 秒重试一次…'
-                % (why or '内容异常'), 'warn')
-            time.sleep(2.0)
+            wait = 20.0 if ('安全验证' in why or '频繁' in why) else 2.0
+            log('  ⚠ 考试页疑似没有加载出来（%s），隔 %d 秒重试一次…'
+                % (why or '内容异常', wait), 'warn')
+            time.sleep(wait)
     else:
         return {'items': [], 'count': '', 'empty': True, 'no_module': False,
                 'page_failed': True,
@@ -1343,6 +1347,9 @@ def scan(cfg, limit=0, headless=None, open_report=None, deep=True, only=None) ->
         banner('逐门课抓取（共 %d 门）' % len(courses))
         results = []
         stopped = False
+        risk_streak = 0   # 连续「页面未加载」的课程数
+        seen_risk = False  # 本次扫描是否撞过风控——撞过就全程保持大间隔，不再贴地飞行
+        cool_downs = 0    # 已做的全局长冷却次数（最多 2 次，之后止损中止）
         for i, c in enumerate(courses, 1):
             # 课程边界检查点：暂停在此生效，中止在此干净收尾（已抓到的结果不丢）
             if not checkpoint('course:%d/%d' % (i, len(courses))):
@@ -1398,12 +1405,48 @@ def scan(cfg, limit=0, headless=None, open_report=None, deep=True, only=None) ->
                 extra = ' · 未完成章节 %d' % len(pd.get('pending') or [])
             log('[%2d/%2d] %-34s %s · %s%s' % (i, len(courses), cut(c['name'], 34),
                                                hw_txt, ex_txt, extra))
-            # 自适应课间间隔：一切正常时贴着下限走（省时间）；
-            # 哪门课页面出了状况就自动退避拉长，给平台喘息，避免连环被拦。
+            # ---- 风控防护 -------------------------------------------------
+            # 实测教训：0.6 秒的课间间隔在部分网络下会触发平台安全验证，
+            # 且风控一旦触发，2 秒的重试间隔缓不过来，越撞越死（连挂 28 门）。
+            # 所以：① 撞过一次风控，本次扫描全程用大间隔；
+            #       ② 连续 3 门失败 → 全局长冷却 45/90 秒；
+            #       ③ 冷却 2 次仍连挂 → 止损中止，别再消耗账号印象分。
             bad = bool(hw.get('page_failed') or ex.get('page_failed')
                        or (pd or {}).get('page_failed'))
+            if bad:
+                risk_streak += 1
+                seen_risk = True
+            else:
+                risk_streak = 0
+            if bad and risk_streak >= 3:
+                if cool_downs >= 2:
+                    log('')
+                    log('⚠ 连续 %d 门课页面都没加载出来，风控没有解除，'
+                        '继续查只会更糟。已中止本次扫描。' % risk_streak, 'err')
+                    log('建议：等 10 分钟以上再查；或先只勾选几门重要的课分批查。',
+                        'err')
+                    stopped = True
+                    break
+                cool = 45 if cool_downs == 0 else 90
+                cool_downs += 1
+                log('')
+                log('⚠ 连续 %d 门课页面未加载（疑似触发平台风控），'
+                    '冷却 %d 秒后再继续…（第 %d 次）' % (risk_streak, cool, cool_downs),
+                    'warn')
+                risk_streak = 0
+                aborted = False
+                for _ in range(int(cool)):
+                    time.sleep(1.0)
+                    if not checkpoint('risk_cool:%d' % cool_downs):
+                        aborted = True
+                        break
+                if aborted:
+                    log('冷却期间已中止，将用已抓到的结果出报告。', 'warn')
+                    stopped = True
+                    break
+                log('冷却结束，继续。')
             base = cfg.get('course_delay', 1.2)
-            time.sleep(max(base, 2.5) if bad else min(base, 0.6))
+            time.sleep(max(base, 2.5) if bad or seen_risk else min(base, 0.6))
 
         failed_courses = [
             {'course': r['name'],

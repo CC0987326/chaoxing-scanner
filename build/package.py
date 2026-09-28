@@ -46,10 +46,43 @@ def _scrub_config():
     return hit
 
 
+def _check_fresh():
+    """防呆：pkg/app 里的源码必须与开发目录一致，否则打出来是旧版坏包。
+
+    真实事故：只跑 package.py 不跑 build_all.sh 的第 4 步（cp 源码），
+    pkg 里还是上一个版本的 chaoxing_scanner.py / webui.py，
+    240MB 的包发出去才发现新功能根本不在里面。
+    """
+    import hashlib
+    bad = []
+    for name in ('chaoxing_scanner.py', 'webui.py', 'captcha_solver.py'):
+        dev = HERE.parent / name
+        pkg = SRC / 'app' / name
+        if not dev.exists():
+            continue
+        if not pkg.exists():
+            bad.append('%s（pkg 里缺失）' % name)
+            continue
+        h = lambda p: hashlib.sha256(p.read_bytes()).hexdigest()
+        if h(dev) != h(pkg):
+            bad.append('%s（pkg 里是旧版）' % name)
+    if bad:
+        print('⛔ 打包中止：build/pkg 里的源码不是最新的：')
+        for b in bad:
+            print('   - ' + b)
+        print('先执行同步（build_all.sh 的第 4/5 步），再跑本脚本：')
+        print('    cp chaoxing_scanner.py webui.py captcha_solver.py build/pkg/app/')
+        print('    python build/mk_extras.py')
+        return False
+    return True
+
+
 def main():
     if not SRC.exists():
         print('找不到 %s，请先执行 build_all.sh' % SRC)
         return 1
+    if not _check_fresh():
+        return 3
     scrubbed = _scrub_config()
     if scrubbed:
         print('已清空 config.json 里的私有字段：%s' % '、'.join(scrubbed))
