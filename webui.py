@@ -40,10 +40,23 @@ STATE = {
     'courses': None,        # 「获取课程列表」的结果，供界面勾选
     'started': 0.0,
     'login_fail': None,     # 密码登录被平台明确回绝 → 'credential'，界面弹红字提示
+    'result_v': 0,          # 结果的版本号：变了界面才重画，见 _set_result()
 }
 
+
+def _set_result(rep):
+    """写入结果并递增版本号。
+
+    界面原来每 900ms 把整块结果重绘一次（innerHTML 整体覆盖），长报告要反复
+    重建上百行 DOM，正在选中的文字还会被抖掉。改成用版本号说话之后，轮询只在
+    这一版还没交出去时才把报告带上，界面也只在换版时重画一次。
+    """
+    with LOCK:
+        STATE['result'] = rep
+        STATE['result_v'] += 1
+
 # 暂停 / 中止信号。扫描器会在每个「课程边界」调用 _control_hook 来检查，
-# 所以这两个信号最迟在下一门课开始时生效（约 10 秒），不会撕裂正在进行的请求。
+# 所以这两个信号最迟在下一门课开始时生效（一般几秒），不会撕裂正在进行的请求。
 PAUSE = threading.Event()
 CANCEL = threading.Event()
 
@@ -102,7 +115,7 @@ def _worker(action, opts):
     CANCEL.clear()
     with LOCK:
         STATE['paused'] = False
-        # 读课程名录是几十秒的只读操作，不参与暂停/停止，单独标一个阶段
+        # 读课程名录是十来秒的只读操作，不参与暂停/停止，单独标一个阶段
         # 兼容性体检同理：它是只读探针，内部没有检查点，所以也不能被暂停
         STATE['phase'] = 'listing' if action in ('list', 'selftest') else 'scanning'
     cs.set_control_hook(_control_hook)
@@ -135,11 +148,11 @@ def _worker(action, opts):
                     if cs.last_login_fail() == 'credential':
                         # 平台明确回绝了这组账号密码。这种失败在界面上用红字讲清楚就够了，
                         # 不必再抛异常打一堆堆栈（那样用户只会看到「任务失败」+ traceback）。
-                        # 同时清掉上一次的旧结果：否则轮询会把旧报告重新渲染回结果区，
+                        # 同时清掉上一次的旧结果：否则结果区里那份旧报告会一直留着，
                         # 用户会以为那是这次查出来的东西。
                         with LOCK:
                             STATE['login_fail'] = 'credential'
-                            STATE['result'] = None
+                        _set_result(None)
                         cs.log('账号或密码错误。请核对账号（手机号 / 超星号）与密码后重试，'
                                '或改用左侧「扫码 / 短信登录」。', 'err')
                         return
@@ -173,7 +186,7 @@ def _worker(action, opts):
                 '未完成考试': len(rep.get('undone_exam', [])),
                 '未完成任务点': len(rep.get('undone_prog', [])),
             }
-            STATE['result'] = rep
+        _set_result(rep)
     except cs.NotLoggedIn as e:
         cs.log('%s' % e, 'err')
         with LOCK:
@@ -412,7 +425,7 @@ PAGE = r"""<!DOCTYPE html>
     <button class="btn" id="bpause" disabled><i>⏸</i>暂停</button>
     <button class="btn" id="bstop" disabled style="border-color:#a33;color:#e88"><i>■</i>停止本次查询</button>
     <div class="tip" style="margin-top:6px">
-      暂停和停止都在这门课抓完后生效（一般 10 秒内）。
+      暂停和停止都在这门课抓完后生效（一般几秒内）。
       停止不会丢结果：已扫完的课程照常出报告，只是标注为「中止扫描」。
       <br>停止后会有几秒在生成报告（状态显示「收尾中」），之后即可再次查询。
     </div>
@@ -433,14 +446,18 @@ PAGE = r"""<!DOCTYPE html>
       会自动提示你改用「扫码 / 短信登录」。
       登录一次后会话会保存在本机，之后无需重复登录。
       <br><br>
-      <b>只想查几门课：</b>先点「获取课程列表」（约几十秒，只读名单），
+      <b>只想查几门课：</b>先点「获取课程列表」（约 10 秒，只读名单），
       然后在下方勾选要查的课程，再点「一键查询」。
       一门都不勾 = 照旧查全部。
       <br><br>
       <b>用完怎么退出：</b>点上面的「退出程序」，或者直接关掉那个黑色命令行窗口。
       只关浏览器页面是不会退出的，后台程序还在跑、端口还占着。
       <br><br>
-      如果有问题或者建议，可联系 QQ：2030161963
+      如果有问题或者建议，可联系 QQ：2030161963<br>
+      最新版下载地址：<a href="https://github.com/CC0987326/chaoxing-scanner"
+        target="_blank" rel="noopener"
+        style="color:var(--ac2);text-decoration:none;overflow-wrap:anywhere;"
+        >https://github.com/CC0987326/chaoxing-scanner</a>
     </div>
   </div>
 
@@ -461,8 +478,16 @@ PAGE = r"""<!DOCTYPE html>
 <div class="toast" id="toast"></div>
 <script>
 let since = 0, timer = null, closed = false, lastDone = 0;
+let rv = -1;            // 已经拿到的结果版本号（回传给服务端，避免重复下发整份报告）
+let cardFp = '';        // 左侧统计卡片的指纹：内容没变就不重建 DOM
 const $ = id => document.getElementById(id);
 const logEl = $('log');
+
+// 只在文字真的变了才写 DOM：轮询每几百毫秒来一次，无脑赋值会白白触发重排
+function setText(el, v){
+  const s = String(v == null ? '' : v);
+  if (el.textContent !== s) el.textContent = s;
+}
 
 function toast(msg, kind){
   const t = $('toast');
@@ -679,40 +704,54 @@ function renderResult(r){
 
 async function poll(){
   if (closed) return;
+  let busy = false;
   try{
-    const r = await fetch('/api/poll?since=' + since);
+    const r = await fetch('/api/poll?since=' + since + '&rv=' + rv);
     const j = await r.json();
+    busy = !!j.running;
     if (j.lines && j.lines.length){ append(j.lines); since = j.total; }
     if (j.courses && j.courses.length) renderCourses(j.courses);
     $('dot').className = 'dot' + (j.running ? ' on' : '');
     const paused = !!j.paused;
     const finishing = j.phase === 'finishing';
     const listing = j.phase === 'listing';
-    $('stxt').textContent = j.running
+    setText($('stxt'), j.running
       ? (paused ? '已暂停 · 点「继续」恢复'
                 : (finishing ? '收尾中 · 正在生成报告' : ('运行中 · ' + (j.task||''))))
-      : (j.done ? '已完成' : '空闲');
+      : (j.done ? '已完成' : '空闲'));
     ['bquery','blogin','blist'].forEach(i => $(i).disabled = j.running);
     $('bquery').title = j.running
       ? (finishing ? '正在收尾（生成报告），稍等几秒就能再次查询' : '任务进行中，请先暂停或停止')
       : '';
-    $('blist').title = j.running ? '任务进行中' : '只读取课程名单（几十秒，不抓作业）';
+    $('blist').title = j.running ? '任务进行中' : '只读取课程名单（约 10 秒，不抓作业）';
     if (j.running && finishing) $('bartip').textContent = '收尾中：正在生成报告…';
-    // 读课程名录是几十秒的只读操作，暂停/停止对它无效，就别让按钮看起来能用
+    // 读课程名录是十来秒的只读操作，暂停/停止对它无效，就别让按钮看起来能用
     $('bpause').disabled = !j.running || listing;
     $('bstop').disabled  = !j.running || listing;
+    const wasPaused = $('bpause').dataset.paused === '1';
     $('bpause').dataset.paused = paused ? '1' : '0';
-    $('bpause').innerHTML = paused ? '<i>▶</i>继续' : '<i>⏸</i>暂停';
+    // 按钮文字只在暂停状态真的翻转时才改，省掉每轮一次 innerHTML 重写
+    if (wasPaused !== paused) $('bpause').innerHTML = paused ? '<i>▶</i>继续' : '<i>⏸</i>暂停';
     if (j.summary){
-      const c = $('cards'); c.style.display = 'grid'; c.innerHTML = '';
-      for (const k in j.summary){
-        const e = document.createElement('div');
-        e.className = 'card';
-        e.innerHTML = '<b>' + esc(j.summary[k]) + '</b><span>' + esc(k) + '</span>';
-        c.appendChild(e);
+      const fp = JSON.stringify(j.summary);
+      if (fp !== cardFp){
+        cardFp = fp;
+        const c = $('cards'); c.style.display = 'grid'; c.innerHTML = '';
+        for (const k in j.summary){
+          const e = document.createElement('div');
+          e.className = 'card';
+          e.innerHTML = '<b>' + esc(j.summary[k]) + '</b><span>' + esc(k) + '</span>';
+          c.appendChild(e);
+        }
       }
     }
-    if (j.result && !j.running){ renderResult(j.result); $('bartip').textContent = '查询完成'; }
+    // 结果只在「换了一版」时重画。以前是无条件每轮重绘，长报告要反复重建上百行
+    // DOM，正在选中的文字也会被抖掉；现在轮询只负责把新版本交过来。
+    if (j.result && !j.running && j.result_v !== rv){
+      rv = j.result_v;
+      renderResult(j.result);
+      setText($('bartip'), '查询完成');
+    }
     // 任务收尾时明确交代一句。否则重复点「获取课程列表」而名单没变时，
     // DOM 不会重建、界面毫无动静，用户会以为按钮坏了
     if (!j.running && j.done && j.started && j.started !== lastDone){
@@ -742,7 +781,8 @@ async function poll(){
     $('bopen').disabled = !j.report;
   }catch(e){}
   if (closed) return;
-  timer = setTimeout(poll, 900);
+  // 运行中问得密一点（日志和状态跟得更紧），空闲时疏一点，没必要一直戳
+  timer = setTimeout(poll, busy ? 400 : 1200);
 }
 poll();
 
@@ -785,16 +825,17 @@ async function run(action){
   }
   since = 0; logEl.innerHTML = '';
   $('cards').style.display = 'none';
+  cardFp = '';   // 卡片已隐藏，指纹一并清掉，否则同样的统计出来时不会重新展开
   if (action === 'query') {
     const n = picked().length;
     $('res').innerHTML = '<div class="empty">'
       + (n ? ('正在查询你勾选的 ' + n + ' 门课程…')
            : (nTop ? ('正在查询最近学习的 ' + nTop + ' 门课程…')
-                   : '查询进行中，请稍候…（首次通常 6~9 分钟）')) + '</div>';
+                   : '查询进行中，请稍候…（全量通常 1~2 分钟）')) + '</div>';
     $('bartip').textContent = '查询中…';
     switchTab('res');
   } else if (action === 'list') {
-    $('res').innerHTML = '<div class="empty">正在读取课程列表…（几十秒，不抓作业）</div>';
+    $('res').innerHTML = '<div class="empty">正在读取课程列表…（约 10 秒，不抓作业）</div>';
     $('bartip').textContent = '读取课程列表…';
     switchTab('log');
   } else {
@@ -905,6 +946,7 @@ class Handler(BaseHTTPRequestHandler):
         if u.path == '/api/poll':
             q = parse_qs(u.query)
             since = int((q.get('since') or ['0'])[0] or 0)
+            rv = int((q.get('rv') or ['-1'])[0] or -1)
             with LOCK:
                 payload = {'lines': STATE['lines'][since:],
                            'total': len(STATE['lines']),
@@ -912,10 +954,15 @@ class Handler(BaseHTTPRequestHandler):
                            'paused': STATE['paused'],
                            'phase': STATE['phase'],
                            'done': STATE['done'], 'summary': STATE['summary'],
-                           'result': STATE['result'], 'report': STATE['report'],
+                           'report': STATE['report'],
                            'courses': STATE['courses'],
                            'login_fail': STATE['login_fail'],
-                           'started': STATE['started']}
+                           'started': STATE['started'],
+                           'result_v': STATE['result_v']}
+                # 报告本体可能很大（几十门课的明细）。界面已经拿到这一版时就别再
+                # 重复下发 —— 否则每次轮询都要把整个报告序列化一遍送过去。
+                if rv != STATE['result_v']:
+                    payload['result'] = STATE['result']
             return self._send(200, json.dumps(payload, ensure_ascii=False).encode('utf-8'))
         return self._send(404, b'{"error":"not found"}')
 
@@ -946,7 +993,7 @@ class Handler(BaseHTTPRequestHandler):
                 PAUSE.set()
                 with LOCK:
                     STATE['paused'] = True
-                cs.log('⏸ 收到暂停请求：当前这门课抓完就停住（约 10 秒内）…', 'warn')
+                cs.log('⏸ 收到暂停请求：当前这门课抓完就停住（一般几秒内）…', 'warn')
             elif u.path == '/api/resume':
                 PAUSE.clear()
                 with LOCK:

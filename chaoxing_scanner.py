@@ -369,6 +369,91 @@ def save_state(ctx):
 
 
 # ================================================================ 页面判定
+# ---------------------------------------------------------------- 按需等待
+# 学习通这些页面都是「先返回骨架、再异步填内容」：domcontentloaded 之后正文
+# 还要等一会儿才出现。改前一律用固定 sleep 兜住（3 秒 / 2.6 秒 / 350ms …），
+# 于是页面明明 0.5 秒就绪也要空等满 3 秒 —— 几十门课累积下来就是好几分钟的
+# 纯等待，用户感知就是「查得慢」。
+#
+# 这里统一改成按条件轮询，两个要点保证「抓到的内容一个字都不差」：
+#   1. 判定条件是「数据到手了没」（条目出现 / 输入框出现 / 渲染条数变多），
+#      不是「页面能不能打开」；
+#   2. 等待上限与改前的固定 sleep 取同一个值 —— 平台慢时行为与改前完全一致，
+#      用户把 page_wait 调大也照样生效，只是不再无谓地等满。
+_POLL_MS = 120
+
+
+def _poll(page, expr, ok, timeout_ms, interval_ms=_POLL_MS):
+    """反复求值 expr，直到 ok(值) 为真或超时；返回最后一次的值。
+
+    超时不抛异常，而是把「最后看到的东西」交回给调用方 —— 调用方原有的兜底
+    分支（读不到就当无此模块 / 空列表）因此一行都不用改。
+    """
+    deadline = time.time() + max(0, timeout_ms) / 1000.0
+    val = None
+    while True:
+        try:
+            val = page.evaluate(expr)
+        except Exception:
+            val = None
+        try:
+            if ok(val):
+                return val
+        except Exception:
+            pass
+        if time.time() >= deadline:
+            return val
+        try:
+            page.wait_for_timeout(interval_ms)
+        except Exception:
+            return val
+
+
+def _grown(n):
+    """计数类条件的快捷写法：等到比 n 大为止"""
+    return lambda v: (v or 0) > n
+
+
+def _settle(page, expr, quiet_ms=260, cap_ms=1200, interval_ms=_POLL_MS):
+    """等到 expr 的取值「连续 quiet_ms 不再变化」，或到 cap_ms 为止。
+
+    用于滚动到底后的收尾：还有卡片没渲染完就继续等，都渲染完就立刻走。
+    """
+    deadline = time.time() + cap_ms / 1000.0
+    last, stable_since = object(), time.time()
+    while True:
+        try:
+            cur = page.evaluate(expr)
+        except Exception:
+            cur = None
+        if cur != last:
+            last, stable_since = cur, time.time()
+        elif (time.time() - stable_since) * 1000 >= quiet_ms:
+            return cur
+        if time.time() >= deadline:
+            return cur
+        try:
+            page.wait_for_timeout(interval_ms)
+        except Exception:
+            return cur
+
+
+# 课程页左侧导航（作业/考试/章节的唯一入口）是否已经渲染出来
+JS_HAS_NAV = r"""
+() => document.querySelectorAll('li[dataname]').length > 0
+"""
+
+# 登录页表单（手机号框 / 手机号输入框 / 登录方式切换字样）是否已经渲染出来
+JS_HAS_LOGIN_FORM = r"""
+() => !!(document.querySelector('#phone') || document.querySelector('input[type=tel]')
+          || /验证码登录|密码登录/.test(document.body ? document.body.innerText : ''))
+"""
+
+# 账号密码登录表单里的手机号输入框
+JS_HAS_PHONE = r"""
+() => !!document.querySelector('#phone')
+"""
+
 JS_IS_LOGINED = r"""
 () => {
   const b = document.body ? (document.body.innerText || '') : '';
@@ -385,14 +470,29 @@ class NotLoggedIn(Exception):
     pass
 
 
+def _logined_enough(v):
+    """check_login 的轮询条件：登录态特征已出现，或已被明确踢到登录页。
+
+    后一种情况要提前收手 —— 都跳登录页了，再等也不会变成登录态。
+    """
+    if not isinstance(v, dict):
+        return False
+    u = v.get('url') or ''
+    if 'passport' in u or 'login' in u:
+        return True
+    return bool(v.get('ok'))
+
+
 def check_login(page, navigate=True) -> bool:
     if navigate:
         try:
             page.goto(BASE_URL, wait_until='domcontentloaded')
-            page.wait_for_timeout(3500)
         except Exception as e:
             log('打开个人空间失败：%s' % e, 'warn')
             return False
+        # 等「个人空间」的特征出现（课程链接 / 互动 iframe / 页面标题）。
+        # 上限仍是改前的 3.5 秒，但特征一到就走。
+        _poll(page, JS_IS_LOGINED, _logined_enough, 3500)
     try:
         info = page.evaluate(JS_IS_LOGINED)
     except Exception:
@@ -430,7 +530,8 @@ def do_login(cfg, auto=False, phone=''):
     try:
         restore_state(ctx)
         page.goto(BASE_URL, wait_until='domcontentloaded')
-        page.wait_for_timeout(3000)
+        # 上限仍是 3 秒；已经是登录态就立刻往下走
+        _poll(page, JS_IS_LOGINED, _logined_enough, 3000)
         if check_login(page, navigate=False):
             save_state(ctx)
             log('原有会话仍然有效，无需重新登录 ✓')
@@ -495,7 +596,8 @@ def _login_auto(cfg, phone=''):
             return True
 
         page.goto(LOGIN_URL, wait_until='domcontentloaded')
-        page.wait_for_timeout(3000)
+        # 等登录表单渲染出来（上限仍是 3 秒）
+        _poll(page, JS_HAS_LOGIN_FORM, lambda v: bool(v), 3000)
 
         # 切到「验证码登录」
         try:
@@ -620,14 +722,15 @@ def do_login_password(cfg, phone, password, headless=False) -> bool:
     page = ctx.new_page()
     keep_open = False
     try:
-        page.goto(BASE_URL, wait_until='domcontentloaded')
-        page.wait_for_timeout(2000)
+        # 原来这里先 goto 一次个人空间再等 2 秒，但那发生在注入 cookie **之前**，
+        # 纯属白等；直接让下面的 check_login 带着 cookie 打开一次就够。
         if restore_state(ctx) and check_login(page, navigate=True):
             log('已有有效会话，无需重新登录 ✓')
             return True
 
         page.goto(LOGIN_URL, wait_until='domcontentloaded')
-        page.wait_for_timeout(2500)
+        # 等登录表单渲染出来（上限仍是 2.5 秒）
+        _poll(page, JS_HAS_PHONE, lambda v: bool(v), 2500)
 
         try:
             page.click('#phone', timeout=8000)
@@ -655,7 +758,9 @@ def do_login_password(cfg, phone, password, headless=False) -> bool:
         deadline = time.time() + 100
         human_warned = False
         while time.time() < deadline:
-            page.wait_for_timeout(1500)
+            # 0.8 秒探一次：登录成功、或平台回绝密码，都能更早被认出来，
+            # 界面上的红字提示 / 开始扫描也就来得更快
+            page.wait_for_timeout(800)
             if check_login(page, navigate=False):
                 save_state(ctx)
                 log('登录成功 ✓')
@@ -747,18 +852,23 @@ JS_COURSES = r"""
 """
 
 
-def _lazy_scroll(page, step=300, max_steps=90, wait_ms=350):
+def _lazy_scroll(page, step=300, max_steps=90, wait_ms=350, interval_ms=90):
     """小步慢滚到页底，触发卡片内容的懒加载。
 
     ⚠️ 关键：课程卡片上的「任务点进度」是随滚动逐屏渲染的
     （实测初始 10 条 → 滚到 900px 变 15 条 → 1800px 变 19 条）。
     如果直接 window.scrollTo(0, scrollHeight) 跳到页底，中间被跳过的区域
     永远不会触发渲染，进度就会大面积缺失。
+
+    改前每滚一屏固定等 350ms；现在每屏只等到「这屏确实渲染出来了」
+    （任务点条目数变多）就走，最多仍等 350ms。步长与步数上限一律没动，
+    所以漏渲染的风险与改前完全相同，只是不再空等。
     """
     page.evaluate("() => window.scrollTo(0, 0)")
-    page.wait_for_timeout(800)
+    _poll(page, JS_COUNT_PROG, lambda v: bool(v), 800)
     still = 0
     for _ in range(max_steps):
+        before = page.evaluate(JS_COUNT_PROG) or 0
         info = page.evaluate("() => [window.scrollY, window.innerHeight, document.body.scrollHeight]")
         y, vh, h = info
         if y + vh >= h - 10:
@@ -766,15 +876,22 @@ def _lazy_scroll(page, step=300, max_steps=90, wait_ms=350):
             if still >= 2:
                 break
         page.evaluate("() => window.scrollBy(0, %d)" % step)
-        page.wait_for_timeout(wait_ms)
-    page.wait_for_timeout(1200)
+        # 等到这一屏渲染出来（条目数增加）或等满 wait_ms
+        _poll(page, JS_COUNT_PROG, _grown(before), wait_ms, interval_ms)
+    # 收尾：还有没渲染完的就继续等，渲染完了立刻回页顶
+    _settle(page, JS_COUNT_PROG, quiet_ms=240, cap_ms=1200)
     page.evaluate("() => window.scrollTo(0, 0)")
-    page.wait_for_timeout(600)
+    page.wait_for_timeout(300)
 
 
 JS_COUNT_PROG = r"""
 () => [...document.querySelectorAll('.l-txt')]
         .filter(e => /任务点|进度/.test(e.textContent || '')).length
+"""
+
+# 课程卡片链接数量（课程列表是否已经渲染出来的判据）
+JS_COUNT_COURSE_LINK = r"""
+() => document.querySelectorAll('a[href*=stucoursemiddle]').length
 """
 
 JS_FIND_LIST_IFRAME = r"""
@@ -797,13 +914,14 @@ def collect_courses(page, cfg) -> list:
         page.goto(target, wait_until='domcontentloaded')
     except Exception as e:
         log('打开课程列表页失败：%s' % e, 'warn')
-    page.wait_for_timeout(4500)
+    # 等课程卡片渲染出来（上限仍是 4.5 秒）
+    _poll(page, JS_COUNT_COURSE_LINK, lambda v: bool(v), 4500)
 
     courses = page.evaluate(JS_COURSES) or []
     if not courses:
         # 再兜底一次：回到个人空间，看是不是能直接从文档里读到
         page.goto('https://i.chaoxing.com/base?ws=1', wait_until='domcontentloaded')
-        page.wait_for_timeout(4500)
+        _poll(page, JS_COUNT_COURSE_LINK, lambda v: bool(v), 4500)
         courses = page.evaluate(JS_COURSES) or []
 
     # 「任务点进度」随滚动逐屏渲染，必须小步慢滚；直接跳页底会漏掉大部分
@@ -903,43 +1021,55 @@ def _sig(items):
     return '|'.join(i['title'] + '#' + i['state'] for i in items)
 
 
+def _items_ready(d):
+    """fetch_items_paged 的轮询条件：列表条目已经出来了，或页面明确说暂无。"""
+    if not isinstance(d, dict):
+        return False
+    return bool(d.get('empty')) or bool(d.get('items'))
+
+
 def fetch_items_paged(page, wait_first=None, max_pages=30) -> dict:
-    """在当前页面上循环翻页，收齐全部条目"""
+    """在当前页面上循环翻页，收齐全部条目。
+
+    改前不论页面多快都先死等 N 秒再读；现在等到「条目真的出现 / 页面明确说
+    暂无」就立刻读，上限仍是 N 秒。翻页同理：点完「下一页」等的是「内容换了
+    一批」（条目签名变化），而不是固定 2.6 秒。没有作业的课因此能秒过。
+    """
     cfg_wait = wait_first if wait_first is not None else 2.6
-    page.wait_for_timeout(int(cfg_wait * 1000))
+    data = _poll(page, JS_ITEMS, _items_ready, int(cfg_wait * 1000))
     items, count, seen_sig = [], '', set()
     for _ in range(max_pages):
-        data = page.evaluate(JS_ITEMS)
+        if not isinstance(data, dict):
+            data = page.evaluate(JS_ITEMS) or {}
         if data.get('count') and not count:
             count = data['count']
-        sig = _sig(data['items'])
+        sig = _sig(data.get('items') or [])
         if sig and sig in seen_sig:
             break
         if sig:
             seen_sig.add(sig)
-        items += data['items']
+        items += data.get('items') or []
         if not data.get('next'):
             break
         if not page.evaluate(JS_CLICK_NEXT):
             break
-        page.wait_for_timeout(2600)
+        data = _poll(page, JS_ITEMS,
+                     lambda d: _sig((d or {}).get('items') or []) != sig, 2600)
     return {'items': items, 'count': count, 'empty': False}
 
 
 def fetch_homework(ctx, page, c, cpi, cfg) -> dict:
     url = COURSE_PAGE.format(cid=c['cid'], clsid=c['clsid'], cpi=cpi)
     page.goto(url, wait_until='domcontentloaded')
-    page.wait_for_timeout(int(cfg['page_wait'] * 1000))
+    # 等左侧导航渲染出来再点「作业」（上限仍是 page_wait 秒）
+    _poll(page, JS_HAS_NAV, lambda v: bool(v), int(cfg['page_wait'] * 1000))
 
     if not page.evaluate(JS_CLICK_WORK):
         return {'no_module': True, 'items': [], 'count': ''}
 
-    work_url = ''
-    for _ in range(24):
-        page.wait_for_timeout(500)
-        work_url = page.evaluate(JS_WORK_IFRAME) or ''
-        if work_url:
-            break
+    # 作业列表是 ajax 塞进 iframe 的：改前每 500ms 探一次、最多 24 次；
+    # 现在探得更密（100ms），上限仍是 12 秒
+    work_url = _poll(page, JS_WORK_IFRAME, lambda v: bool(v), 12000, 100) or ''
     if not work_url:
         return {'no_module': True, 'items': [], 'count': ''}
 
@@ -987,6 +1117,11 @@ JS_CHAPTER_IFRAME = r"""
 }
 """
 
+# 章节节点数量（判断明细是不是已经渲染齐了）
+JS_COUNT_CHAPTER = r"""
+() => document.querySelectorAll('.chapter_item').length
+"""
+
 JS_PROG_DETAIL = r"""
 () => {
   const res = { total: null, pending: [], nodes: 0 };
@@ -1029,20 +1164,24 @@ def fetch_progress_detail(page, c, cpi, cfg) -> dict:
     """
     url = COURSE_PAGE.format(cid=c['cid'], clsid=c['clsid'], cpi=cpi)
     page.goto(url, wait_until='domcontentloaded')
-    page.wait_for_timeout(int(cfg['page_wait'] * 1000))
+    # 等左侧导航渲染出来再点「章节」（上限仍是 page_wait 秒）
+    _poll(page, JS_HAS_NAV, lambda v: bool(v), int(cfg['page_wait'] * 1000))
     if not page.evaluate(JS_CLICK_CHAPTER):
         return {'no_module': True, 'pending': [], 'total': None}
-    zj = ''
-    for _ in range(24):
-        page.wait_for_timeout(500)
-        zj = page.evaluate(JS_CHAPTER_IFRAME) or ''
-        if zj:
-            break
+    zj = _poll(page, JS_CHAPTER_IFRAME, lambda v: bool(v), 12000, 100) or ''
     if not zj:
         return {'no_module': True, 'pending': [], 'total': None}
     page.goto(zj, wait_until='domcontentloaded')
-    page.wait_for_timeout(int(cfg['page_wait'] * 1000))
+    # 章节节点是分批塞进 DOM 的：「概览文字出现」并不等于「明细已经齐了」，
+    # 所以先等概览就位，再等节点数稳定，最后才正式读一次 —— 读到半截明细会
+    # 让报告漏掉未完成章节，这里绝不能图快。
+    _poll(page, JS_PROG_DETAIL,
+          lambda d: bool(d) and (d.get('nodes') or 0) > 0 and bool(d.get('total')),
+          int(cfg['page_wait'] * 1000))
+    _settle(page, JS_COUNT_CHAPTER, quiet_ms=300, cap_ms=700)
     data = page.evaluate(JS_PROG_DETAIL) or {}
+    if not isinstance(data, dict):
+        data = {}
     return {'no_module': False,
             'pending': data.get('pending') or [],
             'total': data.get('total'),
@@ -1051,7 +1190,7 @@ def fetch_progress_detail(page, c, cpi, cfg) -> dict:
 
 # ================================================================ 扫描主流程
 # ================================================================ 运行控制（供 GUI 注入）
-# 扫描是个长循环（37 门课要 6~9 分钟），界面需要能在「课程边界」暂停或中止。
+# 扫描是个长循环（几十门课要一两分钟），界面需要能在「课程边界」暂停或中止。
 # CLI 模式不注入钩子，_control_hook 保持 None，行为与以前完全一致。
 _control_hook = None
 
@@ -1525,7 +1664,7 @@ def doctor(cfg):
     log('输出目录：%s' % OUT_DIR)
     log('')
     log('提示：学习通改版后想知道本工具还适不适用，运行 '
-        'chaoxing_scanner.py selftest（逐层自检，约 1~2 分钟）。')
+        'chaoxing_scanner.py selftest（逐层自检，约半分钟）。')
     return True
 
 
@@ -1557,7 +1696,7 @@ def selftest(cfg, headless=None, sample=3) -> dict:
     """
     checks, notes = [], []
     banner('学习通兼容性体检')
-    log('只读检测，不会修改任何课程数据，约 1~2 分钟。')
+    log('只读检测，不会修改任何课程数据，约半分钟。')
     log('')
 
     # ---------------- L0 本地运行环境（与平台无关） ----------------
@@ -1639,7 +1778,8 @@ def selftest(cfg, headless=None, sample=3) -> dict:
             try:
                 page.goto(COURSE_PAGE.format(cid=c['cid'], clsid=c['clsid'], cpi=cpi),
                           wait_until='domcontentloaded')
-                page.wait_for_timeout(int(cfg['page_wait'] * 1000))
+                # 等导航渲染出来（上限仍是 page_wait 秒）
+                _poll(page, JS_HAS_NAV, lambda v: bool(v), int(cfg['page_wait'] * 1000))
                 nav_all |= set(page.evaluate(SELFTEST_JS_NAV) or [])
             except Exception:
                 pass
@@ -1818,7 +1958,7 @@ def main(argv=None):
     p.add_argument('--no-open', action='store_true', help='生成后不自动打开报告')
     p.add_argument('--no-deep', action='store_true', help='跳过任务点章节下钻（更快）')
 
-    p = sub.add_parser('list', help='只列出课程名录，不抓任何作业（几十秒）')
+    p = sub.add_parser('list', help='只列出课程名录，不抓任何作业（约 10 秒）')
     p.add_argument('--headed', action='store_true', help='显示浏览器窗口')
 
     sub.add_parser('doctor', help='检查运行环境')
