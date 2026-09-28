@@ -438,6 +438,22 @@ def _settle(page, expr, quiet_ms=260, cap_ms=1200, interval_ms=_POLL_MS):
             return cur
 
 
+# 页面健康检查：导航没渲染出来时，分清「被风控/掉登录」还是单纯加载慢。
+# v2.5 的教训：课程页没打开时把课报成「无作业模块」，用户拿着假报告以为没作业。
+JS_PAGE_HEALTH = r"""
+() => {
+  const navs = [...document.querySelectorAll('li[dataname]')]
+        .map(x => x.getAttribute('dataname'));
+  const url = location.href;
+  const body = (document.body ? document.body.innerText : '').replace(/\s+/g, '');
+  let why = '';
+  if (/passport|login/i.test(url)) why = '被重定向到登录页，登录态可能已失效';
+  else if (/安全验证|验证码|访问异常|过于频繁|请稍后再试/.test(body)) why = '触发平台安全验证';
+  else if (!navs.length) why = '页面没有渲染出课程导航';
+  return { navs: navs, why: why };
+}
+"""
+
 # 课程页左侧导航（作业/考试/章节的唯一入口）是否已经渲染出来
 JS_HAS_NAV = r"""
 () => document.querySelectorAll('li[dataname]').length > 0
@@ -1058,20 +1074,47 @@ def fetch_items_paged(page, wait_first=None, max_pages=30) -> dict:
     return {'items': items, 'count': count, 'empty': False}
 
 
-def fetch_homework(ctx, page, c, cpi, cfg) -> dict:
-    url = COURSE_PAGE.format(cid=c['cid'], clsid=c['clsid'], cpi=cpi)
-    page.goto(url, wait_until='domcontentloaded')
-    # 等左侧导航渲染出来再点「作业」（上限仍是 page_wait 秒）
-    _poll(page, JS_HAS_NAV, lambda v: bool(v), int(cfg['page_wait'] * 1000))
+def _open_course_page(page, c, cpi, cfg) -> dict:
+    """打开课程页并等到左侧导航渲染出来。
 
-    if not page.evaluate(JS_CLICK_WORK):
+    导航一次没出来不立刻下结论：先看页面处于什么状态（风控/掉登录/单纯慢），
+    自动重试一次。两次都不行就把原因带回去——绝不能把「页面没打开」当成
+    「这门课没有作业」，那是误报，比漏报更害人。
+    """
+    url = COURSE_PAGE.format(cid=c['cid'], clsid=c['clsid'], cpi=cpi)
+    why = ''
+    for attempt in (1, 2):
+        page.goto(url, wait_until='domcontentloaded')
+        nav = _poll(page, JS_HAS_NAV, lambda v: bool(v), int(cfg['page_wait'] * 1000))
+        if nav:
+            return {'ok': True, 'reason': ''}
+        why = ((page.evaluate(JS_PAGE_HEALTH) or {}).get('why')) or '页面未加载出课程导航'
+        if attempt == 1:
+            log('  ⚠ 课程页没有渲染出导航（%s），隔 2 秒重试一次…' % why, 'warn')
+            time.sleep(2.0)
+    return {'ok': False, 'reason': why}
+
+
+def fetch_homework(ctx, page, c, cpi, cfg) -> dict:
+    opened = _open_course_page(page, c, cpi, cfg)
+    if not opened['ok']:
+        return {'no_module': False, 'items': [], 'count': '',
+                'page_failed': True, 'reason': opened['reason']}
+
+    # 「作业」导航项可能是渐进渲染的（智慧课程新版门户先出 AI助教，
+    # 其余项晚几步），所以把点击也放进轮询：出现就点。
+    # 上限取 max(page_wait, 5 秒)：实测过导航渲染到 3.4 秒才齐的情况，
+    # 贴着 page_wait 的下限太险，漏一次作业比多等两秒严重得多。
+    if not _poll(page, JS_CLICK_WORK, lambda v: bool(v),
+                 max(int(cfg['page_wait'] * 1000), 5000), 300):
         return {'no_module': True, 'items': [], 'count': ''}
 
-    # 作业列表是 ajax 塞进 iframe 的：改前每 500ms 探一次、最多 24 次；
-    # 现在探得更密（100ms），上限仍是 12 秒
+    # 作业列表是 ajax 塞进 iframe 的：探得密（100ms），上限仍是 12 秒
     work_url = _poll(page, JS_WORK_IFRAME, lambda v: bool(v), 12000, 100) or ''
     if not work_url:
-        return {'no_module': True, 'items': [], 'count': ''}
+        # 点进了作业但列表一直没出来 —— 这不是「没有作业」，是页面出了状况
+        return {'no_module': False, 'items': [], 'count': '',
+                'page_failed': True, 'reason': '作业列表没有加载出来'}
 
     page.goto(work_url, wait_until='domcontentloaded')
     res = fetch_items_paged(page)
@@ -1083,13 +1126,32 @@ def fetch_homework(ctx, page, c, cpi, cfg) -> dict:
 def fetch_exam(page, c, cpi, cfg) -> dict:
     ts = int(time.time() * 1000)
     url = EXAM_LIST.format(cid=c['cid'], clsid=c['clsid'], cpi=cpi, ts=ts)
-    page.goto(url, wait_until='domcontentloaded')
-    res = fetch_items_paged(page, wait_first=cfg['page_wait'])
-    body = ''
-    try:
-        body = page.evaluate("() => document.body.innerText.replace(/\\s+/g,' ')")
-    except Exception:
-        pass
+    res, body, why = {'items': [], 'count': '', 'empty': False}, '', ''
+    for attempt in (1, 2):
+        page.goto(url, wait_until='domcontentloaded')
+        res = fetch_items_paged(page, wait_first=cfg['page_wait'])
+        try:
+            body = page.evaluate("() => document.body.innerText.replace(/\\s+/g,' ')")
+        except Exception:
+            body = ''
+        plain = body.replace(' ', '')
+        why = ''
+        if re.search(r'passport|login', page.url or '', re.I):
+            why = '被重定向到登录页，登录态可能已失效'
+        elif re.search(r'安全验证|验证码|访问异常|过于频繁|请稍后再试', plain):
+            why = '触发平台安全验证'
+        # 页面真的加载出来了的判据：有条目 / 平台明说「暂无考试」/ 有实质内容
+        # 且没有掉登录或风控迹象。三者皆无 → 视为未加载，重试一次。
+        if res['items'] or '暂无考试' in body or (len(body) >= 200 and not why):
+            break
+        if attempt == 1:
+            log('  ⚠ 考试页疑似没有加载出来（%s），隔 2 秒重试一次…'
+                % (why or '内容异常'), 'warn')
+            time.sleep(2.0)
+    else:
+        return {'items': [], 'count': '', 'empty': True, 'no_module': False,
+                'page_failed': True,
+                'reason': why or '考试页没有加载出来'}
     res['empty'] = ('暂无考试' in body) or not res['items']
     res['no_module'] = False
     return res
@@ -1162,15 +1224,19 @@ def fetch_progress_detail(page, c, cpi, cfg) -> dict:
     实测：章节页每个 .chapter_item 中，未完成的节点带 .catalog_jindu，
     文本形如「N个待完成任务点」；已完成的节点没有该元素。
     """
-    url = COURSE_PAGE.format(cid=c['cid'], clsid=c['clsid'], cpi=cpi)
-    page.goto(url, wait_until='domcontentloaded')
-    # 等左侧导航渲染出来再点「章节」（上限仍是 page_wait 秒）
-    _poll(page, JS_HAS_NAV, lambda v: bool(v), int(cfg['page_wait'] * 1000))
-    if not page.evaluate(JS_CLICK_CHAPTER):
+    opened = _open_course_page(page, c, cpi, cfg)
+    if not opened['ok']:
+        return {'no_module': False, 'pending': [], 'total': None,
+                'page_failed': True, 'reason': opened['reason']}
+    # 「章节」导航项同样可能渐进渲染，点击放进轮询（上限同作业：max(page_wait, 5s)）
+    if not _poll(page, JS_CLICK_CHAPTER, lambda v: bool(v),
+                 max(int(cfg['page_wait'] * 1000), 5000), 300):
         return {'no_module': True, 'pending': [], 'total': None}
     zj = _poll(page, JS_CHAPTER_IFRAME, lambda v: bool(v), 12000, 100) or ''
     if not zj:
-        return {'no_module': True, 'pending': [], 'total': None}
+        # 点进了章节但页面一直没出来 —— 不是「没有章节」，是出了状况
+        return {'no_module': False, 'pending': [], 'total': None,
+                'page_failed': True, 'reason': '章节页没有加载出来'}
     page.goto(zj, wait_until='domcontentloaded')
     # 章节节点是分批塞进 DOM 的：「概览文字出现」并不等于「明细已经齐了」，
     # 所以先等概览就位，再等节点数稳定，最后才正式读一次 —— 读到半截明细会
@@ -1311,19 +1377,50 @@ def scan(cfg, limit=0, headless=None, open_report=None, deep=True, only=None) ->
 
             nh = sum(1 for it in hw['items'] if is_undone(it))
             ne = sum(1 for it in ex['items'] if is_undone(it))
-            if hw.get('no_module'):
+            if hw.get('page_failed'):
+                hw_txt = '⚠ 页面未加载'
+            elif hw.get('no_module'):
                 hw_txt = '无作业模块'
             else:
                 hw_txt = '作业 %s（未完成 %d）' % (hw.get('count') or '-', nh)
-            ex_txt = '无考试' if ex.get('empty') else '考试 %d 场（未完成 %d）' % (
-                len(ex['items']), ne)
+            if ex.get('page_failed'):
+                ex_txt = '⚠ 页面未加载'
+            elif ex.get('empty'):
+                ex_txt = '无考试'
+            else:
+                ex_txt = '考试 %d 场（未完成 %d）' % (len(ex['items']), ne)
             pd = row.get('prog_detail')
             extra = ''
             if pd is not None and not pd.get('no_module'):
                 extra = ' · 未完成章节 %d' % len(pd.get('pending') or [])
             log('[%2d/%2d] %-34s %s · %s%s' % (i, len(courses), cut(c['name'], 34),
                                                hw_txt, ex_txt, extra))
-            time.sleep(cfg.get('course_delay', 1.2))
+            # 自适应课间间隔：一切正常时贴着下限走（省时间）；
+            # 哪门课页面出了状况就自动退避拉长，给平台喘息，避免连环被拦。
+            bad = bool(hw.get('page_failed') or ex.get('page_failed')
+                       or (pd or {}).get('page_failed'))
+            base = cfg.get('course_delay', 1.2)
+            time.sleep(max(base, 2.5) if bad else min(base, 0.6))
+
+        failed_courses = [
+            {'course': r['name'],
+             'what': '、'.join(w for w, d in (('作业', r['hw']), ('考试', r['exam']),
+                                              ('章节明细', r.get('prog_detail') or {}))
+                               if d.get('page_failed')),
+             'reason': ((r['hw'].get('page_failed') and r['hw'].get('reason'))
+                        or (r['exam'].get('page_failed') and r['exam'].get('reason'))
+                        or ((r.get('prog_detail') or {}).get('page_failed')
+                            and (r.get('prog_detail') or {}).get('reason'))
+                        or '页面未加载成功')}
+            for r in results
+            if r['hw'].get('page_failed') or r['exam'].get('page_failed')
+            or (r.get('prog_detail') or {}).get('page_failed')]
+        if failed_courses:
+            log('')
+            log('⚠ 有 %d 门课的页面没有加载成功（%s），这些课的作业/考试结果不可信，'
+                '建议稍后重新查询一次。'
+                % (len(failed_courses), '、'.join(x['course'] for x in failed_courses[:6])
+                   + ('…' if len(failed_courses) > 6 else '')), 'warn')
 
         log('')
         if stopped:
@@ -1340,7 +1437,8 @@ def scan(cfg, limit=0, headless=None, open_report=None, deep=True, only=None) ->
     report = build_report(courses, results,
                           stopped_at=len(results) if stopped else None,
                           scope_total=total_all if scope_kind else None,
-                          scope_kind=scope_kind or 'selected')
+                          scope_kind=scope_kind or 'selected',
+                          failed_courses=failed_courses)
     paths = write_outputs(report)
     if open_report:
         try:
@@ -1406,13 +1504,14 @@ def is_undone(item) -> bool:
 
 # ================================================================ 报告
 def build_report(courses, results, stopped_at=None, scope_total=None,
-                 scope_kind='selected') -> dict:
+                 scope_kind='selected', failed_courses=None) -> dict:
     """scope_total：账号里的课程总数。
 
     只在「本次只查了一部分课程」时传入。传了它，报告就会显式写明这是
     一次范围受限的检查——否则用户看到清单里没别的课，会误以为都完成了。
     scope_kind：'selected'=用户勾选了一部分；'recent'=只查了最近 N 门。
     两者措辞不同但同样必须标注，理由一致。
+    failed_courses：页面没加载成功的课程清单（v2.6 起），报告里要显式警告。
     """
     def label(i):
         c = courses[i]
@@ -1438,13 +1537,17 @@ def build_report(courses, results, stopped_at=None, scope_total=None,
                 undone_prog.append({'course': nm, 'done': done, 'total': total,
                                     'rate': done * 100.0 / total if total else 0,
                                     'chapters': pd.get('pending') or []})
-        if hw.get('no_module'):
+        if hw.get('page_failed'):
+            hw_txt = '⚠ 未加载'
+        elif hw.get('no_module'):
             hw_txt = '无作业模块'
         elif hw.get('count'):
             hw_txt = hw['count']
         else:
             hw_txt = '—'
-        if ex.get('empty'):
+        if ex.get('page_failed'):
+            ex_txt = '⚠ 未加载'
+        elif ex.get('empty'):
             ex_txt = '无考试'
         elif ex.get('items'):
             ne = sum(1 for it in ex['items'] if is_undone(it))
@@ -1471,6 +1574,7 @@ def build_report(courses, results, stopped_at=None, scope_total=None,
         'undone_exam': undone_exam,
         'undone_prog': undone_prog,
         'overview': overview,
+        'page_failed': failed_courses or [],
     }
 
 
@@ -1495,8 +1599,14 @@ def write_outputs(rep: dict) -> dict:
 
     L = ['# 学习通未完成事项清单', '',
          '- 生成时间：%s' % rep['time'],
-         scope,
-         '- 说明：状态「未交」才是真正未完成；「待批阅/已互评/待互评/已提交」平台均计为已完成', '']
+         scope]
+    if rep.get('page_failed'):
+        names = '、'.join(x['course'] for x in rep['page_failed'][:6]) \
+                + ('…' if len(rep['page_failed']) > 6 else '')
+        L.append('- ⚠️ **有 %d 门课的页面没有加载成功（%s），这些课的作业/考试'
+                 '结果是「没查到」而不是「没有」，建议稍后重新查询**'
+                 % (len(rep['page_failed']), names))
+    L += ['- 说明：状态「未交」才是真正未完成；「待批阅/已互评/待互评/已提交」平台均计为已完成', '']
 
     L += ['## 一、未完成作业（%d 项）' % len(rep['undone_hw']), '']
     if rep['undone_hw']:

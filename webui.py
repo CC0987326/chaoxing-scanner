@@ -186,6 +186,10 @@ def _worker(action, opts):
                 '未完成考试': len(rep.get('undone_exam', [])),
                 '未完成任务点': len(rep.get('undone_prog', [])),
             }
+            # 有页面没加载成功时多给一张卡，明示「结果不可信」；没有就不出现这张卡
+            nf = len(rep.get('page_failed') or [])
+            if nf:
+                STATE['summary']['⚠ 页面未加载'] = nf
         _set_result(rep)
     except cs.NotLoggedIn as e:
         cs.log('%s' % e, 'err')
@@ -633,6 +637,14 @@ function renderResult(r){
        + (r.course_total||0) + ' 门课程'
        + '（账号共 ' + (r.account_total||0) + ' 门）。'
        + (isRecent ? '更早的课程没查' : '未勾选的课没查') + '，不在下表范围内。</div>';
+  }
+  // 页面没加载成功的课必须显式警告——v2.5 的教训是把它们静默报成
+  // 「无作业模块」，用户拿着假报告以为没作业。没失败时这块完全不出现。
+  if (r.page_failed && r.page_failed.length){
+    h += '<div class="sub" style="color:#e06c60;margin-bottom:10px">'
+       + '⚠️ 有 ' + r.page_failed.length + ' 门课的页面没有加载成功（'
+       + esc(r.page_failed.map(function(x){ return x.course; }).join('、'))
+       + '），这些课的作业/考试是「没查到」而不是「没有」，建议稍后重新查询。</div>';
   }
   h += '<div class="sub" style="margin-bottom:16px">生成时间 ' + esc(r.time)
      + '　·　' + (r.partial
