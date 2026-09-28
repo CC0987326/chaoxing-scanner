@@ -1211,7 +1211,10 @@ JS_PROG_DETAIL = r"""
     if (n <= 0) return;            // 0 个待完成 = 该节点没欠账，不算未完成
     const tip = jd.querySelector('.bntHoverTips');
     const tipTxt = tip ? (tip.textContent || '').replace(/\s+/g, ' ').trim() : txt;
-    res.pending.push({ name: name, count: n, text: tipTxt });
+    // kid = 章节节点的 knowledgeid（.chapter_item 的 id 是 cur<kid>），
+    // 「自动刷视频」要靠它直达 knowledge/cards 页面。
+    const kid = (item.id || '').replace(/^cur/, '');
+    res.pending.push({ name: name, count: n, text: tipTxt, kid: kid });
   });
   return res;
 }
@@ -1503,6 +1506,310 @@ def is_undone(item) -> bool:
 
 
 # ================================================================ 报告
+# ================================================================ 自动刷视频
+# 实测结论（2026-09-28，真实账号验证过）：
+#   1) 章节节点的 knowledgeid 就在 .chapter_item 的 id 里（cur<kid>），
+#      凭 courseid/clazzid/kid/cpi 可以直达 knowledge/cards 卡片页，无需 enc；
+#   2) 视频卡是 ananas/modules/video iframe + video.js 播放器；
+#      静音 + playbackRate=2 真实播放，平台心跳照发，播到片尾任务点即判完成
+#      （multimedia/log 响应 {"isPassed":true}，章节列表节点翻绿）；
+#   3) 播放中偶发自暂停（无弹窗），再次 play() 即可继续；
+#   4) 测验卡（doHomeWorkNew）不是视频，本模块不碰——替考式自动答题不做。
+CARDS_URL = ('https://mooc1.chaoxing.com/mooc-ans/knowledge/cards'
+             '?clazzid={clsid}&courseid={cid}&knowledgeid={kid}&num=0&ut=s&cpi={cpi}')
+
+# 视频元素就绪（duration 是有限数才算加载完，NaN 是还在缓冲）。
+# ⚠️ 学习通的播放器是 preload=none：duration 在开始播放前一直是 NaN，
+# 所以「等时长」必须放在 play() 之后，否则所有视频都会被误判成「无视频」。
+JS_VIDEO_READY = r"""
+() => {
+  const vs = [...document.querySelectorAll('video')]
+    .filter(v => isFinite(v.duration) && v.duration > 0);
+  return vs.length > 0;
+}
+"""
+
+JS_VIDEO_HAS = "() => !!document.querySelector('video')"
+
+JS_VIDEO_STATE = r"""
+() => {
+  const v = document.querySelector('video');
+  if (!v) return null;
+  return {t: v.currentTime, dur: v.duration, paused: v.paused, ended: v.ended,
+          rate: v.playbackRate, muted: v.muted};
+}
+"""
+
+# 静音 + 倍速 + 播放。play() 的 promise 失败（自动播放策略）就静默吞掉，
+# 下一轮监控循环会再试
+JS_VIDEO_PLAY = r"""
+(r) => {
+  const v = document.querySelector('video');
+  if (!v) return 'novideo';
+  v.muted = true;
+  v.playbackRate = r;
+  const p = v.play();
+  if (p && p.catch) p.catch(() => {});
+  return 'ok';
+}
+"""
+
+JS_VIDEO_PAUSE = "() => { const v = document.querySelector('video'); if (v && !v.paused) v.pause(); }"
+
+# 这个 frame 里的视频刷完没有（刷完打标记，防止同一个卡被刷两遍）
+JS_VIDEO_CLAIM = r"""
+() => {
+  if (window.__cx_brushed) return false;
+  const v = document.querySelector('video');
+  return !!v;
+}
+"""
+
+
+def fmt_t(sec):
+    try:
+        s = int(float(sec))
+    except (TypeError, ValueError):
+        return '?'
+    return '%d:%02d' % (s // 60, s % 60)
+
+
+def brush_video_frame(vf, cfg, progress, control) -> str:
+    """把一个视频 iframe 播到片尾。
+
+    返回 'done' | 'stopped' | 'stuck' | 'novideo' | 'timeout'。
+    学习通的心跳是播放器自己发的，我们只负责「让视频真的播完」——
+    不伪造心跳请求，平台看到的就是一次真实的观看（静音、2 倍速）。
+    """
+    rate = min(max(float(cfg.get('brush_rate', 2) or 2), 1.0), 16.0)
+    if not _poll(vf, JS_VIDEO_HAS, lambda v: bool(v), 15000, 400):
+        return 'novideo'
+    try:
+        vf.evaluate(JS_VIDEO_PLAY, rate)
+    except Exception as e:
+        log('    播放启动失败：%s' % str(e)[:80], 'warn')
+        return 'stuck'
+    # duration 只有开播了才会加载（preload=none），先播再等它就绪
+    if not _poll(vf, JS_VIDEO_READY, lambda v: bool(v), 25000, 400):
+        return 'novideo'
+    st = None
+    try:
+        st = vf.evaluate(JS_VIDEO_STATE)
+    except Exception:
+        pass
+    if not st or not st.get('dur'):
+        return 'novideo'
+    # 超时上限：剩余内容按倍速折算再放 80% 余量 + 2 分钟，防心跳卡住白等
+    deadline = time.time() + max((st['dur'] - st['t']) / rate * 1.8 + 120, 120)
+    last_t = st['t']
+    no_progress = 0        # 连续多次「暂停且位置没动过」→ 可能有插问卡死
+    last_report = st['t']
+    while time.time() < deadline:
+        act = control()
+        if act == 'stop':
+            return 'stopped'
+        if act == 'pause':
+            try:
+                vf.evaluate(JS_VIDEO_PAUSE)     # 暂停的是视频本身，不只是任务
+            except Exception:
+                pass
+            while control() == 'pause':
+                if control() == 'stop':
+                    return 'stopped'
+                time.sleep(0.3)
+            try:
+                vf.evaluate(JS_VIDEO_PLAY, rate)
+            except Exception:
+                pass
+        time.sleep(2)
+        try:
+            st = vf.evaluate(JS_VIDEO_STATE)
+        except Exception:
+            continue
+        if not st:
+            continue
+        if st.get('ended') or (st['dur'] and st['t'] >= st['dur'] - 1.5):
+            time.sleep(3)     # 等播放器把最后一条心跳发出去再走
+            return 'done'
+        if st['paused']:
+            try:
+                vf.evaluate(JS_VIDEO_PLAY, rate)
+            except Exception:
+                pass
+            # 位置纹丝不动的暂停连续出现，多半是插问弹窗把播放器卡住了：
+            # 刷不动就跳过，别死磕（那一题本来也不是视频能解决的）
+            no_progress = no_progress + 1 if abs(st['t'] - last_t) < 3 else 0
+            if no_progress >= 5:
+                log('    视频在 %s 处反复暂停（可能有插问），跳过。'
+                    % fmt_t(st['t']), 'warn')
+                return 'stuck'
+        else:
+            no_progress = 0
+        last_t = st['t']
+        # 平台要是把倍速/静音拨回去，就再拨回来
+        if st['rate'] != rate or not st['muted']:
+            try:
+                vf.evaluate(JS_VIDEO_PLAY, rate)
+            except Exception:
+                pass
+        if st['t'] - last_report >= 10:
+            last_report = st['t']
+            progress('    播放中 %s / %s（%sx 静音）'
+                     % (fmt_t(st['t']), fmt_t(st['dur']), g_rate(cfg)))
+    return 'timeout'
+
+
+def g_rate(cfg):
+    return min(max(float(cfg.get('brush_rate', 2) or 2), 1.0), 16.0)
+
+
+def brush_node(page, c, cpi, kid, cfg, progress, control):
+    """刷一个章节节点里的全部视频卡。返回 (完成数, 未完成数, 是否被停止)"""
+    url = CARDS_URL.format(clsid=c['clsid'], cid=c['cid'], kid=kid, cpi=cpi)
+    try:
+        page.goto(url, wait_until='domcontentloaded')
+    except Exception as e:
+        log('    打开章节页失败：%s' % str(e)[:80], 'warn')
+        return 0, 1, False
+    done = fail = 0
+    # 一个节点挂好几张卡（视频/文档/测验混排），视频卡是懒加载的：
+    # 刷完一张再扫一遍 frame，扫不到新的才算这个节点完事
+    for _ in range(12):
+        vf = None
+        for f in page.frames:
+            if 'modules/video' not in (f.url or ''):
+                continue
+            try:
+                if f.evaluate(JS_VIDEO_CLAIM):
+                    vf = f
+                    break
+            except Exception:
+                continue
+        if vf is None:
+            time.sleep(2)
+            for f in page.frames:
+                if 'modules/video' not in (f.url or ''):
+                    continue
+                try:
+                    if f.evaluate(JS_VIDEO_CLAIM):
+                        vf = f
+                        break
+                except Exception:
+                    continue
+        if vf is None:
+            break
+        try:
+            vf.evaluate("() => { window.__cx_brushed = true; }")
+        except Exception:
+            pass
+        r = brush_video_frame(vf, cfg, progress, control)
+        if r == 'stopped':
+            return done, fail, True
+        if r == 'done':
+            done += 1
+            log('    ✓ 这个视频刷完了')
+        elif r in ('stuck', 'timeout'):
+            fail += 1
+        # 'novideo'：这卡是文档/音频之类，不算账
+    return done, fail, False
+
+
+def _wait_control(control, progress):
+    """在课程/节点边界处理暂停。返回 'run' 或 'stop'。"""
+    while True:
+        act = control()
+        if act != 'pause':
+            return act
+        time.sleep(0.3)
+
+
+def brush_videos(cfg, only, progress=None, control=None, headless=None) -> dict:
+    """按课程自动刷未完成的「任务点视频」。
+
+    only: course_key() 列表（界面勾选的课），必填——不提供「全部课程都刷」，
+          防止误触发把几十门课全部挂后台。
+    progress(msg): 进度回调（界面把它写进日志和状态行）。
+    control(): 'run' | 'pause' | 'stop'，界面注入；CLI 用默认的「一直 run」。
+    返回 {'courses': [...], 'done': n, 'fail': n, 'stopped': bool}
+    """
+    progress = progress or (lambda m: log(m))
+    control = control or (lambda: 'run')
+    t0 = time.time()
+    ctx = launch(cfg, headless=headless)
+    page = ctx.new_page()
+    out = {'courses': [], 'done': 0, 'fail': 0, 'stopped': False}
+    try:
+        banner('检查登录状态')
+        if not check_login(page):
+            if restore_state(ctx) and check_login(page):
+                log('已用本地会话自动登录 ✓')
+            else:
+                log('本地没有可用登录态，请先登录。', 'err')
+                raise NotLoggedIn('未登录')
+        courses, cpi = collect_courses(page, cfg)
+        keep = set(only or [])
+        picked = [c for c in courses if course_key(c) in keep]
+        if not picked:
+            raise RuntimeError('要刷的课程没匹配到（课程可能有变动），'
+                               '请重新「获取课程列表」或「一键查询」后再试')
+        progress('共 %d 门课要刷：%s' % (
+            len(picked), '、'.join(cut(c['name'], 16) for c in picked)))
+        banner('逐门课刷视频（共 %d 门，%sx 静音）' % (len(picked), g_rate(cfg)))
+        for i, c in enumerate(picked, 1):
+            if _wait_control(control, progress) == 'stop':
+                out['stopped'] = True
+                log('已停止。', 'warn')
+                break
+            progress('【%d/%d】%s' % (i, len(picked), c['name']))
+            pd = fetch_progress_detail(page, c, cpi, cfg)
+            if pd.get('page_failed'):
+                progress('  ⚠ 页面没加载成功（%s），这门课先跳过，稍后重新刷。'
+                         % pd.get('reason', ''), )
+                out['courses'].append({'name': c['name'], 'done': 0, 'fail': 0,
+                                       'note': '页面未加载'})
+                continue
+            if pd.get('no_module') or not pd.get('pending'):
+                progress('  没有待完成的章节节点，跳过。')
+                out['courses'].append({'name': c['name'], 'done': 0, 'fail': 0,
+                                       'note': '无待完成节点'})
+                continue
+            nodes = [n for n in pd['pending'] if n.get('kid')]
+            progress('  待完成节点 %d 个，开始刷…' % len(nodes))
+            cd = cf = 0
+            stopped_here = False
+            for j, node in enumerate(nodes, 1):
+                if _wait_control(control, progress) == 'stop':
+                    stopped_here = True
+                    break
+                progress('  ▶ 节点 %d/%d：%s' % (j, len(nodes), cut(node['name'], 30)))
+                d, f, stopped_here = brush_node(page, c, cpi, node['kid'],
+                                                cfg, progress, control)
+                cd += d
+                cf += f
+                if stopped_here:
+                    break
+                time.sleep(max(float(cfg.get('course_delay', 1.2)), 1.0))
+            out['courses'].append({'name': c['name'], 'done': cd, 'fail': cf})
+            out['done'] += cd
+            out['fail'] += cf
+            if stopped_here:
+                out['stopped'] = True
+                break
+            # 课程之间留足间隔：刷视频的请求密度比扫描高得多，别在课间也贴地飞行
+            time.sleep(max(float(cfg.get('course_delay', 1.2)), 2.0))
+        progress('刷视频结束：完成 %d 个，未完成 %d 个，用时 %.0f 分钟。'
+                 % (out['done'], out['fail'], (time.time() - t0) / 60))
+        if out['fail']:
+            progress('没刷完的多半是「反复暂停卡住」的插问视频或超长视频，'
+                     '这些需要你手动看一遍。')
+        if not out['stopped']:
+            progress('建议重新点「一键查询」核对最新状态——报告里消失的节点就是刷完的。')
+    finally:
+        save_state(ctx)
+        close_ctx(ctx)
+    return out
+
+
 def build_report(courses, results, stopped_at=None, scope_total=None,
                  scope_kind='selected', failed_courses=None) -> dict:
     """scope_total：账号里的课程总数。
@@ -1534,8 +1841,11 @@ def build_report(courses, results, stopped_at=None, scope_total=None,
             done, total = int(pm.group(1)), int(pm.group(2))
             if done < total:
                 pd = r.get('prog_detail') or {}
+                # cid/clsid 是「自动刷视频」的定位参数：界面勾选哪门课要刷，
+                # 后端靠这两个 ID 重新找到这门课的章节页。
                 undone_prog.append({'course': nm, 'done': done, 'total': total,
                                     'rate': done * 100.0 / total if total else 0,
+                                    'cid': r['cid'], 'clsid': r['clsid'],
                                     'chapters': pd.get('pending') or []})
         if hw.get('page_failed'):
             hw_txt = '⚠ 未加载'
@@ -2071,6 +2381,14 @@ def main(argv=None):
     p = sub.add_parser('list', help='只列出课程名录，不抓任何作业（约 10 秒）')
     p.add_argument('--headed', action='store_true', help='显示浏览器窗口')
 
+    p = sub.add_parser('brush',
+                       help='自动刷未完成的任务点视频（2 倍速静音真实播放）')
+    p.add_argument('courses', nargs='+',
+                   help='课程名（支持部分匹配，可给多个）')
+    p.add_argument('--headed', action='store_true', help='显示浏览器窗口')
+    p.add_argument('--rate', type=float, default=None,
+                   help='播放倍速（默认取 config 的 brush_rate，再默认 2）')
+
     sub.add_parser('doctor', help='检查运行环境')
     sub.add_parser('selftest',
                    help='检测学习通是否改版（逐层验证解析规则是否还有效）')
@@ -2117,6 +2435,45 @@ def main(argv=None):
             return 130
         except Exception as e:
             log('扫描失败：%s' % e, 'err')
+            import traceback
+            log(traceback.format_exc()[-1200:], 'err')
+            return 1
+
+    if args.cmd == 'brush':
+        if args.rate:
+            cfg['brush_rate'] = args.rate
+        try:
+            # 课程名 → course_key：先读一遍名录做部分匹配
+            ctx = launch(cfg, headless=False if args.headed else None)
+            page = ctx.new_page()
+            try:
+                if not check_login(page):
+                    if not (restore_state(ctx) and check_login(page)):
+                        log('未登录，请先 login', 'err')
+                        return 1
+                courses, cpi = collect_courses(page, cfg)
+            finally:
+                save_state(ctx)
+                close_ctx(ctx)
+            keys = []
+            for name in args.courses:
+                hit = [c for c in courses if name in c['name']]
+                if not hit:
+                    log('没找到课程：%s（可先跑 list 看名单）' % name, 'warn')
+                    continue
+                keys += [course_key(c) for c in hit]
+            if not keys:
+                return 1
+            brush_videos(cfg, keys)
+            return 0
+        except NotLoggedIn as e:
+            log(str(e), 'err')
+            return 2
+        except KeyboardInterrupt:
+            log('已中断', 'warn')
+            return 130
+        except Exception as e:
+            log('刷视频失败：%s' % e, 'err')
             import traceback
             log(traceback.format_exc()[-1200:], 'err')
             return 1

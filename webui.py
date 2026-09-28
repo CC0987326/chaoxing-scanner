@@ -99,6 +99,7 @@ TASK_NAME = {
     'login': '扫码 / 短信登录',
     'doctor': '环境自检',
     'selftest': '学习通兼容性检测',
+    'brush': '自动刷视频（2 倍速静音）',
 }
 
 
@@ -195,6 +196,66 @@ def _worker(action, opts):
         cs.log('%s' % e, 'err')
         with LOCK:
             STATE['summary'] = {'提示': '未登录，请填账号密码或点「扫码 / 短信登录」'}
+    except Exception as e:
+        cs.log('任务失败：%s' % e, 'err')
+        import traceback
+        cs.log(traceback.format_exc()[-900:], 'err')
+    finally:
+        cs.set_control_hook(None)
+        PAUSE.clear()
+        CANCEL.clear()
+        with LOCK:
+            STATE['running'] = False
+            STATE['done'] = True
+            STATE['paused'] = False
+            STATE['phase'] = ''
+        cs.log('■ 任务结束')
+
+
+def _brush_worker(opts):
+    """「刷选中的课的视频」的后台线程。
+
+    与扫描共用暂停/停止信号（PAUSE/CANCEL），但控制粒度更细：
+    刷视频的 control() 会把视频元素本身也暂停，而不是只停任务推进。
+    """
+    only = [str(k) for k in (opts.get('only') or []) if k]
+    cs.log('')
+    cs.log('▶ 任务开始：自动刷视频')
+    PAUSE.clear()
+    CANCEL.clear()
+    with LOCK:
+        STATE['paused'] = False
+        STATE['phase'] = 'brushing'
+    try:
+        cfg = cs.load_config()
+        rate = min(max(float(cfg.get('brush_rate', 2) or 2), 1.0), 16.0)
+        cs.log('播放方式：%sx 倍速 + 静音，真实播放到片尾（不伪造心跳）。' % rate)
+        cs.log('只刷视频任务点；测验 / 作业不会替你自动完成。')
+
+        def progress(msg):
+            cs.log(msg)
+            # 状态行跟着走：让用户随时看到「现在刷到哪门课哪个视频」
+            with LOCK:
+                STATE['task'] = '刷视频 · ' + (msg[:54] if msg else '')
+
+        def control():
+            if CANCEL.is_set():
+                return 'stop'
+            if PAUSE.is_set():
+                return 'pause'
+            return 'run'
+
+        out = cs.brush_videos(cfg, only, progress=progress, control=control)
+        with LOCK:
+            STATE['summary'] = {'刷完视频': out.get('done', 0),
+                                '未完成': out.get('fail', 0)}
+            if out.get('stopped'):
+                STATE['summary']['状态'] = '已停止'
+        cs.log('想核对结果：重新点「一键查询」，报告里消失的章节节点就是刷完的。', 'ok')
+    except cs.NotLoggedIn as e:
+        cs.log('%s' % e, 'err')
+        with LOCK:
+            STATE['summary'] = {'提示': '未登录，请先登录'}
     except Exception as e:
         cs.log('任务失败：%s' % e, 'err')
         import traceback
@@ -328,6 +389,15 @@ PAGE = r"""<!DOCTYPE html>
   #res details.cbox[open] .foldhint .t-closed{display:none;}
   #res details.cbox[open] .foldhint .t-open{display:inline;}
   #res .tip{font-size:12px;color:var(--mut);line-height:1.75;}
+  /* 刷视频入口：节标题下的一条工具栏 + 每门课折叠条右侧的勾选 */
+  #res .brushbar{display:flex;align-items:center;gap:8px;margin:10px 0 2px;flex-wrap:wrap;}
+  #res .brushbar .sub{flex:1;min-width:180px;}
+  #res details.cbox summary .bkwrap{flex:none;display:flex;align-items:center;gap:5px;
+                                    font-size:12px;color:#9fb0b3;cursor:pointer;
+                                    padding:3px 8px;border:1px solid var(--line);
+                                    border-radius:6px;background:#0d1517;}
+  #res details.cbox summary .bkwrap:hover{border-color:var(--ac);color:var(--ac2);}
+  #res details.cbox summary .bkwrap input{accent-color:var(--ac);margin:0;cursor:pointer;}
   /* 课程勾选面板 */
   .pickhead{display:flex;align-items:center;gap:6px;margin:7px 0 0;
             font-size:11.5px;color:var(--mut);}
@@ -681,9 +751,16 @@ function renderResult(r){
 
   h += '<div class="sec"><h2>三、未完成任务点 <span class="n">' + pg.length + '</span> 门课</h2>';
   if (pg.length){
+    // 刷视频入口：勾哪门刷哪门。视频 2 倍速静音真实播放；测验/作业不碰。
+    h += '<div class="brushbar"><button class="mini primary" id="bbrush"'
+       + ' onclick="startBrush(event)">▶ 刷选中的课的视频</button>'
+       + '<button class="mini" onclick="toggleAllBrush(event)">全选</button>'
+       + '<span class="sub">只自动刷视频任务点（2 倍速静音），测验/作业不会替你做；'
+       + '刷完建议重新查询核对。</span></div>';
     // 每门课一个折叠：课程名 + 进度始终露出，只把章节明细收起来（一门课能拉出十几行）。
     for (let i = 0; i < pg.length; i++){
       const it = pg[i], chs = it.chapters || [], idx = String(i);
+      const bkey = (it.cid && it.clsid) ? (it.cid + ':' + it.clsid) : '';
       h += '<details class="cbox"' + (openIdx.has(idx) ? ' open' : '')
          + ' data-idx="' + idx + '"><summary>'
          + '<span class="hd"><b>' + esc(it.course) + '</b>　'
@@ -692,7 +769,13 @@ function renderResult(r){
          + '<span class="foldhint">'
          + '<span class="t-closed">'
          + (chs.length ? chs.length + ' 个章节待完成 · 点这里展开' : '点这里展开')
-         + '</span><span class="t-open">点这里收起</span></span></summary>';
+         + '</span><span class="t-open">点这里收起</span></span>'
+         // 没有 cid/clsid 的课（旧缓存结果）压根不渲染勾选框——没有定位参数就不能假装能刷
+         + (bkey
+            ? '<label class="bkwrap" onclick="event.stopPropagation()" title="勾上后点上面的「刷选中的课的视频」">'
+              + '<input type="checkbox" class="bk" value="' + esc(bkey) + '"> 刷视频</label>'
+            : '')
+         + '</summary>';
       if (chs.length){
         h += '<div class="chap">';
         for (const c of chs){
@@ -863,6 +946,38 @@ function switchTab(t){
   $('res').style.display = t === 'res' ? '' : 'none';
   $('logpane').style.display = t === 'log' ? '' : 'none';
 }
+
+// ---------- 刷视频 ----------
+// 勾选在第三节每门课的折叠条上（勾上即生效，不用再确认）。
+// 只有同时拿得到 cid/clsid 的课才显示勾选框——没有定位参数就刷不了。
+function startBrush(ev){
+  if (ev) ev.stopPropagation();
+  const keys = [...document.querySelectorAll('#res .bk:checked')].map(b => b.value).filter(Boolean);
+  if (!keys.length){
+    toast('先在「未完成任务点」里勾选要刷视频的课程', 'warn');
+    return;
+  }
+  fetch('/api/brush', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({only: keys})}).then(r => {
+    if (r.status === 409){ toast('当前有任务在跑，等它结束再刷', 'warn'); return; }
+    if (!r.ok){ toast('刷视频没能启动（HTTP ' + r.status + '）', 'err'); return; }
+    since = 0; logEl.innerHTML = '';
+    $('cards').style.display = 'none'; cardFp = '';
+    $('res').innerHTML = '<div class="empty">正在后台刷视频…（2 倍速静音真实播放，'
+      + '进度看「运行日志」；可以随时暂停/停止）</div>';
+    $('bartip').textContent = '刷视频中…';
+    switchTab('log');
+    clearTimeout(timer);
+    poll();
+  }).catch(() => toast('连不上本地程序，请确认那个黑色命令行窗口还在运行', 'err'));
+}
+
+function toggleAllBrush(ev){
+  if (ev) ev.stopPropagation();
+  const bks = [...document.querySelectorAll('#res .bk')];
+  const allOn = bks.length && bks.every(b => b.checked);
+  bks.forEach(b => b.checked = !allOn);
+}
 document.querySelectorAll('.tab').forEach(b => b.onclick = () => switchTab(b.dataset.t));
 
 $('bquery').onclick = () => {
@@ -912,8 +1027,9 @@ $('bpause').onclick = () => {
   fetch(on ? '/api/resume' : '/api/pause', {method:'POST'});
 };
 $('bstop').onclick = () => {
-  if (!confirm('停止本次查询？\n\n已扫完的课程会照常出报告，只是会标注为「中止扫描」。'
-               + '\n停止后需要几秒生成报告，这几秒里不能开始新查询。')) return;
+  if (!confirm('停止当前任务？\n\n查询：已扫完的课程会照常出报告，只是标注为「中止扫描」。\n'
+               + '刷视频：已刷完的不受影响，没刷完的保持原样。'
+               + '\n停止后有几秒收尾时间，这几秒里不能开始新任务。')) return;
   fetch('/api/cancel', {method:'POST'});
 };
 $('bquit').onclick  = async () => {
@@ -996,6 +1112,26 @@ class Handler(BaseHTTPRequestHandler):
                              login_fail=None)
             threading.Thread(target=_worker, args=(action, data), daemon=True).start()
             return self._send(200, b'{"ok":true}')
+        if u.path == '/api/brush':
+            # 「刷选中的课的视频」。only 必填：不给「全部都刷」这种选项，
+            # 防止误点一次就把几十门课全挂到后台。
+            try:
+                data = json.loads(raw.decode('utf-8') or '{}')
+            except Exception:
+                data = {}
+            only = [str(k) for k in (data.get('only') or []) if k]
+            if not only:
+                return self._send(400, json.dumps(
+                    {'error': '没有勾选要刷的课程'}).encode('utf-8'))
+            with LOCK:
+                if STATE['running']:
+                    return self._send(409, b'{"error":"busy"}')
+                STATE.update(running=True, task=TASK_NAME['brush'],
+                             lines=[], done=False, summary=None,
+                             started=time.time(), login_fail=None)
+            threading.Thread(target=_brush_worker, args=({'only': only},),
+                             daemon=True).start()
+            return self._send(200, b'{"ok":true}')
         if u.path in ('/api/pause', '/api/resume', '/api/cancel'):
             with LOCK:
                 busy = STATE['running']
@@ -1005,7 +1141,8 @@ class Handler(BaseHTTPRequestHandler):
                 PAUSE.set()
                 with LOCK:
                     STATE['paused'] = True
-                cs.log('⏸ 收到暂停请求：当前这门课抓完就停住（一般几秒内）…', 'warn')
+                cs.log('⏸ 收到暂停请求：当前这步做完就停住（查询是这门课抓完，'
+                       '刷视频是当前视频暂停）…', 'warn')
             elif u.path == '/api/resume':
                 PAUSE.clear()
                 with LOCK:
@@ -1016,7 +1153,7 @@ class Handler(BaseHTTPRequestHandler):
                 PAUSE.clear()
                 with LOCK:
                     STATE['paused'] = False
-                cs.log('■ 收到停止请求：当前这门课抓完后收尾，已扫到的结果照常出报告 …', 'warn')
+                cs.log('■ 收到停止请求：当前这步做完就收尾，已完成的进度会保留 …', 'warn')
             return self._send(200, b'{"ok":true}')
         if u.path == '/api/open-report':
             p = STATE.get('report') or str(cs.OUT_DIR / '学习通未完成清单.md')
