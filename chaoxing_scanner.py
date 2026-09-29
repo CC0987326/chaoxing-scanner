@@ -104,6 +104,7 @@ DEFAULT_CONFIG = {
     'brush_rate': 1.5,
     'brush_rest_every': 6,     # 每连刷 6 个视频歇一次（0 = 不歇）
     'brush_rest_seconds': 30,  # 歇多久（±40% 随机），模拟人离开一下
+    'brush_retry': 1,          # 单个视频卡住/超时后原地重试的次数（0 = 不重试）
 }
 
 # ================================================================ 日志
@@ -424,9 +425,35 @@ def launch(cfg, headless=None, offscreen=False, auto_download=True):
         try:
             ctx = pw.chromium.launch_persistent_context(**opts)
             ctx.set_default_timeout(30000)
-            # 抹掉最容易被风控识别的自动化特征
-            ctx.add_init_script(
-                "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});")
+            # 抹掉最容易被风控识别的自动化特征。补丁对每个 frame 生效；
+            # 全部是「与真实浏览器对齐」的防御性补丁，缺什么补什么，
+            # 真实值存在时不动（伪装成固定值反而克隆化）。
+            ctx.add_init_script(r"""
+Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+// window.chrome.runtime：部分检测脚本查它在不在；真实 Chrome 自带，
+// 只在缺失时补一个无功能的占位，headful 下基本是 no-op
+try {
+  if (!window.chrome) window.chrome = {};
+  if (!window.chrome.runtime) {
+    window.chrome.runtime = {
+      connect: function () {}, sendMessage: function () {},
+      PlatformOs: {MAC: 'mac', WIN: 'win', ANDROID: 'android',
+                   CROS: 'cros', LINUX: 'linux', OPENBSD: 'openbsd'}
+    };
+  }
+} catch (e) {}
+// permissions.query 对 notifications 的返回要与 Notification.permission 一致
+try {
+  if (window.Notification && navigator.permissions
+      && navigator.permissions.query) {
+    const _q = navigator.permissions.query.bind(navigator.permissions);
+    navigator.permissions.query = (p) => (
+      p && p.name === 'notifications'
+        ? Promise.resolve({state: Notification.permission})
+        : _q(p));
+  }
+} catch (e) {}
+""")
             log('浏览器已启动（%s%s，%s）' % (
                 '无头' if hl else '有窗口', '·屏幕外' if offscreen else '',
                 Path(val).name if kind == 'exe' else val))
@@ -1949,8 +1976,19 @@ def brush_video_frame(vf, cfg, progress, control) -> str:
     返回 'done' | 'stopped' | 'stuck' | 'novideo' | 'timeout'。
     学习通的心跳是播放器自己发的，我们只负责「让视频真的播完」——
     不伪造心跳请求，平台看到的就是一次真实的观看（静音、倍速）。
+
+    防检测细节（v3.3）：
+      · 倍速不取死值：围绕设定档随机取一档，部分视频中途再换一次挡
+        ——「几小时恒定同一倍速」是明显的统计特征；
+      · 播放期间每隔随机 25~70 秒在页面里注入一小段鼠标移动（CDP 注入，
+        不动用户真实光标）——「零鼠标移动挂几小时」同样是特征。
     """
-    rate = g_rate(cfg)
+    base = g_rate(cfg)
+    tiers = sorted({round(base * f, 2) for f in (0.83, 1.0, 1.17)} | {base})
+    rate = random.choice(tiers)
+    # 部分视频中途换一次挡（换到另一档，不再换回来）
+    switch_pending = random.random() < 0.35
+    switch_at = None
     if not _poll(vf, JS_VIDEO_HAS, lambda v: bool(v), 15000, 400):
         return 'novideo'
     try:
@@ -1968,11 +2006,18 @@ def brush_video_frame(vf, cfg, progress, control) -> str:
         pass
     if not st or not st.get('dur'):
         return 'novideo'
+    if switch_pending:
+        switch_at = st['t'] + (st['dur'] - st['t']) * random.uniform(0.3, 0.7)
     # 超时上限：剩余内容按倍速折算再放 80% 余量 + 2 分钟，防心跳卡住白等
-    deadline = time.time() + max((st['dur'] - st['t']) / rate * 1.8 + 120, 120)
+    # （余量按「可能切到的最低档」折算，中途降速也不会误杀）
+    low = min(tiers)
+    deadline = time.time() + max((st['dur'] - st['t']) / low * 1.8 + 120, 120)
     last_t = st['t']
     no_progress = 0        # 连续多次「暂停且位置没动过」→ 可能有插问卡死
+    lost = 0               # 连续取不到播放器状态的轮数（断网/页面崩溃的信号）
     last_report = st['t']
+    last_mouse = time.time()
+    mouse_gap = random.uniform(20, 50)
     while time.time() < deadline:
         act = control()
         if act == 'stop':
@@ -1990,13 +2035,38 @@ def brush_video_frame(vf, cfg, progress, control) -> str:
                 vf.evaluate(JS_VIDEO_PLAY, rate)
             except Exception:
                 pass
+        # 随机间隔的轻量鼠标活动：像真人盯着页面偶尔动下鼠标
+        if time.time() - last_mouse >= mouse_gap:
+            last_mouse = time.time()
+            mouse_gap = random.uniform(25, 70)
+            try:
+                pg = vf.page
+                vp = pg.viewport_size or {'width': 1440, 'height': 900}
+                mx = random.uniform(40, max(60, vp['width'] - 40))
+                my = random.uniform(60, max(80, vp['height'] - 60))
+                for _ in range(random.randint(2, 4)):
+                    pg.mouse.move(
+                        random.uniform(max(10, mx - 35), mx + 35),
+                        random.uniform(max(10, my - 25), my + 25))
+                    time.sleep(random.uniform(0.03, 0.12))
+            except Exception:
+                pass
         time.sleep(2)
         try:
             st = vf.evaluate(JS_VIDEO_STATE)
         except Exception:
+            lost += 1
+            if lost >= 8:
+                log('    页面状态连续取不到（可能断网或页面崩溃），按卡住处理。'
+                    '重新打开即可重试。', 'warn')
+                return 'stuck'
             continue
         if not st:
+            lost += 1
+            if lost >= 8:
+                return 'stuck'
             continue
+        lost = 0
         if st.get('ended') or (st['dur'] and st['t'] >= st['dur'] - 1.5):
             time.sleep(3)     # 等播放器把最后一条心跳发出去再走
             return 'done'
@@ -2015,6 +2085,17 @@ def brush_video_frame(vf, cfg, progress, control) -> str:
         else:
             no_progress = 0
         last_t = st['t']
+        # 到了随机约定的进度点就换一挡倍速：真人会中途调倍速，
+        # 恒定一个速度播完几十个视频不像人
+        if switch_pending and switch_at is not None and st['t'] >= switch_at:
+            switch_pending = False
+            others = [x for x in tiers if abs(x - rate) > 0.01]
+            if others:
+                rate = random.choice(others)
+                try:
+                    vf.evaluate(JS_VIDEO_PLAY, rate)
+                except Exception:
+                    pass
         # 平台要是把倍速/静音拨回去，就再拨回来
         if st['rate'] != rate or not st['muted']:
             try:
@@ -2024,7 +2105,7 @@ def brush_video_frame(vf, cfg, progress, control) -> str:
         if st['t'] - last_report >= 300:
             last_report = st['t']
             progress('    播放中 %s / %s（%sx 静音）'
-                     % (fmt_t(st['t']), fmt_t(st['dur']), g_rate(cfg)))
+                     % (fmt_t(st['t']), fmt_t(st['dur']), rate))
     return 'timeout'
 
 
@@ -3226,8 +3307,25 @@ def brush_node(page, c, cpi, kid, cfg, progress, control):
         except Exception:
             pass
         r = brush_video_frame(vf, cfg, progress, control)
-        if r == 'stopped':
-            return done, fail, True
+        # 卡住/超时后原地重试（网络抖动、临时卡顿最常见）：同一个页面还在，
+        # 清掉防重刷标记重跑一遍即可，不用重新导航（重新导航会把已完成的
+        # 视频卡也重播一遍，浪费时间还重复心跳）
+        retries = max(int(cfg.get('brush_retry', 1) or 0), 0)
+        attempt = 0
+        while r in ('stuck', 'timeout') and attempt < retries:
+            attempt += 1
+            if _wait_control(control, progress) == 'stop':
+                return done, fail, True
+            progress('    ⚠ 上一次%s（第 %d 次重试）…'
+                     % ('卡住' if r == 'stuck' else '超时', attempt), 'warn')
+            time.sleep(random.uniform(4.0, 8.0))
+            try:
+                vf.evaluate("() => { window.__cx_brushed = false; }")
+            except Exception:
+                pass
+            r = brush_video_frame(vf, cfg, progress, control)
+            if r == 'stopped':
+                return done, fail, True
         if r == 'done':
             done += 1
             log('    ✓ 这个视频刷完了')
