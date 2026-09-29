@@ -118,7 +118,7 @@ TASK_NAME = {
     'login': '扫码 / 短信登录',
     'doctor': '环境自检',
     'selftest': '学习通兼容性检测',
-    'brush': '自动刷视频（2 倍速静音）',
+    'brush': '自动刷视频（倍速静音）',
     'answer': '做作业并交卷（大模型答题）',
     'combo': '刷课 + 刷题（先刷视频再做作业交卷）',
     'verify': '重新核实未确认的作业',
@@ -288,8 +288,19 @@ def _worker(action, opts):
 
         if action == 'login':
             # fresh=True：点这个按钮就是要登录/换号——不自动恢复旧会话，
-            # 否则一点按钮就登回旧账号，用户根本没机会扫新码（实测踩过）
+            # 否则一点按钮就登回旧账号，用户根本没机会扫新码（实测踩过）。
+            # 同时把旧账号的浏览器 profile 整体归档：多个账号轮流共用
+            # 同一个 cookie 罐，平台侧会把它们关联成同一团伙。
+            if cs.fresh_profile() is False:
+                raise RuntimeError(
+                    '旧浏览器痕迹归档失败（可能有浏览器窗口还开着）。'
+                    '请关闭本工具后重新打开再点登录。')
             ok = cs.do_login(cfg, auto=False, fresh=True)
+            if not ok:
+                # 没登成 → 把旧账号的痕迹与会话挪回来。否则用户只是点了一下
+                # 登录、或 8 分钟没点完验证码，原来的登录态就白丢了：
+                # 下次查询还得重登，反而更容易反复撞验证码。
+                cs.restore_profile()
             with LOCK:
                 STATE['summary'] = {'登录': '成功 ✓' if ok else '未完成'}
             return
@@ -385,7 +396,7 @@ def _brush_worker(opts):
         STATE['phase'] = 'brushing'
     try:
         cfg = cs.load_config()
-        rate = min(max(float(cfg.get('brush_rate', 2) or 2), 1.0), 16.0)
+        rate = cs.g_rate(cfg)
         cs.log('播放方式：%sx 倍速 + 静音，真实播放到片尾（不伪造心跳）。' % rate)
         cs.log('只刷视频任务点；测验 / 作业不会替你自动完成。')
 
@@ -612,7 +623,7 @@ def _combo_worker(opts):
             return 'run'
 
         # ---- 第一段：刷视频 ----
-        rate = min(max(float(cfg.get('brush_rate', 2) or 2), 1.0), 16.0)
+        rate = cs.g_rate(cfg)
         cs.log('【第 1 步】刷视频：%sx 倍速 + 静音，真实播放到片尾。' % rate)
         out = cs.brush_videos(cfg, only, progress=progress, control=control)
         if out.get('stopped'):
@@ -866,7 +877,7 @@ PAGE = r"""<!DOCTYPE html>
 </head>
 <body>
 <header>
-  <h1>学习通巡检工具<small>查询只读 · 刷课/答题需手动触发 · 数据只在本机</small></h1>
+  <h1>学习通巡检工具<small>__VERSION__ · 查询只读 · 刷课/答题需手动触发 · 数据只在本机</small></h1>
 </header>
 <div class="wrap">
   <div class="side">
@@ -1224,7 +1235,7 @@ function renderResult(r){
        + '<input type="checkbox" id="sdafter"' + (sdAfterOn ? ' checked' : '')
        + '> 刷完自动关机</label>'
        + '<span class="sub">勾课程=全部章节；展开后可只勾某些章节。'
-       + '刷视频=2 倍速静音真实播放；做作业=大模型答题后直接交卷，'
+       + '刷视频=倍速静音真实播放；做作业=大模型答题后直接交卷，'
        + '同题干自动复用上次答案不重复花钱；附件/报告题会跳过并提示。'
        + '勾了自动关机：只有正常刷完才关（手动停止 / 出错不关），'
        + '关机前留 60 秒缓冲（cmd 运行 shutdown /a 可取消）。'
@@ -1467,7 +1478,7 @@ function startBrush(ev){
     if (!r.ok){ toast('刷视频没能启动（HTTP ' + r.status + '）', 'err'); return; }
     since = 0; logEl.innerHTML = '';
     $('cards').style.display = 'none'; cardFp = '';
-    $('res').innerHTML = '<div class="empty">正在后台刷视频…（2 倍速静音真实播放，'
+    $('res').innerHTML = '<div class="empty">正在后台刷视频…（倍速静音真实播放，'
       + '进度看「运行日志」；可以随时暂停/停止）</div>';
     $('bartip').textContent = '刷视频中…';
     switchTab('log');
@@ -1775,7 +1786,10 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(403, b'{"error":"forbidden"}')
         u = urlparse(self.path)
         if u.path in ('/', '/index.html'):
-            return self._send(200, PAGE.encode('utf-8'), 'text/html; charset=utf-8')
+            # PAGE 是 raw 字符串，塞不进 f-string；版本号用占位符在这里替换，
+            # 免得版本改了界面还挂着旧号（用户报问题时说不清自己用的哪版）
+            html = PAGE.replace('__VERSION__', cs.VERSION)
+            return self._send(200, html.encode('utf-8'), 'text/html; charset=utf-8')
         if u.path == '/api/poll':
             q = parse_qs(u.query)
             try:

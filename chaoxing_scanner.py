@@ -5,7 +5,8 @@
 把「登录 → 逐门课翻作业/考试/任务点 → 汇总成清单」这套流程固化成本地程序。
 
     python chaoxing_scanner.py login          首次登录（会弹出浏览器窗口，扫码或短信都行）
-    python chaoxing_scanner.py login --auto   全自动短信登录（自动识别点选验证码）
+    python chaoxing_scanner.py login --auto   全自动短信登录（需 config 里 auto_captcha=true；
+                                              无头运行，出现点选验证码会直接停下并提示）
     python chaoxing_scanner.py scan           扫描全部课程并生成清单
     python chaoxing_scanner.py scan --limit 3 只扫前 3 门课（自检用）
     python chaoxing_scanner.py doctor         检查运行环境
@@ -21,6 +22,7 @@ import argparse
 import csv
 import json
 import os
+import random
 import re
 import shutil
 import subprocess
@@ -67,13 +69,25 @@ EXAM_LIST = ('https://mooc1.chaoxing.com/exam-ans/mooc2/exam/exam-list'
              '?courseid={cid}&clazzid={clsid}&cpi={cpi}&ut=s&t={ts}')
 LOGIN_URL = 'https://passport2.chaoxing.com/login?fid=12'
 
+# 版本号：界面侧栏、启动日志、使用说明都引它，别再各处手写一份
+VERSION = 'v3.3'
+
 # 平台自身算「已完成」的状态；除此之外都视为未完成
 DONE_STATES = ('已完成', '已互评', '待批阅', '已提交', '待互评', '已结束', '已过期')
 
 DEFAULT_CONFIG = {
     'chrome_path': '',      # 留空 = 自动探测 / 自动下载
-    'headless': True,       # 扫描时是否无头运行
-    'course_delay': 1.2,    # 每门课之间的间隔秒数
+    # 有头模式的行为与真人无差；无头 Chrome 有一堆可检测特征（plugins 为空、
+    # 字体/编解码异常等），风控角度默认有头更安全。扫描时窗口会弹到前台，
+    # 想后台跑再在 config.json 里手动改回 true。
+    'headless': False,
+    # 每门课之间的间隔秒数。真人不会 1 秒切一门课；3 秒起步是风控底线，
+    # 想更稳可自己调到 5。全量 36 门课约多用 1 分钟。
+    # v3.3 起这个值是真会生效的：正常扫描就按它走，撞到风控迹象
+    # （页面未加载 / 已判定风险）时在它基础上再放慢一倍。
+    # 在此之前正常路径被回 min(base, 0.6) 夹死成固定 0.6 秒，
+    # 这颗旋钮是空的——使用说明却写着「至少隔 3 秒」。
+    'course_delay': 3.0,
     'page_wait': 3.0,       # 页面加载后的额外等待秒数
     'max_courses': 0,       # 0 = 全部
     'open_report': True,    # 生成后自动打开报告
@@ -82,6 +96,14 @@ DEFAULT_CONFIG = {
     'llm_url': '',          # 大模型接口地址（OpenAI 兼容，如 https://api.xx.com/v1）
     'llm_key': '',          # 大模型 API Key（只存在本机 config.json）
     'llm_model': '',        # 模型名（如 gpt-4o-mini / deepseek-chat）
+    # 点选验证码默认留给用户手点：弹验证码本身就说明已被风控关注，
+    # OCR 识别率有限，点错重试反而加重标记。确要自动识别才改 true。
+    'auto_captcha': False,
+    # 刷课倍速默认 1.5x：静音 + 2x + 连续几小时是明显的统计特征；
+    # 心跳仍是真实播放产生的（不伪造），只是节奏更像人。
+    'brush_rate': 1.5,
+    'brush_rest_every': 6,     # 每连刷 6 个视频歇一次（0 = 不歇）
+    'brush_rest_seconds': 30,  # 歇多久（±40% 随机），模拟人离开一下
 }
 
 # ================================================================ 日志
@@ -364,7 +386,7 @@ def launch(cfg, headless=None, offscreen=False, auto_download=True):
         except Exception as e:
             log('自动下载失败（将尝试使用系统已装的 Chrome）：%s' % e, 'warn')
 
-    hl = cfg.get('headless', True) if headless is None else headless
+    hl = cfg.get('headless', False) if headless is None else headless
     args = [
         '--no-sandbox',
         '--disable-dev-shm-usage',
@@ -377,6 +399,10 @@ def launch(cfg, headless=None, offscreen=False, auto_download=True):
         args += ['--window-position=-32000,-32000', '--window-size=1440,900']
 
     PROFILE_DIR.mkdir(parents=True, exist_ok=True)
+    # viewport 每次启动随机抽一个常见分辨率：固定 1440x900 会让「同一工具
+    # 的所有账号」在平台侧呈现一模一样的画布尺寸，反而方便划成同一团伙
+    vw, vh = random.choice([(1440, 900), (1536, 864), (1366, 768),
+                            (1600, 900), (1920, 969)])
     ua = fake_user_agent(cfg, _chrome_candidates(cfg))
     errors = []
     pw = sync_playwright().start()
@@ -385,7 +411,7 @@ def launch(cfg, headless=None, offscreen=False, auto_download=True):
             user_data_dir=str(PROFILE_DIR),
             headless=hl,
             args=args,
-            viewport={'width': 1440, 'height': 900},
+            viewport={'width': vw, 'height': vh},
             locale='zh-CN',
             timezone_id='Asia/Shanghai',
             ignore_https_errors=True,
@@ -457,6 +483,79 @@ def save_state(ctx):
         log('会话保存失败：%s' % e, 'warn')
 
 
+def fresh_profile():
+    """换号登录前清场：归档浏览器 profile 与登录会话，新账号从零开始。
+
+    为什么：多个账号轮流共用同一个浏览器 profile（同一个 cookie 罐）时，
+    平台侧看到的是「同一罐 cookie 里先后出现多个不同 uid」，账号之间
+    会被关联分析划成同一团伙。每次换号换新罐，账号间在 cookie 层面
+    不再共享任何痕迹。
+
+    做法：profile 目录整体改名归档（同盘 rename，瞬时完成），state.json
+    一起挪进去。只保留最近一份归档；改名失败（多半有浏览器进程占用）
+    就什么都不动并返回 False，由调用方提示。
+    """
+    old = PROFILE_DIR.with_name('profile_old')
+    try:
+        if old.exists():
+            shutil.rmtree(old, ignore_errors=True)
+    except Exception:
+        pass
+    if not PROFILE_DIR.exists():
+        # 本来就没有 profile（首次使用），只需清掉旧会话文件
+        try:
+            if STATE_FILE.exists():
+                STATE_FILE.unlink()
+        except Exception:
+            pass
+        return True
+    try:
+        PROFILE_DIR.rename(old)
+    except Exception as e:
+        log('归档旧浏览器痕迹失败（可能有浏览器窗口还开着）：%s' % str(e)[:80],
+            'warn')
+        log('请关闭工具重开后再点登录，否则新旧账号会共用同一个浏览器痕迹。',
+            'warn')
+        return False
+    try:
+        if STATE_FILE.exists():
+            shutil.move(str(STATE_FILE), str(old / 'state.json'))
+    except Exception:
+        pass
+    log('已归档旧账号的浏览器痕迹（runtime/profile_old），本次登录使用全新会话。')
+    return True
+
+
+def restore_profile():
+    """fresh_profile() 的逆操作：把归档的浏览器痕迹和会话挪回原位。
+
+    用在新登录没成功的时候。否则用户只是点一下登录、或验证码没点完，
+    原来的登录态就被归档走了，下次查询还得重登一遍（反而更容易反复
+    撞验证码）——这属于「换个号把老号也搭进去」，必须能回滚。
+
+    调用前要先关掉浏览器（profile 目录被占用时 rename 会失败）。
+    """
+    old = PROFILE_DIR.with_name('profile_old')
+    if not old.exists():
+        return False
+    try:
+        if PROFILE_DIR.exists():
+            shutil.rmtree(PROFILE_DIR, ignore_errors=True)
+        old.rename(PROFILE_DIR)
+    except Exception as e:
+        log('回滚旧浏览器痕迹失败：%s' % str(e)[:80], 'warn')
+        log('旧痕迹还在 runtime/profile_old，可手动改名回 runtime/profile。',
+            'warn')
+        return False
+    try:
+        if (PROFILE_DIR / 'state.json').exists():
+            shutil.move(str(PROFILE_DIR / 'state.json'), str(STATE_FILE))
+    except Exception:
+        pass
+    log('登录没有成功，已把上一个账号的浏览器痕迹与会话挪回原位。')
+    return True
+
+
 # ================================================================ 页面判定
 # ---------------------------------------------------------------- 按需等待
 # 学习通这些页面都是「先返回骨架、再异步填内容」：domcontentloaded 之后正文
@@ -493,7 +592,8 @@ def _poll(page, expr, ok, timeout_ms, interval_ms=_POLL_MS):
         if time.time() >= deadline:
             return val
         try:
-            page.wait_for_timeout(interval_ms)
+            # 轮询间隔带随机抖动：固定节奏的请求间隔是机器特征
+            page.wait_for_timeout(int(interval_ms * random.uniform(0.7, 1.6)))
         except Exception:
             return val
 
@@ -522,7 +622,7 @@ def _settle(page, expr, quiet_ms=260, cap_ms=1200, interval_ms=_POLL_MS):
         if time.time() >= deadline:
             return cur
         try:
-            page.wait_for_timeout(interval_ms)
+            page.wait_for_timeout(int(interval_ms * random.uniform(0.7, 1.6)))
         except Exception:
             return cur
 
@@ -752,13 +852,30 @@ def _login_auto(cfg, phone=''):
             log('找不到「获取验证码」按钮', 'warn')
         page.wait_for_timeout(3000)
 
-        # 处理点选验证码
+        # 处理点选验证码。这条链路是「全自动短信登录」，浏览器是**无头**的
+        # （见本函数开头的 launch(cfg, headless=True)）——没有窗口可以点。
+        # 所以 auto_captcha 关掉时不能像有头链路那样「提示用户手点然后干等」：
+        # 那是 180 秒纯空转，界面上还写着一句根本没窗口可点的提示。
+        # 这里改成识别不了就立刻停下说清楚，让人改走有头链路。
         try:
-            from captcha_solver import solve_point_captcha
-            if solve_point_captcha(page):
-                log('点选验证码已通过 ✓')
-            else:
-                log('点选验证码自动识别未通过', 'warn')
+            from captcha_solver import read_targets, solve_point_captcha
+            if read_targets(page):
+                if cfg.get('auto_captcha') and solve_point_captcha(
+                        page, interactive=False):
+                    log('点选验证码已通过 ✓')
+                else:
+                    log('出现点选验证码。', 'warn')
+                    if not cfg.get('auto_captcha'):
+                        log('全自动登录默认不做验证码识别'
+                            '（config.json 的 auto_captcha 为 false）。', 'warn')
+                    else:
+                        log('自动识别没能通过。', 'warn')
+                    log('全自动短信登录跑在无头浏览器里，没有窗口可人工点选，'
+                        '本次到此为止。', 'err')
+                    log('请改在图形界面点「扫码 / 短信登录」（会弹出窗口），'
+                        '或把 config.json 的 auto_captcha 设为 true。', 'err')
+                    _login_fail = 'captcha'
+                    return False
         except Exception as e:
             log('验证码模块不可用：%s' % e, 'warn')
         page.wait_for_timeout(3000)
@@ -843,12 +960,38 @@ def do_login_password(cfg, phone, password, headless=False) -> bool:
     ctx = launch(cfg, headless=headless, offscreen=False)
     page = ctx.new_page()
     keep_open = False
+    swapped = False          # 本次是否归档了旧痕迹、换成了全新的罐
+    logged_in = False        # 是否真的登进去了（决定要不要回滚）
     try:
         # 原来这里先 goto 一次个人空间再等 2 秒，但那发生在注入 cookie **之前**，
         # 纯属白等；直接让下面的 check_login 带着 cookie 打开一次就够。
         if restore_state(ctx) and check_login(page, navigate=True):
             log('已有有效会话，无需重新登录 ✓')
             return True
+
+        # 走到这说明 state.json 里没有可用会话 → 这是一次「真的要登录」。
+        # 换号登录前先换罐：持久化 profile 里可能还躺着上一个账号的 cookie
+        # （启动即带），不换罐的话访问登录页时旧 cookie 就随请求发出去了，
+        # 新账号登上去也是在「装着别人 cookie 的罐」里。做法与界面上的
+        # 「扫码 / 短信登录」按钮一致。归档必须在浏览器开着之前做，
+        # 所以这里先关掉再重开一次。
+        #
+        # （v3.3 前这里是 ctx.clear_cookies()：只在 cookie 层面擦一把，
+        #   profile 里的 localStorage / IndexedDB / 缓存还留着；而且它
+        #   在「会话只是瞬时判失败」时也会把仍然有效的 cookie 抹掉，
+        #   直接把用户踢下线。换成整体归档就没有这两个问题。）
+        try:
+            close_ctx(ctx)
+        except Exception:
+            pass
+        if not fresh_profile():
+            log('旧浏览器痕迹归档失败（可能有浏览器窗口还开着）。', 'err')
+            log('请关闭本工具后重新打开，再重新登录一次。', 'err')
+            _login_fail = 'other'
+            return False
+        swapped = True
+        ctx = launch(cfg, headless=headless, offscreen=False)
+        page = ctx.new_page()
 
         page.goto(LOGIN_URL, wait_until='domcontentloaded')
         # 等登录表单渲染出来（上限仍是 2.5 秒）
@@ -891,26 +1034,39 @@ def do_login_password(cfg, phone, password, headless=False) -> bool:
                 time.sleep(2)
                 if check_login(page, navigate=True):
                     save_state(ctx)
+                    logged_in = True
                     log('登录成功 ✓')
                     return True
                 log('  登录还没真正建立，继续等 …', 'warn')
                 continue
-            # 点选验证码：先试自动识别（装了 ddddocr 才有）
+            # 点选验证码：默认留给用户手点。弹验证码＝平台已在关注这个会话，
+            # OCR 识别率有限，点错重试反而加重标记；自动识别只在
+            # config.json 里显式 'auto_captcha': true 时才启用（装了 ddddocr 才有）
             try:
-                from captcha_solver import read_targets, solve_point_captcha
-                if read_targets(page):
-                    if not human_warned:
-                        log('出现点选验证码，尝试自动识别 …')
-                    if solve_point_captcha(page, interactive=False):
-                        log('验证码已通过 ✓')
-                        page.wait_for_timeout(3000)
-                        continue
-                    if not human_warned:
-                        human_warned = True
-                        keep_open = True
-                        log('自动识别未通过 → 请在弹出的浏览器窗口里手动点选完成验证。', 'warn')
-                        log('（窗口会保持打开，完成后自动继续）', 'warn')
-                        deadline = time.time() + 300   # 给人操作留足时间
+                if cfg.get('auto_captcha'):
+                    from captcha_solver import read_targets, solve_point_captcha
+                    if read_targets(page):
+                        if not human_warned:
+                            log('出现点选验证码，尝试自动识别 …')
+                        if solve_point_captcha(page, interactive=False):
+                            log('验证码已通过 ✓')
+                            page.wait_for_timeout(3000)
+                            continue
+                        if not human_warned:
+                            human_warned = True
+                            keep_open = True
+                            log('自动识别未通过 → 请在弹出的浏览器窗口里手动点选完成验证。', 'warn')
+                            log('（窗口会保持打开，完成后自动继续）', 'warn')
+                            deadline = time.time() + 300   # 给人操作留足时间
+                else:
+                    from captcha_solver import read_targets
+                    if read_targets(page):
+                        if not human_warned:
+                            human_warned = True
+                            keep_open = True
+                            log('出现点选验证码 → 请在弹出的浏览器窗口里手动点选完成验证。', 'warn')
+                            log('（窗口会保持打开，完成后自动继续）', 'warn')
+                            deadline = time.time() + 300   # 给人操作留足时间
             except Exception:
                 pass
             # 服务器明确回绝
@@ -931,6 +1087,10 @@ def do_login_password(cfg, phone, password, headless=False) -> bool:
     finally:
         if not keep_open:
             close_ctx(ctx)
+            # 换了新罐又没登成 → 把旧账号的痕迹与会话挪回原位，
+            # 别让一次没成的登录把原来的登录态也搭进去
+            if swapped and not logged_in:
+                restore_profile()
 
 
 # ================================================================ 取课程
@@ -1005,9 +1165,13 @@ def _lazy_scroll(page, step=300, max_steps=90, wait_ms=350, interval_ms=90):
             still += 1
             if still >= 2:
                 break
-        page.evaluate("() => window.scrollBy(0, %d)" % step)
+        # 步长与等待都带随机抖动：等距滚动、固定节奏是机器特征。
+        # 抖动只动「等多久、滚多远」，不动「每屏等渲染」的契约（照旧等条目数变多）。
+        page.evaluate("() => window.scrollBy(0, %d)"
+                      % int(step * random.uniform(0.8, 1.25)))
         # 等到这一屏渲染出来（条目数增加）或等满 wait_ms
-        _poll(page, JS_COUNT_PROG, _grown(before), wait_ms, interval_ms)
+        _poll(page, JS_COUNT_PROG, _grown(before),
+              int(wait_ms * random.uniform(0.7, 1.3)), interval_ms)
     # 收尾：还有没渲染完的就继续等，渲染完了立刻回页顶
     _settle(page, JS_COUNT_PROG, quiet_ms=240, cap_ms=1200)
     page.evaluate("() => window.scrollTo(0, 0)")
@@ -1403,6 +1567,22 @@ def checkpoint(stage: str = '') -> bool:
         return True
 
 
+def _course_wait(cfg_base, risky):
+    """两门课之间睡多久（秒）。
+
+    risky = 这门课页面没加载成功、或已经判定撞了风控。撞了就在基础节奏上
+    再放慢一倍，但无论如何不低于 2.5 秒。
+
+    单独抽成函数是为了能被测试直接验：v3.2 那次「course_delay 默认改成 3 秒」
+    在正常路径上是假的——一行 min(base, 0.6) 把它夹死成固定的 0.6 秒，
+    测试却只 grep 源码里字符串出现过，照样全绿（假绿灯）。
+    """
+    base = float(cfg_base or 0) or float(DEFAULT_CONFIG['course_delay'])
+    if risky:
+        return max(base * 2.0, 2.5)
+    return max(base, 0.6)
+
+
 def scan(cfg, limit=0, headless=None, open_report=None, deep=True, only=None) -> dict:
     """扫描并出报告。
 
@@ -1564,8 +1744,8 @@ def scan(cfg, limit=0, headless=None, open_report=None, deep=True, only=None) ->
                     stopped = True
                     break
                 log('冷却结束，继续。')
-            base = cfg.get('course_delay', 1.2)
-            time.sleep(max(base, 2.5) if bad or seen_risk else min(base, 0.6))
+            base = cfg.get('course_delay', 3.0)
+            time.sleep(_course_wait(base, bad or seen_risk))
 
         failed_courses = [
             {'course': r['name'],
@@ -1768,9 +1948,9 @@ def brush_video_frame(vf, cfg, progress, control) -> str:
 
     返回 'done' | 'stopped' | 'stuck' | 'novideo' | 'timeout'。
     学习通的心跳是播放器自己发的，我们只负责「让视频真的播完」——
-    不伪造心跳请求，平台看到的就是一次真实的观看（静音、2 倍速）。
+    不伪造心跳请求，平台看到的就是一次真实的观看（静音、倍速）。
     """
-    rate = min(max(float(cfg.get('brush_rate', 2) or 2), 1.0), 16.0)
+    rate = g_rate(cfg)
     if not _poll(vf, JS_VIDEO_HAS, lambda v: bool(v), 15000, 400):
         return 'novideo'
     try:
@@ -1849,7 +2029,39 @@ def brush_video_frame(vf, cfg, progress, control) -> str:
 
 
 def g_rate(cfg):
-    return min(max(float(cfg.get('brush_rate', 2) or 2), 1.0), 16.0)
+    return min(max(float(cfg.get('brush_rate', 1.5) or 1.5), 1.0), 16.0)
+
+
+def brush_pace_rest(done_total, cfg, progress, control, state=None):
+    """连刷若干个视频后歇一会（可被「停止」打断）。
+
+    静音倍速连刷几个小时、中途零停顿，是刷课最明显的统计特征之一；
+    每刷 brush_rest_every 个视频歇 brush_rest_seconds 秒（±40% 抖动），
+    节奏更像真人（人总要离开一下）。返回 True 表示被用户停止。
+
+    state：跨节点共享的小本子（{'last': 上次已经歇过的累计数}）。没有它会
+    出问题：本函数是在**每个节点之后**调的，而「文档卡 / 音频卡 / 章节页
+    打不开」的节点完成数是 0——计数停在原地，一旦正好卡在倍数上，后面每个
+    零进度节点都会再歇一次，连续几个节点就是几分钟白睡。
+    """
+    every = int(cfg.get('brush_rest_every', 6) or 0)
+    if every <= 0 or done_total <= 0 or done_total % every:
+        return False
+    if state is None:
+        state = {}
+    if done_total <= int(state.get('last', 0)):
+        return False                     # 计数没往前走，别再歇一遍
+    state['last'] = done_total
+    secs = float(cfg.get('brush_rest_seconds', 30) or 30)
+    secs = max(5.0, secs) * random.uniform(0.6, 1.4)
+    progress('    已连刷 %d 个视频，歇 %.0f 秒再继续（可点停止）…'
+             % (done_total, secs))
+    end = time.time() + secs
+    while time.time() < end:
+        time.sleep(1)
+        if _wait_control(control, progress) == 'stop':
+            return True
+    return False
 
 
 # ================================================================ LLM 自动答题（v2.9，v2.11 改直接交卷）
@@ -2361,6 +2573,9 @@ def answer_one(page, c, cpi, kid, cfg, submit, progress, pre=None, detail=None):
             log('    作业卡两次都没渲染出答题页。', 'warn')
             return 'norender'
         return 'nohw'                        # 视频/文档卡，答题模块不碰
+    # 开卷先「读题」停留：开卷几秒内做完交卷是老师端和风控端都看得见的
+    # 时序特征，停留时长随机、与题数无关地拉开
+    time.sleep(random.uniform(4.0, 9.0))
     timus = _poll(hw, JS_PARSE_TIMUS, lambda v: bool(v), 12000, 400) or []
     if not timus:
         log('    作业卡打开但没解析到题目（可能结构变了），跳过。', 'warn')
@@ -2463,6 +2678,8 @@ def answer_one(page, c, cpi, kid, cfg, submit, progress, pre=None, detail=None):
         r = hw.evaluate(JS_FILL_ANSWERS, opt_fills)
         log('    已填 %d 个选项（未命中 %d）。' % (r.get('ok', 0), r.get('miss', 0)))
     if picked:
+        # 客观题与主观题之间隔一会，别一瞬全填完
+        time.sleep(random.uniform(1.0, 3.0))
         r = hw.evaluate(JS_FILL_TEXT, picked)
         log('    已填 %d 道主观题（未命中 %d）。' % (r.get('ok', 0), r.get('miss', 0)))
         # 主观题没真正写进编辑器（UE 未就绪等）＝平台会收到空答案。
@@ -2512,6 +2729,8 @@ def answer_one(page, c, cpi, kid, cfg, submit, progress, pre=None, detail=None):
         page.on('response', _on_resp)
         page.on('request', _on_req)
     try:
+        # 提交前再停一下：填完立刻点提交在时序上太齐整
+        time.sleep(random.uniform(2.0, 5.0))
         act = hw.evaluate(JS_DO_SUBMIT if submit else JS_DO_SAVE)
         if act != 'ok':
             log('    %s调用失败：%s' % ('交卷' if submit else '暂存', act), 'warn')
@@ -2727,7 +2946,7 @@ def answer_courses(cfg, only, submit=False, progress=None, control=None,
                     f += 1
                 else:
                     f += 1
-                time.sleep(max(float(cfg.get('course_delay', 1.2)), 1.0))
+                time.sleep(max(float(cfg.get('course_delay', 3.0)), 1.0))
             out['courses'].append({'name': c['name'], 'submitted': su,
                                    'saved': s, 'skipped': sk, 'fail': f,
                                    'report': rp, 'unverified': uw})
@@ -2743,7 +2962,7 @@ def answer_courses(cfg, only, submit=False, progress=None, control=None,
             if stopped_here:
                 out['stopped'] = True
                 break
-            time.sleep(max(float(cfg.get('course_delay', 1.2)), 2.0))
+            time.sleep(max(float(cfg.get('course_delay', 3.0)), 2.0))
         if submit == 'dry':
             n_ready = sum(1 for it in out['items'] if it['status'] == 'ready')
             n_need = sum(1 for it in out['items']
@@ -2844,7 +3063,7 @@ def submit_items(cfg, items, progress=None, control=None, headless=None) -> dict
                 out['fail'] += 1
                 out['results'].append({'key': it.get('key'),
                                        'kid': it.get('kid'), 'status': 'fail'})
-                time.sleep(max(float(cfg.get('course_delay', 1.2)), 1.5))
+                time.sleep(max(float(cfg.get('course_delay', 3.0)), 1.5))
                 continue
             if r == 'submitted':
                 out['submitted'] += 1
@@ -2863,7 +3082,7 @@ def submit_items(cfg, items, progress=None, control=None, headless=None) -> dict
                 st = 'fail'
             out['results'].append({'key': it.get('key'), 'kid': it.get('kid'),
                                    'status': st})
-            time.sleep(max(float(cfg.get('course_delay', 1.2)), 1.5))
+            time.sleep(max(float(cfg.get('course_delay', 3.0)), 1.5))
         progress('交卷结束：成功 %d 份，未确认 %d 份，失败 %d 份，需人工 %d 份，'
                  '用时 %.0f 分钟。'
                  % (out['submitted'], out['unverified'], out['fail'],
@@ -3043,6 +3262,8 @@ def brush_videos(cfg, only, progress=None, control=None, headless=None) -> dict:
     ctx = launch(cfg, headless=headless)
     page = ctx.new_page()
     out = {'courses': [], 'done': 0, 'fail': 0, 'stopped': False}
+    # 连刷歇息的小本子：见 brush_pace_rest 的说明（防零进度节点反复歇）
+    rest_state = {'last': 0}
     try:
         banner('检查登录状态')
         if not check_login(page):
@@ -3101,7 +3322,12 @@ def brush_videos(cfg, only, progress=None, control=None, headless=None) -> dict:
                 cf += f
                 if stopped_here:
                     break
-                time.sleep(max(float(cfg.get('course_delay', 1.2)), 1.0))
+                # 连刷一阵就歇一会：连续几小时零停顿是明显统计特征
+                if brush_pace_rest(out['done'] + cd, cfg, progress, control,
+                                   rest_state):
+                    stopped_here = True
+                    break
+                time.sleep(max(float(cfg.get('course_delay', 3.0)), 1.0))
             out['courses'].append({'name': c['name'], 'done': cd, 'fail': cf})
             out['done'] += cd
             out['fail'] += cf
@@ -3112,7 +3338,7 @@ def brush_videos(cfg, only, progress=None, control=None, headless=None) -> dict:
                 out['stopped'] = True
                 break
             # 课程之间留足间隔：刷视频的请求密度比扫描高得多，别在课间也贴地飞行
-            time.sleep(max(float(cfg.get('course_delay', 1.2)), 2.0))
+            time.sleep(max(float(cfg.get('course_delay', 3.0)), 2.0))
         progress('刷视频结束：完成 %d 个，未完成 %d 个，用时 %.0f 分钟。'
                  % (out['done'], out['fail'], (time.time() - t0) / 60))
         if out['fail']:
@@ -3698,12 +3924,12 @@ def main(argv=None):
     p.add_argument('--headed', action='store_true', help='显示浏览器窗口')
 
     p = sub.add_parser('brush',
-                       help='自动刷未完成的任务点视频（2 倍速静音真实播放）')
+                       help='自动刷未完成的任务点视频（倍速静音真实播放）')
     p.add_argument('courses', nargs='+',
                    help='课程名（支持部分匹配，可给多个）')
     p.add_argument('--headed', action='store_true', help='显示浏览器窗口')
     p.add_argument('--rate', type=float, default=None,
-                   help='播放倍速（默认取 config 的 brush_rate，再默认 2）')
+                   help='播放倍速（默认取 config 的 brush_rate，再默认 1.5）')
 
     p = sub.add_parser('answer',
                        help='用大模型自动做章节任务点里的作业（先在 config 填 llm_url/llm_key/llm_model）')

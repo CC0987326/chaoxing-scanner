@@ -1,10 +1,17 @@
 {
   "chrome_path": "",
-  "headless": true,
-  "course_delay": 1.2,
-  "page_wait": 3.0,
+  "headless": false,
+  "course_delay": 3.0,
+  "page_wait": 2,
   "max_courses": 0,
-  "open_report": true,
+  "open_report": false,
   "cpi": "",
-  "user_agent": ""
+  "user_agent": "",
+  "llm_url": "https://api.deepseek.com/v1",
+  "llm_key": "",
+  "llm_model": "deepseek-flash",
+  "auto_captcha": false,
+  "brush_rate": 1.5,
+  "brush_rest_every": 6,
+  "brush_rest_seconds": 30
 }
