@@ -116,26 +116,72 @@ def banner(title: str):
     log('─' * 62)
 
 
+# ================================================================ 防休眠
+_ES_CONTINUOUS = 0x80000000     # 恢复由系统管理（调用即清除本次持有）
+_ES_SYSTEM_REQUIRED = 0x00000001  # 阻止系统空闲睡眠 / 休眠（屏幕仍可关）
+
+
+def keep_awake(on: bool):
+    """任务运行期间阻止 Windows 自动睡眠（v2.11.4）。
+
+    只压住「系统空闲睡眠」，**不锁屏幕**——屏幕到点照常关闭，用户合盖前
+    记得别选「合盖=睡眠」的电源动作即可。任务线程结束（含异常）时必须
+    以 keep_awake(False) 恢复。非 Windows 平台直接忽略。
+    注意 SetThreadExecutionState 是按线程持有的，必须在同一线程内开关。
+
+    v2.11.5：开关都写日志——用户报告过「空闲时也不让睡」，日志化后
+    谁在什么时候持有、持有多久，一眼可查。
+    """
+    if os.name != 'nt':
+        return
+    try:
+        import ctypes
+        flags = _ES_CONTINUOUS | (_ES_SYSTEM_REQUIRED if on else 0)
+        ctypes.windll.kernel32.SetThreadExecutionState(flags)
+        log('防睡眠：%s' % ('开（任务运行中，屏幕仍可正常关闭）' if on else '关（已恢复系统自主睡眠）'))
+    except Exception:
+        pass  # 防休眠失败不影响任务本身，只会在电源计划到点时睡掉
+
+
 # ================================================================ 配置
 def load_config() -> dict:
     cfg = dict(DEFAULT_CONFIG)
-    if CONFIG_FILE.exists():
-        try:
-            cfg.update(json.loads(CONFIG_FILE.read_text(encoding='utf-8')))
-        except Exception as e:
-            # 解析失败绝不能「静默用默认」就完事：任务线程随后 save_config
-            # 会用不含 llm 键的默认 cfg 覆盖写回，用户保存的大模型信息
-            # 就这么被抹掉（实测：查询中保存的模型信息莫名消失）。把坏
-            # 文件留档，方便排查是并发写坏还是手改坏了。
-            bak = CONFIG_FILE.with_suffix('.json.bad')
-            try:
-                CONFIG_FILE.replace(bak)
-                log('config.json 解析失败（%s），已把原文件留档到 %s，'
-                    '用默认值继续。' % (e, bak.name), 'warn')
-            except Exception:
-                log('配置文件解析失败，用默认值：%s' % e, 'warn')
-    else:
+    if not CONFIG_FILE.exists():
         save_config(cfg)
+        return cfg
+    # 读文件先容忍「瞬时不可读」：Windows 上 os.replace 进行中时，
+    # 并发读方会拿到 PermissionError（Python 开文件不带 FILE_SHARE_DELETE）。
+    # 这种情况重试就行；当成解析失败会把好端端的 config 归档成 .bad。
+    txt = None
+    perm_err = None
+    for _ in range(5):
+        try:
+            txt = CONFIG_FILE.read_text(encoding='utf-8')
+            break
+        except PermissionError as e:
+            perm_err = e
+            time.sleep(0.05)
+        except OSError:
+            break
+    if txt is None:
+        if perm_err:
+            log('config.json 暂时不可读（正在被并发写入？），'
+                '本次先用默认值：%s' % perm_err, 'warn')
+        return cfg
+    try:
+        cfg.update(json.loads(txt))
+    except Exception as e:
+        # 解析失败绝不能「静默用默认」就完事：任务线程随后 save_config
+        # 会用不含 llm 键的默认 cfg 覆盖写回，用户保存的大模型信息
+        # 就这么被抹掉（实测：查询中保存的模型信息莫名消失）。把坏
+        # 文件留档，方便排查是并发写坏还是手改坏了。
+        bak = CONFIG_FILE.with_suffix('.json.bad')
+        try:
+            CONFIG_FILE.replace(bak)
+            log('config.json 解析失败（%s），已把原文件留档到 %s，'
+                '用默认值继续。' % (e, bak.name), 'warn')
+        except Exception:
+            log('配置文件解析失败，用默认值：%s' % e, 'warn')
     return cfg
 
 
@@ -148,7 +194,22 @@ def save_config(cfg: dict):
     tmp = CONFIG_FILE.with_suffix('.json.tmp%d' % threading.get_ident())
     tmp.write_text(
         json.dumps(cfg, ensure_ascii=False, indent=2), encoding='utf-8')
-    tmp.replace(CONFIG_FILE)
+    # Windows 上目标文件被并发读句柄攥着时，os.replace 会瞬时
+    # PermissionError（WinError 5）。短暂重试即可成功；不重试的话，
+    # 扫描中途的检查点存盘失败会以异常中止整个任务（实测复现）。
+    last = None
+    for _ in range(10):
+        try:
+            os.replace(tmp, CONFIG_FILE)
+            return
+        except PermissionError as e:
+            last = e
+            time.sleep(0.06)
+    try:
+        tmp.unlink(missing_ok=True)
+    except Exception:
+        pass
+    raise last
 
 
 # ================================================================ 浏览器内核
@@ -356,13 +417,18 @@ def launch(cfg, headless=None, offscreen=False, auto_download=True):
 
 
 def close_ctx(ctx):
+    # pw.stop 必须独立于 ctx.close 的成败：ctx.close 抛异常就跳过 stop
+    # 的话，playwright driver 进程会留下来（泄漏，实测内存里挂一堆 node）
+    pw = getattr(ctx, '_wb_pw', None)
     try:
-        pw = getattr(ctx, '_wb_pw', None)
         ctx.close()
-        if pw:
-            pw.stop()
     except Exception:
         pass
+    if pw:
+        try:
+            pw.stop()
+        except Exception:
+            pass
 
 
 def restore_state(ctx) -> bool:
@@ -573,7 +639,16 @@ def do_login(cfg, auto=False, phone='', fresh=False):
     page = ctx.new_page()
     try:
         if fresh:
-            log('本次为重新登录：已忽略旧登录会话，请直接扫码或登录新账号。')
+            # 只跳过 restore_state 不够：launch 用的是持久化 profile，
+            # 旧账号的 cookie 本来就躺在里面，启动即带——不主动清掉，
+            # passport 对已登录用户自动跳转时照样「换号失败登回旧号」。
+            try:
+                ctx.clear_cookies()
+                log('本次为重新登录：已忽略并清除旧登录会话，'
+                    '请直接扫码或登录新账号。')
+            except Exception as e:
+                log('清除旧会话失败（仍会尝试忽略旧号）：%s' % str(e)[:80],
+                    'warn')
         else:
             restore_state(ctx)
             page.goto(BASE_URL, wait_until='domcontentloaded')
@@ -1361,7 +1436,12 @@ def scan(cfg, limit=0, headless=None, open_report=None, deep=True, only=None) ->
         total_all = len(courses)
         if cpi:
             cfg['cpi'] = cpi
-            save_config(cfg)
+            try:
+                save_config(cfg)
+            except Exception as e:
+                # 存 cpi 只是缓存优化，落盘失败不该中止整场扫描
+                log('cpi 写回配置失败（不影响本次查询）：%s' % str(e)[:60],
+                    'warn')
         if only:
             want = [k for k in only if k]
             keep = set(want)
@@ -1585,7 +1665,11 @@ def list_courses(cfg, headless=None) -> dict:
         courses, cpi = collect_courses(page, cfg)
         if cpi:
             cfg['cpi'] = cpi
-            save_config(cfg)
+            try:
+                save_config(cfg)
+            except Exception as e:
+                log('cpi 写回配置失败（不影响本次查询）：%s' % str(e)[:60],
+                    'warn')
         items = [{'key': course_key(c), 'name': c['name'], 'cid': c['cid'],
                   'clsid': c.get('clsid', ''), 'prog': c.get('prog', '')}
                  for c in courses]
@@ -1866,6 +1950,11 @@ JS_FILL_TEXT = r"""
             .replace(/\n/g, '<br>');
         }
       } catch (e) { /* 跨域/未就绪则放弃 */ }
+      // ⚠ 走到兜底 = UE API 没写进去。textarea 只是壳，平台 serialize
+      // 读不到（实测），iframe 直写也无法确认平台收没收到——一律计为
+      // miss，交卷侧会拦下这份卷子，绝不把空简答悄悄交上去。
+      miss++;
+      return;
     }
     ok++;
   });
@@ -1976,6 +2065,9 @@ def _parse_llm_answers(txt, n, types=None):
     types = {题号: atype}：传入时按题型精确规范化（选择题才大写字母、
     判断题才转对错，简答/填空文本原样保留）；未传时用启发式（≤4 个
     字母才大写化，避免把纯字母的简答文本误当选项）。
+    注意 n 是**最大题号**不是题数——交卷复用预演答案时传入的是带空洞
+    的子集（如全卷 6 题只重问第 3、6 题），按题数设上限会把模型如实
+    返回的「3」「6」全丢掉，这份卷子就永远交不了（实测踩过）。
     """
     import re
     cands = re.findall(r'\{[^{}]*\}', txt, re.S)
@@ -2030,11 +2122,22 @@ def _answer_cache_load():
 
 
 def _answer_cache_save(cache):
+    # 原子写（tmp + replace）：缓存文件几百 KB 且答题中途随时可能崩，
+    # 截断式覆盖一旦写一半损坏，整份缓存就全丢了
+    import os
+    import threading
+    tmp = ANSWER_CACHE_FILE.with_suffix(
+        '.json.tmp%d' % threading.get_ident())
     try:
-        ANSWER_CACHE_FILE.write_text(
-            json.dumps(cache, ensure_ascii=False), encoding='utf-8')
+        tmp.write_text(json.dumps(cache, ensure_ascii=False),
+                       encoding='utf-8')
+        os.replace(tmp, ANSWER_CACHE_FILE)
     except Exception as e:
         log('答案缓存写入失败（不影响答题）：%s' % str(e)[:60], 'warn')
+        try:
+            tmp.unlink(missing_ok=True)
+        except Exception:
+            pass
 
 
 def llm_solve(cfg, timus, progress):
@@ -2084,8 +2187,11 @@ def llm_solve(cfg, timus, progress):
               '没有把握的题输出 "?"。不要输出 JSON 以外的任何文字。\n\n'
               + '\n\n'.join(lines))
     txt = llm_chat(cfg, prompt)
-    ans = _parse_llm_answers(txt, len(timus),
-                             types={t['no']: t['atype'] for t in todo})
+    # 上限用真实最大题号而非题数：todo 可能是带空洞的子集
+    # （交卷复用预演答案时只重问没答上的题，题号仍是整卷序号）
+    ans = _parse_llm_answers(
+        txt, max((t['no'] for t in timus), default=0),
+        types={t['no']: t['atype'] for t in todo})
     # 模型拒答拦截：「无法代为提交…」「我不能替你…」这类话不算答案。
     # 乱码题干（平台字体反爬）会诱发拒答，拒答文本绝不能写进作业。
     import re as _re
@@ -2359,6 +2465,12 @@ def answer_one(page, c, cpi, kid, cfg, submit, progress, pre=None, detail=None):
     if picked:
         r = hw.evaluate(JS_FILL_TEXT, picked)
         log('    已填 %d 道主观题（未命中 %d）。' % (r.get('ok', 0), r.get('miss', 0)))
+        # 主观题没真正写进编辑器（UE 未就绪等）＝平台会收到空答案。
+        # 这是「误交卷」级别的事故，宁可不交也不能悄悄交白卷（实测踩过）。
+        if r.get('miss'):
+            log('    ⚠ 有 %d 道主观题没写进答题编辑器（平台会读到空），'
+                '不保存不交卷，这份需要你手动做。' % r['miss'], 'warn')
+            return 'unsolved'
     ids = hw.evaluate(JS_PREP_WQB)
     if not ids:
         log('    ⚠ 没拿到题目清单（answerwqbid），平台会拒绝保存。', 'warn')
@@ -2368,6 +2480,9 @@ def answer_one(page, c, cpi, kid, cfg, submit, progress, pre=None, detail=None):
     # 测试桩的 FakePage 没有事件接口，跳过监听、维持旧的直接判定。
     # 注意端点不限于 addStudentWorkNew：实测有一次提交延迟数分钟才生效，
     # 期间响应抓不到——所以捕获放宽到全部 work 请求，核实允许多次重开。
+    # ⚠ 判「受理成功」必须同时看到**真实提交 POST 已发出**（req_seen）：
+    # btnBlueSubmit 兜底链的状态检查类响应也会带 "status":true，
+    # 只看响应不看请求，会把「没交上报成交上」（本项目出过的事故类别）。
     resp_seen = []      # work 相关响应（证据 + 成功判定）
     req_seen = []       # work 相关 POST（判定「请求到底发没发出去」）
     can_listen = hasattr(page, 'on')
@@ -2408,7 +2523,7 @@ def answer_one(page, c, cpi, kid, cfg, submit, progress, pre=None, detail=None):
             deadline = time.time() + vwin
             while time.time() < deadline:
                 time.sleep(2)
-                if _submit_ok(resp_seen):
+                if req_seen and _submit_ok(resp_seen):
                     break
     finally:
         if can_listen:
@@ -2423,7 +2538,7 @@ def answer_one(page, c, cpi, kid, cfg, submit, progress, pre=None, detail=None):
     if not can_listen:
         log('    ✓ 已交卷（平台完整提交流程）。')
         return 'submitted'
-    if _submit_ok(resp_seen):
+    if req_seen and _submit_ok(resp_seen):
         log('    ✓ 已交卷（平台已受理提交）。')
         return 'submitted'
     # 响应没抓到 → 重开作业卡核实是否已切「已批阅」。平台翻转状态可能
@@ -2533,8 +2648,14 @@ def answer_courses(cfg, only, submit=False, progress=None, control=None,
                 progress('  · 节点 %d/%d：%s' % (j, len(nodes),
                                                  cut(node.get('name', ''), 30)))
                 det = {} if submit == 'dry' else None
-                r = answer_one(page, c, cpi, node['kid'], cfg, submit, progress,
-                               detail=det)
+                try:
+                    r = answer_one(page, c, cpi, node['kid'], cfg, submit,
+                                   progress, detail=det)
+                except Exception as e:
+                    # 单节点故障（如大模型接口连挂 3 次）不炸整批/整门
+                    progress('  ✗ 节点失败（%s），按需人工处理。'
+                             % str(e)[:80], 'warn')
+                    r = 'failed'
                 if r == 'norender':
                     if cooled:
                         progress('  ⚠ 冷却后作业卡仍打不开，限流没解除，这门课先中止'
@@ -2548,8 +2669,13 @@ def answer_courses(cfg, only, submit=False, progress=None, control=None,
                             break
                         cooled = True
                         nr = 0
-                        r = answer_one(page, c, cpi, node['kid'], cfg, submit,
-                                       progress, detail=det)
+                        try:
+                            r = answer_one(page, c, cpi, node['kid'], cfg,
+                                           submit, progress, detail=det)
+                        except Exception as e:
+                            progress('  ✗ 节点失败（%s），按需人工处理。'
+                                     % str(e)[:80], 'warn')
+                            r = 'failed'
                 elif r != 'nohw':
                     nr = 0       # 真正处理了作业卡（无论成败）→ 重置嫌疑计数
                 if submit == 'dry' and r in ('dry', 'unsolved', 'report',
@@ -2706,9 +2832,20 @@ def submit_items(cfg, items, progress=None, control=None, headless=None) -> dict
                 continue
             progress('【%d/%d】交卷：%s · %s' % (i, len(items), cut(c['name'], 18),
                                                  cut(it.get('node', ''), 28)))
-            r = answer_one(page, c, cpi, it.get('kid'), cfg, True, progress,
-                           pre={'answers': it.get('answers') or {},
-                                'stems': it.get('stems') or {}})
+            try:
+                r = answer_one(page, c, cpi, it.get('kid'), cfg, True, progress,
+                               pre={'answers': it.get('answers') or {},
+                                    'stems': it.get('stems') or {}})
+            except Exception as e:
+                # 单份的意外故障（如大模型接口连挂 3 次）不能炸掉整批：
+                # 记失败、继续下一份（实测教训：一题断网，后面全不交了）
+                progress('  ✗ 这份交卷失败（%s），跳过继续。'
+                         % str(e)[:80], 'warn')
+                out['fail'] += 1
+                out['results'].append({'key': it.get('key'),
+                                       'kid': it.get('kid'), 'status': 'fail'})
+                time.sleep(max(float(cfg.get('course_delay', 1.2)), 1.5))
+                continue
             if r == 'submitted':
                 out['submitted'] += 1
                 st = 'done'
@@ -3585,6 +3722,12 @@ def main(argv=None):
 
     args = ap.parse_args(argv)
     cfg = load_config()
+
+    # CLI 长任务（刷课 / 答题）同样阻止系统睡眠；进程退出时自动恢复
+    if args.cmd in ('brush', 'answer'):
+        keep_awake(True)
+        import atexit
+        atexit.register(keep_awake, False)
 
     if args.cmd == 'login':
         if args.password:

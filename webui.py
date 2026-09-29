@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import os
 import socket
+import subprocess
 import sys
 import threading
 import time
@@ -31,6 +32,7 @@ STATE = {
     'running': False,
     'task': '',
     'lines': [],
+    'dropped': 0,           # 日志累计丢弃行数（截断时递增，见 _sink）
     'done': False,
     'paused': False,
     'phase': '',
@@ -101,6 +103,10 @@ def _sink(line, level):
         STATE['lines'].append({'t': line, 'lvl': level})
         if len(STATE['lines']) > 5000:
             del STATE['lines'][:1500]
+            # 累计丢弃行数：前端拿它发现「自己手里的 since 已经被截走」，
+            # 清空日志从 0 重拉。不用它的话，截断后前端 since 永远指向
+            # 不存在的下标，日志停在半空还会周期性跳段（长任务必踩）。
+            STATE['dropped'] = STATE.get('dropped', 0) + 1500
 
 
 cs.add_sink(_sink)
@@ -117,6 +123,135 @@ TASK_NAME = {
     'combo': '刷课 + 刷题（先刷视频再做作业交卷）',
     'verify': '重新核实未确认的作业',
 }
+
+
+def _shutdown_pc():
+    """「刷完自动关机」：任务正常跑完才调用。留 60 秒缓冲，
+    万一用户正巧在电脑前想取消，运行 shutdown /a 即可撤掉。"""
+    if os.name != 'nt':
+        cs.log('自动关机目前只支持 Windows，本次跳过。', 'warn')
+        return
+    cs.log('⚡ 任务完成：60 秒后自动关机（想取消可在 cmd 里运行 shutdown /a）',
+           'warn')
+    try:
+        r = subprocess.run(['shutdown', '/s', '/t', '60'], capture_output=True,
+                           text=True, errors='ignore')
+        if r.returncode != 0:
+            # 关机请求被系统/安全软件拒绝时必须说出来，不能静默装成功
+            detail = (r.stderr or '').strip() or ('返回码 %s' % r.returncode)
+            cs.log('⚠ 关机请求未成功：%s。电脑将保持开着，请手动关机。' % detail,
+                   'err')
+    except Exception as e:
+        cs.log('发起关机失败：%s。电脑将保持开着，请手动关机。' % e, 'err')
+
+
+_SCREEN_LOCK = threading.Lock()   # 窗口类名固定，并发熄屏会互抢注册
+
+
+def _screen_off():
+    """「💡 熄屏」：立刻强制关闭显示器。
+
+    Chrome 播视频时会自带 Video Wake Lock（阻止屏幕自动关闭，
+    powercfg /requests 里 DISPLAY 栏的 chrome.exe 就是它），关不掉；
+    但显式发 SC_MONITORPOWER 仍可强制熄屏，直到下一次鼠标/键盘输入。
+    熄屏不影响任务运行——刷课在无头浏览器里继续。
+
+    实现要点（2026-09-29 修正）：不能用 HWND_BROADCAST 广播——广播会把
+    「关显示器」塞给每一个顶层窗口，等于连发几十次，跟 Chrome 的
+    Video Wake Lock 来回打架，实测会「黑屏 + 有规律闪烁 + 唤不醒」，
+    只能强按电源键。现在改为本进程自建一个隐藏窗口，只发这一次。
+    极个别显卡驱动即使这样也会卡在黑屏（该 API 的已知毛病），
+    那种情况按 Win+Ctrl+Shift+B 重置显卡驱动即可恢复，不用强制关机。
+    """
+    if os.name != 'nt':
+        cs.log('熄屏目前只支持 Windows。', 'warn')
+        return
+    with _SCREEN_LOCK:      # 连点两次：等第一次注册/注销完再做第二次
+        try:
+            import ctypes
+            import ctypes.wintypes as wt  # 必须显式导入，wintypes 才可用
+            user32 = ctypes.windll.user32
+            WM_SYSCOMMAND = 0x0112
+            SC_MONITORPOWER = 0xF170
+
+            # 64 位下句柄/返回值必须显式定型，ctypes 默认 int 会截断
+            WNDPROC = ctypes.WINFUNCTYPE(
+                ctypes.c_ssize_t, wt.HWND, wt.UINT, ctypes.c_size_t,
+                ctypes.c_ssize_t)
+            # 不定型的话 ctypes 默认按 32 位 int 转参，64 位句柄会 OverflowError，
+            # 窗口过程收到的每条消息都送不进 DefWindowProc
+            user32.DefWindowProcW.argtypes = [
+                wt.HWND, wt.UINT, ctypes.c_size_t, ctypes.c_ssize_t]
+            user32.DefWindowProcW.restype = ctypes.c_ssize_t
+            defproc = WNDPROC(user32.DefWindowProcW)  # 引用须存活到发完消息
+
+            class WNDCLASSW(ctypes.Structure):
+                _fields_ = [
+                    ('style', wt.UINT),
+                    ('lpfnWndProc', WNDPROC),
+                    ('cbClsExtra', ctypes.c_int),
+                    ('cbWndExtra', ctypes.c_int),
+                    ('hInstance', wt.HINSTANCE),
+                    ('hIcon', wt.HICON),
+                    ('hCursor', wt.HANDLE),  # wintypes 没有 HCURSOR，HANDLE 等价
+                    ('hbrBackground', wt.HBRUSH),
+                    ('lpszMenuName', wt.LPCWSTR),
+                    ('lpszClassName', wt.LPCWSTR)]
+
+            cls_name = 'CxScreenOffWnd'
+            hinst = ctypes.windll.kernel32.GetModuleHandleW(None)
+            user32.RegisterClassW.argtypes = [ctypes.POINTER(WNDCLASSW)]
+            user32.CreateWindowExW.restype = wt.HWND
+            wc = WNDCLASSW()
+            wc.lpfnWndProc = defproc
+            wc.hInstance = hinst
+            wc.lpszClassName = cls_name
+            if not user32.RegisterClassW(ctypes.byref(wc)):
+                raise OSError('RegisterClassW 失败（错误码 %d）'
+                              % ctypes.windll.kernel32.GetLastError())
+            # 不调 ShowWindow 的隐藏窗口：能收到消息、不进任务栏
+            hwnd = user32.CreateWindowExW(
+                0, cls_name, cls_name, 0, 0, 0, 0, 0, None, None, hinst, None)
+            if not hwnd:
+                raise OSError('CreateWindowExW 失败（错误码 %d）'
+                              % ctypes.windll.kernel32.GetLastError())
+            try:
+                user32.SendMessageW(hwnd, WM_SYSCOMMAND, SC_MONITORPOWER, 2)
+            finally:
+                # 发送本身抛异常也不能留下半注册的窗口类，
+                # 否则之后每一次熄屏都失败
+                user32.DestroyWindow(hwnd)
+                user32.UnregisterClassW(cls_name, hinst)
+            cs.log('已熄屏。动下鼠标或按任意键点亮；万一黑屏唤不醒，'
+                   '按 Win+Ctrl+Shift+B 重置显卡驱动即可恢复，不必强制关机。')
+        except Exception as e:
+            cs.log('熄屏失败：%s' % e, 'err')
+
+
+def _spawn(fn, *args):
+    """任务线程统一入口：运行期间阻止系统自动睡眠（屏幕仍可关）。
+
+    刷课/答题动辄半小时起步，Windows 电源计划到点会把机器睡掉，
+    任务就断在半路。这里在任务线程内持有「阻止睡眠」状态，
+    结束（含异常）时恢复。SetThreadExecutionState 按线程持有，
+    所以必须包在任务线程里开关，不能在主线程调一次完事。
+    """
+    def run():
+        cs.keep_awake(True)
+        try:
+            fn(*args)
+        finally:
+            cs.keep_awake(False)
+            # 兜底复位：worker 若在进入自己的 try 之前就抛了（如请求里
+            # limit 填了非数字），它的 finally 不会执行，running 永远
+            # 停在 True，之后所有任务按钮都 409 锁死，只能重启程序。
+            # 正常收尾时 running 已是 False，这里是幂等空操作。
+            with LOCK:
+                if STATE['running']:
+                    STATE.update(running=False, done=True,
+                                 paused=False, phase='')
+                    cs.log('检测到任务异常收尾，已复位任务状态。', 'warn')
+    threading.Thread(target=run, daemon=True).start()
 
 
 def _worker(action, opts):
@@ -214,10 +349,14 @@ def _worker(action, opts):
         cs.log('%s' % e, 'err')
         with LOCK:
             STATE['summary'] = {'提示': '未登录，请填账号密码或点「扫码 / 短信登录」'}
+        _set_result({'error': str(e) or '未登录'})
     except Exception as e:
         cs.log('任务失败：%s' % e, 'err')
         import traceback
         cs.log(traceback.format_exc()[-900:], 'err')
+        # 结果区给一版错误卡片：不然「查询中…」占位永远挂着（rv 没变
+        # 前端不会重画），用户只看到无限转圈，失败原因却藏在日志页签
+        _set_result({'error': str(e)[:200] or type(e).__name__})
     finally:
         cs.set_control_hook(None)
         PAUSE.clear()
@@ -264,6 +403,7 @@ def _brush_worker(opts):
             return 'run'
 
         out = cs.brush_videos(cfg, only, progress=progress, control=control)
+        all_done = not out.get('stopped')
         with LOCK:
             STATE['summary'] = {'刷完视频': out.get('done', 0),
                                 '未完成': out.get('fail', 0)}
@@ -278,6 +418,9 @@ def _brush_worker(opts):
         cs.log('任务失败：%s' % e, 'err')
         import traceback
         cs.log(traceback.format_exc()[-900:], 'err')
+        # 结果区给一版错误卡片：不然「查询中…」占位永远挂着（rv 没变
+        # 前端不会重画），用户只看到无限转圈，失败原因却藏在日志页签
+        _set_result({'error': str(e)[:200] or type(e).__name__})
     finally:
         cs.set_control_hook(None)
         PAUSE.clear()
@@ -288,6 +431,8 @@ def _brush_worker(opts):
             STATE['paused'] = False
             STATE['phase'] = ''
         cs.log('■ 任务结束')
+        if locals().get('all_done') and opts.get('shutdown'):
+            _shutdown_pc()
 
 
 def _answer_worker(opts):
@@ -350,6 +495,9 @@ def _answer_worker(opts):
         cs.log('任务失败：%s' % e, 'err')
         import traceback
         cs.log(traceback.format_exc()[-900:], 'err')
+        # 结果区给一版错误卡片：不然「查询中…」占位永远挂着（rv 没变
+        # 前端不会重画），用户只看到无限转圈，失败原因却藏在日志页签
+        _set_result({'error': str(e)[:200] or type(e).__name__})
     finally:
         cs.set_control_hook(None)
         PAUSE.clear()
@@ -416,6 +564,9 @@ def _verify_worker(opts):
         cs.log('任务失败：%s' % e, 'err')
         import traceback
         cs.log(traceback.format_exc()[-900:], 'err')
+        # 结果区给一版错误卡片：不然「查询中…」占位永远挂着（rv 没变
+        # 前端不会重画），用户只看到无限转圈，失败原因却藏在日志页签
+        _set_result({'error': str(e)[:200] or type(e).__name__})
     finally:
         cs.set_control_hook(None)
         PAUSE.clear()
@@ -478,6 +629,7 @@ def _combo_worker(opts):
             STATE['phase'] = 'answering'
         out2 = cs.answer_courses(cfg, only, submit=True,
                                  progress=progress, control=control)
+        all_done = not out2.get('stopped')
         with LOCK:
             STATE['summary'] = {'刷完视频': out.get('done', 0),
                                 '交卷': out2.get('submitted', 0),
@@ -502,6 +654,9 @@ def _combo_worker(opts):
         cs.log('任务失败：%s' % e, 'err')
         import traceback
         cs.log(traceback.format_exc()[-900:], 'err')
+        # 结果区给一版错误卡片：不然「查询中…」占位永远挂着（rv 没变
+        # 前端不会重画），用户只看到无限转圈，失败原因却藏在日志页签
+        _set_result({'error': str(e)[:200] or type(e).__name__})
     finally:
         cs.set_control_hook(None)
         PAUSE.clear()
@@ -512,6 +667,8 @@ def _combo_worker(opts):
             STATE['paused'] = False
             STATE['phase'] = ''
         cs.log('■ 任务结束')
+        if locals().get('all_done') and opts.get('shutdown'):
+            _shutdown_pc()
 
 
 PAGE = r"""<!DOCTYPE html>
@@ -818,6 +975,7 @@ PAGE = r"""<!DOCTYPE html>
     <div class="bar">
       <span class="ttl" id="bartip">尚未查询</span>
       <span class="sp"></span>
+      <button class="mini" id="boff">💡 熄屏</button>
       <button class="mini" id="bclear">清空日志</button>
     </div>
     <div class="pane" id="res"><div class="empty">还没有结果。填好账号密码后点左侧「一键查询未完成事项」。</div></div>
@@ -827,6 +985,7 @@ PAGE = r"""<!DOCTYPE html>
 <div class="toast" id="toast"></div>
 <script>
 let since = 0, timer = null, closed = false, lastDone = 0;
+let dropped = 0;        // 服务端已累计丢弃的日志行数（对不上 = 自己的 since 已被截走）
 let pollSeq = 0;        // 轮询代际令牌：按钮重启 poll 时使在途的旧循环作废，
                         // 否则旧循环 await 完又会排一个新 timer，多循环并行
                         // 会把同一批日志追加 N 遍（实测出现过 ×2 / ×4）
@@ -868,8 +1027,15 @@ function append(lines){
 }
 
 function esc(s){
+  // 引号也要转：抓来的作业标题/课程名可能含双引号，esc 进属性值
+  // （href="..."）时不转义就能从属性里逃逸注入事件
   return String(s == null ? '' : s)
-    .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+    .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
+    .replace(/"/g,'&quot;').replace(/'/g,'&#39;');
+}
+// 抓来的 URL 只认 http(s)：javascript: 之类的伪协议点了就执行
+function safeUrl(u){
+  return (/^https?:\/\//i).test(String(u || '')) ? esc(u) : '';
 }
 
 // ---------- 课程勾选 ----------
@@ -964,9 +1130,23 @@ function renderCourses(list){
   refreshSel();
 }
 
+// 「刷完自动关机」的勾选状态：结果区每 900ms 重绘一次，勾选框会被重建，
+// 必须像折叠状态一样重绘前读出、渲染时回填，否则勾上几秒后自己弹开。
+var sdAfterOn = false;
+
 function renderResult(r){
   if (!r) return;
+  // 任务以异常收尾时结果里只有 error：把「查询中…」的占位换掉，
+  // 别让用户停在无限转圈的假象里（失败详情在「运行日志」页签）
+  if (r.error){
+    $('res').innerHTML = '<div class="errbox"><b>任务失败</b>'
+      + '<span>' + esc(r.error) + '<br>详情见「运行日志」页签；'
+      + '可修正后重试（未登录时先登录）。</span></div>';
+    return;
+  }
   const hw = r.undone_hw || [], ex = r.undone_exam || [], pg = r.undone_prog || [];
+  const sda = document.getElementById('sdafter');
+  if (sda) sdAfterOn = sda.checked;
   // 结果区每 900ms 会被轮询整个重绘一次（innerHTML 覆盖），<details> 的展开状态会跟着
   // 一起丢掉——用户点开看一眼，一秒后自己又合上了。重绘前先记下哪些课是展开的，重绘时
   // 按原样补回去，展开与否就变成「用户的决定」而不是「上一次重绘的副作用」。
@@ -1011,7 +1191,7 @@ function renderResult(r){
       h += '<tr><td>' + esc(it.course) + '</td><td>' + esc(it.title)
          + '</td><td class="bad">' + esc(it.state) + '</td><td class="sub">'
          + esc(it.left || '—') + '</td><td>'
-         + (it.url ? '<a href="' + esc(it.url) + '" target="_blank">去完成 ↗</a>' : '')
+         + (safeUrl(it.url) ? '<a href="' + safeUrl(it.url) + '" target="_blank" rel="noopener">去完成 ↗</a>' : '')
          + '</td></tr>';
     }
     h += '</table>';
@@ -1039,9 +1219,17 @@ function renderResult(r){
        + '<button class="mini" style="background:#1a7f37;border-color:#1a7f37;color:#fff"'
        + ' onclick="startAnswer(event)">▶ 做作业并交卷（正式提交）</button>'
        + '<button class="mini" onclick="toggleAllBrush(event)">全选</button>'
+       + '<button class="mini" onclick="screenOff(event)">💡 熄屏</button>'
+       + '<label class="chk" style="margin:0;white-space:nowrap">'
+       + '<input type="checkbox" id="sdafter"' + (sdAfterOn ? ' checked' : '')
+       + '> 刷完自动关机</label>'
        + '<span class="sub">勾课程=全部章节；展开后可只勾某些章节。'
        + '刷视频=2 倍速静音真实播放；做作业=大模型答题后直接交卷，'
-       + '同题干自动复用上次答案不重复花钱；附件/报告题会跳过并提示。</span></div>';
+       + '同题干自动复用上次答案不重复花钱；附件/报告题会跳过并提示。'
+       + '勾了自动关机：只有正常刷完才关（手动停止 / 出错不关），'
+       + '关机前留 60 秒缓冲（cmd 运行 shutdown /a 可取消）。'
+       + '熄屏：播放中浏览器会阻止屏幕自动关闭（Video Wake Lock），'
+       + '点「熄屏」可立即强制关屏，任务照常在后台跑，动下鼠标就亮。</span></div>';
     // 每门课一个折叠：课程名 + 进度始终露出，只把章节明细收起来（一门课能拉出十几行）。
     for (let i = 0; i < pg.length; i++){
       const it = pg[i], chs = it.chapters || [], idx = String(i);
@@ -1096,6 +1284,13 @@ async function poll(){
     if (me !== pollSeq) return;  // 等待期间又有新循环启动了 → 这轮作废
     const j = await r.json();
     busy = !!j.running;
+    // 服务端日志超 5000 行会截断：dropped 对不上说明自己手里的 since
+    // 已经指向被删掉的区域，清空日志从 0 重拉（本轮拿到的可能不完整，
+    // 下一轮 since=0 会把全文补齐）
+    if ((j.dropped || 0) !== dropped){
+      dropped = j.dropped || 0;
+      since = 0; logEl.innerHTML = '';
+    }
     if (j.lines && j.lines.length){ append(j.lines); since = j.total; }
     if (j.courses && j.courses.length) renderCourses(j.courses);
     $('dot').className = 'dot' + (j.running ? ' on' : '');
@@ -1137,7 +1332,7 @@ async function poll(){
     if (j.result && !j.running && j.result_v !== rv){
       rv = j.result_v;
       renderResult(j.result);
-      setText($('bartip'), '查询完成');
+      setText($('bartip'), j.result.error ? '任务失败' : '查询完成');
     }
     // 交卷结果面板同理：任务结束才生成，换版才重画，重画时切到结果页
     // 让用户直接看到「哪些可交卷」。
@@ -1267,7 +1462,7 @@ function startBrush(ev){
     return;
   }
   fetch('/api/brush', {method:'POST', headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({only: keys})}).then(r => {
+    body: JSON.stringify({only: keys, shutdown: !!($('sdafter') && $('sdafter').checked)})}).then(r => {
     if (r.status === 409){ toast('当前有任务在跑，等它结束再刷', 'warn'); return; }
     if (!r.ok){ toast('刷视频没能启动（HTTP ' + r.status + '）', 'err'); return; }
     since = 0; logEl.innerHTML = '';
@@ -1290,7 +1485,7 @@ function startCombo(ev){
     return;
   }
   fetch('/api/combo', {method:'POST', headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({only: keys})}).then(r => {
+    body: JSON.stringify({only: keys, shutdown: !!($('sdafter') && $('sdafter').checked)})}).then(r => {
     if (r.status === 409){ toast('当前有任务在跑，等它结束再做', 'warn'); return; }
     if (!r.ok){ toast('任务没能启动（HTTP ' + r.status + '）', 'err'); return; }
     since = 0; logEl.innerHTML = '';
@@ -1309,6 +1504,16 @@ function toggleAllBrush(ev){
   const bks = [...document.querySelectorAll('#res .bk')];
   const allOn = bks.length && bks.every(b => b.checked);
   bks.forEach(b => b.checked = !allOn);
+}
+
+// 💡 熄屏：强制关显示器（Chrome 播视频的 Video Wake Lock 挡不住
+// 显式的 SC_MONITORPOWER），任务照常在后台跑；动下鼠标屏幕就亮。
+// 万一黑屏唤不醒：按 Win+Ctrl+Shift+B 重置显卡驱动即可恢复。
+function screenOff(ev){
+  if (ev) ev.stopPropagation();
+  fetch('/api/screen-off', {method:'POST'})
+    .then(r => { if (!r.ok) toast('熄屏请求失败（HTTP ' + r.status + '）', 'err'); })
+    .catch(() => toast('连不上本地程序', 'err'));
 }
 
 // ---------- 大模型答题并交卷 ----------
@@ -1377,7 +1582,7 @@ function renderAnswerResult(a){
     h += '<tr><td>' + esc(it.course) + '</td><td>' + esc(it.node)
        + '</td><td style="color:' + st[1] + ';font-weight:600">' + esc(st[0])
        + '</td><td style="white-space:nowrap">'
-       + (it.url ? '<a href="' + esc(it.url) + '" target="_blank">打开作业 ↗</a>' : '')
+       + (safeUrl(it.url) ? '<a href="' + safeUrl(it.url) + '" target="_blank" rel="noopener">打开作业 ↗</a>' : '')
        + '</td></tr>';
   });
   h += '</table></div>';
@@ -1488,6 +1693,14 @@ $('cpin').onclick = pinPicked;
 $('recentTop').oninput = updateCount;
 $('recentTop').onkeydown = e => { if (e.key === 'Enter') $('bquery').click(); };
 $('bclear').onclick = () => { logEl.innerHTML = ''; };
+// 💡 熄屏：顶栏常驻，任务跑着随时能点（Chrome 的 Video Wake Lock 挡不住
+// 显式 SC_MONITORPOWER），动下鼠标屏幕就亮，再点一下即可。
+// 万一黑屏唤不醒：按 Win+Ctrl+Shift+B 重置显卡驱动即可恢复，不必强制关机。
+$('boff').onclick = () => {
+  fetch('/api/screen-off', {method:'POST'})
+    .then(r => { if (!r.ok) toast('熄屏请求失败（HTTP ' + r.status + '）', 'err'); })
+    .catch(() => toast('连不上本地程序', 'err'));
+};
 // 密码框小眼睛：点一下明文核对，再点一下隐藏（不改变输入内容）
 $('beye').onclick = () => {
   const pwd = $('pwd'), show = pwd.type === 'password';
@@ -1543,18 +1756,40 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             pass
 
+    def _local_only(self):
+        """只服务本机浏览器：Host 头必须是 127.0.0.1/localhost。
+
+        只绑 127.0.0.1 挡不住浏览器发起的跨源请求：恶意网页可以把
+        自己的域名解析到 127.0.0.1（DNS rebinding），同源读到
+        /api/llm-config 里的 API Key、或用表单 POST 触发退出/扫描。
+        校验 Host 一举挡死 rebinding；写接口再校验 Content-Type
+        挡掉无 JSON 头的表单 CSRF。
+        """
+        host = (self.headers.get('Host') or '').strip().lower()
+        ok = (host.startswith('127.0.0.1:') or host.startswith('localhost:')
+              or host in ('127.0.0.1', 'localhost'))
+        return ok
+
     def do_GET(self):
+        if not self._local_only():
+            return self._send(403, b'{"error":"forbidden"}')
         u = urlparse(self.path)
         if u.path in ('/', '/index.html'):
             return self._send(200, PAGE.encode('utf-8'), 'text/html; charset=utf-8')
         if u.path == '/api/poll':
             q = parse_qs(u.query)
-            since = int((q.get('since') or ['0'])[0] or 0)
-            rv = int((q.get('rv') or ['-1'])[0] or -1)
-            av = int((q.get('av') or ['-1'])[0] or -1)
+            try:
+                since = int((q.get('since') or ['0'])[0] or 0)
+                rv = int((q.get('rv') or ['-1'])[0] or -1)
+                av = int((q.get('av') or ['-1'])[0] or -1)
+            except ValueError:
+                # 畸形参数按缺省处理：不给响应会让 socketserver 往
+                # 黑色控制台刷 traceback，可被脚本刷屏
+                since, rv, av = 0, -1, -1
             with LOCK:
                 payload = {'lines': STATE['lines'][since:],
                            'total': len(STATE['lines']),
+                           'dropped': STATE['dropped'],
                            'running': STATE['running'], 'task': STATE['task'],
                            'paused': STATE['paused'],
                            'phase': STATE['phase'],
@@ -1579,9 +1814,22 @@ class Handler(BaseHTTPRequestHandler):
                 ensure_ascii=False).encode('utf-8'))
         return self._send(404, b'{"error":"not found"}')
 
+    # 解析请求体的 POST 接口：必须带 application/json 头。
+    # HTML 表单发不出这个头 → 表单型 CSRF 无法伪造这些操作。
+    _JSON_PATHS = ('/api/run', '/api/brush', '/api/answer', '/api/combo',
+                   '/api/answer-verify', '/api/llm-config', '/api/llm-test')
+
     def do_POST(self):
+        if not self._local_only():
+            return self._send(403, b'{"error":"forbidden"}')
         u = urlparse(self.path)
-        n = int(self.headers.get('Content-Length') or 0)
+        if u.path in self._JSON_PATHS and 'application/json' not in (
+                self.headers.get('Content-Type') or '').lower():
+            return self._send(415, b'{"error":"json required"}')
+        try:
+            n = int(self.headers.get('Content-Length') or 0)
+        except ValueError:
+            n = 0
         raw = self.rfile.read(n) if n else b'{}'
         if u.path == '/api/run':
             try:
@@ -1595,7 +1843,12 @@ class Handler(BaseHTTPRequestHandler):
                 STATE.update(running=True, task=TASK_NAME.get(action, action),
                              lines=[], done=False, summary=None, started=time.time(),
                              login_fail=None)
-            threading.Thread(target=_worker, args=(action, data), daemon=True).start()
+            _spawn(_worker, action, data)
+            return self._send(200, b'{"ok":true}')
+        if u.path == '/api/screen-off':
+            # 💡 熄屏：强制关显示器，不影响任务（Chrome 的 Video Wake Lock
+            # 挡不住显式的 SC_MONITORPOWER 广播）。同步执行，毫秒级返回。
+            threading.Thread(target=_screen_off, daemon=True).start()
             return self._send(200, b'{"ok":true}')
         if u.path == '/api/brush':
             # 「刷选中的课的视频」。only 必填：不给「全部都刷」这种选项，
@@ -1614,8 +1867,8 @@ class Handler(BaseHTTPRequestHandler):
                 STATE.update(running=True, task=TASK_NAME['brush'],
                              lines=[], done=False, summary=None,
                              started=time.time(), login_fail=None)
-            threading.Thread(target=_brush_worker, args=({'only': only},),
-                             daemon=True).start()
+            _spawn(_brush_worker, {'only': only,
+                                   'shutdown': bool(data.get('shutdown'))})
             return self._send(200, b'{"ok":true}')
         if u.path == '/api/answer':
             # 「做勾选课程的章节作业并交卷」。only 必填，答完直接正式提交。
@@ -1633,9 +1886,7 @@ class Handler(BaseHTTPRequestHandler):
                 STATE.update(running=True, task=TASK_NAME['answer'],
                              lines=[], done=False, summary=None,
                              started=time.time(), login_fail=None)
-            threading.Thread(target=_answer_worker,
-                             args=({'only': only},),
-                             daemon=True).start()
+            _spawn(_answer_worker, {'only': only})
             return self._send(200, b'{"ok":true}')
         if u.path == '/api/combo':
             # 「刷课+刷题」：先刷选中范围的视频，再对同一批范围做作业并交卷。
@@ -1653,8 +1904,8 @@ class Handler(BaseHTTPRequestHandler):
                 STATE.update(running=True, task=TASK_NAME['combo'],
                              lines=[], done=False, summary=None,
                              started=time.time(), login_fail=None)
-            threading.Thread(target=_combo_worker, args=({'only': only},),
-                             daemon=True).start()
+            _spawn(_combo_worker, {'only': only,
+                                   'shutdown': bool(data.get('shutdown'))})
             return self._send(200, b'{"ok":true}')
         if u.path == '/api/answer-verify':
             # 「重新核实」：把未确认的作业逐份重开，翻案或继续等平台翻转。
@@ -1673,8 +1924,7 @@ class Handler(BaseHTTPRequestHandler):
                 STATE.update(running=True, task=TASK_NAME['verify'],
                              lines=[], done=False, summary=None,
                              started=time.time(), login_fail=None)
-            threading.Thread(target=_verify_worker, args=({'items': items},),
-                             daemon=True).start()
+            _spawn(_verify_worker, {'items': items})
             return self._send(200, b'{"ok":true}')
         if u.path == '/api/llm-config':
             try:
@@ -1769,6 +2019,10 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 return self._send(500, json.dumps({'error': str(e)}).encode())
         if u.path == '/api/quit':
+            # 退出前先置停止信号：让任务线程的收尾逻辑（保存进度/报告）
+            # 有机会跑，也避免浏览器进程被硬杀后残留
+            CANCEL.set()
+            PAUSE.set()      # 解除暂停挂起，别让任务线程卡在暂停循环里
             # 先回包再关停：否则连接会被自己掐断，浏览器报「网络错误」
             self._send(200, b'{"ok":true}')
             _shutdown_async()
