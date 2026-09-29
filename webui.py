@@ -41,6 +41,8 @@ STATE = {
     'started': 0.0,
     'login_fail': None,     # 密码登录被平台明确回绝 → 'credential'，界面弹红字提示
     'result_v': 0,          # 结果的版本号：变了界面才重画，见 _set_result()
+    'ares': None,           # 交卷结果面板（逐份状态，未确认行可「重新核实」）
+    'ares_v': 0,
 }
 
 
@@ -54,6 +56,17 @@ def _set_result(rep):
     with LOCK:
         STATE['result'] = rep
         STATE['result_v'] += 1
+
+
+def _set_ares(rep):
+    """交卷结果面板（答题/交卷任务的逐份结果），机制同 _set_result。
+
+    与扫描报告（result）分开放：两种任务的面板长得完全不一样，
+    而且可能先后出现——各用各的版本号互不打架。
+    """
+    with LOCK:
+        STATE['ares'] = rep
+        STATE['ares_v'] += 1
 
 # 暂停 / 中止信号。扫描器会在每个「课程边界」调用 _control_hook 来检查，
 # 所以这两个信号最迟在下一门课开始时生效（一般几秒），不会撕裂正在进行的请求。
@@ -100,6 +113,9 @@ TASK_NAME = {
     'doctor': '环境自检',
     'selftest': '学习通兼容性检测',
     'brush': '自动刷视频（2 倍速静音）',
+    'answer': '做作业并交卷（大模型答题）',
+    'combo': '刷课 + 刷题（先刷视频再做作业交卷）',
+    'verify': '重新核实未确认的作业',
 }
 
 
@@ -136,7 +152,9 @@ def _worker(action, opts):
             return
 
         if action == 'login':
-            ok = cs.do_login(cfg, auto=False)
+            # fresh=True：点这个按钮就是要登录/换号——不自动恢复旧会话，
+            # 否则一点按钮就登回旧账号，用户根本没机会扫新码（实测踩过）
+            ok = cs.do_login(cfg, auto=False, fresh=True)
             with LOCK:
                 STATE['summary'] = {'登录': '成功 ✓' if ok else '未完成'}
             return
@@ -232,8 +250,8 @@ def _brush_worker(opts):
         cs.log('播放方式：%sx 倍速 + 静音，真实播放到片尾（不伪造心跳）。' % rate)
         cs.log('只刷视频任务点；测验 / 作业不会替你自动完成。')
 
-        def progress(msg):
-            cs.log(msg)
+        def progress(msg, *a):
+            cs.log(msg, a[0] if a else 'info')
             # 状态行跟着走：让用户随时看到「现在刷到哪门课哪个视频」
             with LOCK:
                 STATE['task'] = '刷视频 · ' + (msg[:54] if msg else '')
@@ -252,6 +270,230 @@ def _brush_worker(opts):
             if out.get('stopped'):
                 STATE['summary']['状态'] = '已停止'
         cs.log('想核对结果：重新点「一键查询」，报告里消失的章节节点就是刷完的。', 'ok')
+    except cs.NotLoggedIn as e:
+        cs.log('%s' % e, 'err')
+        with LOCK:
+            STATE['summary'] = {'提示': '未登录，请先登录'}
+    except Exception as e:
+        cs.log('任务失败：%s' % e, 'err')
+        import traceback
+        cs.log(traceback.format_exc()[-900:], 'err')
+    finally:
+        cs.set_control_hook(None)
+        PAUSE.clear()
+        CANCEL.clear()
+        with LOCK:
+            STATE['running'] = False
+            STATE['done'] = True
+            STATE['paused'] = False
+            STATE['phase'] = ''
+        cs.log('■ 任务结束')
+
+
+def _answer_worker(opts):
+    """「做勾选课程的章节作业并交卷」的后台线程。
+
+    答完直接走平台完整交卷链（正式提交，记录成绩）；每份作业的结果
+    （已交卷/未确认/需人工…）放进「交卷结果」面板，未确认的可以在
+    面板里「重新核实」（平台批阅状态可能延迟几分钟才翻转，实测多次）。
+    （原来的「暂存预演」已按需求移除：平台没有「只存答案不记完成」的
+    暂存，预演清单反而多一道手续——现在一步到位直接交卷。）
+    """
+    only = [str(k) for k in (opts.get('only') or []) if k]
+    cs.log('')
+    cs.log('▶ 任务开始：做作业并交卷（答完直接提交）')
+    PAUSE.clear()
+    CANCEL.clear()
+    with LOCK:
+        STATE['paused'] = False
+        STATE['phase'] = 'answering'
+    try:
+        cfg = cs.load_config()
+        if not (cfg.get('llm_url') and cfg.get('llm_key') and cfg.get('llm_model')):
+            cs.log('还没有配置大模型：请在左侧「大模型答题设置」里填接口地址、'
+                   'API Key 和模型名，保存后再试。', 'err')
+            with LOCK:
+                STATE['summary'] = {'提示': '先配置大模型接口'}
+            return
+        cs.log('模型：%s ｜ 自动答单选/多选/判断/填空/简答；'
+               '要上传附件（实验报告）的整份跳过并提示。' % cfg['llm_model'])
+
+        def progress(msg, *a):
+            cs.log(msg, a[0] if a else 'info')
+            with LOCK:
+                STATE['task'] = '答题 · ' + (msg[:54] if msg else '')
+
+        def control():
+            if CANCEL.is_set():
+                return 'stop'
+            if PAUSE.is_set():
+                return 'pause'
+            return 'run'
+
+        out = cs.answer_courses(cfg, only, submit=True,
+                                progress=progress, control=control)
+        with LOCK:
+            STATE['summary'] = {'交卷': out.get('submitted', 0),
+                                '未确认': out.get('unverified', 0),
+                                '需人工': out.get('report', 0)
+                                          + out.get('skipped', 0),
+                                '失败': out.get('fail', 0)}
+            if out.get('stopped'):
+                STATE['summary']['状态'] = '已停止'
+        if out.get('items'):
+            _set_ares({'time': time.strftime('%H:%M'), 'items': out['items']})
+    except cs.NotLoggedIn as e:
+        cs.log('%s' % e, 'err')
+        with LOCK:
+            STATE['summary'] = {'提示': '未登录，请先登录'}
+    except Exception as e:
+        cs.log('任务失败：%s' % e, 'err')
+        import traceback
+        cs.log(traceback.format_exc()[-900:], 'err')
+    finally:
+        cs.set_control_hook(None)
+        PAUSE.clear()
+        CANCEL.clear()
+        with LOCK:
+            STATE['running'] = False
+            STATE['done'] = True
+            STATE['paused'] = False
+            STATE['phase'] = ''
+        cs.log('■ 任务结束')
+
+
+def _verify_worker(opts):
+    """「重新核实」的后台线程：把未确认的作业逐份重开翻案。
+
+    平台批阅状态可能延迟几分钟到十几分钟才翻转（实测三次交卷全部
+    延迟生效），这里按轮次重开作业卡，渲染成「已批阅」页即翻案为
+    已交卷；核实一轮不中就隔一段时间再核，最多 N 轮（可停）。
+    结束后把每份的最新状态合并回交卷结果面板。
+    """
+    items = [it for it in (opts.get('items') or []) if isinstance(it, dict)]
+    cs.log('')
+    cs.log('▶ 任务开始：重新核实未确认的作业（共 %d 份）' % len(items))
+    PAUSE.clear()
+    CANCEL.clear()
+    with LOCK:
+        STATE['paused'] = False
+        STATE['phase'] = 'answering'
+    try:
+        def progress(msg, *a):
+            cs.log(msg, a[0] if a else 'info')
+            with LOCK:
+                STATE['task'] = '核实 · ' + (msg[:54] if msg else '')
+
+        def control():
+            if CANCEL.is_set():
+                return 'stop'
+            if PAUSE.is_set():
+                return 'pause'
+            return 'run'
+
+        cfg = cs.load_config()
+        out = cs.verify_items(cfg, items, progress=progress, control=control)
+        st = {(r.get('key'), r.get('kid')): r.get('status')
+              for r in out.get('results', [])}
+        with LOCK:
+            ares = STATE['ares']
+        if ares:
+            for it in ares.get('items', []):
+                s = st.get((it.get('key'), it.get('kid')))
+                if s:
+                    it['status'] = s
+            _set_ares(ares)
+        with LOCK:
+            STATE['summary'] = {'核实确认已交': out.get('confirmed', 0),
+                                '仍未确认': out.get('still', 0)}
+            if out.get('stopped'):
+                STATE['summary']['状态'] = '已停止'
+    except cs.NotLoggedIn as e:
+        cs.log('%s' % e, 'err')
+        with LOCK:
+            STATE['summary'] = {'提示': '未登录，请先登录'}
+    except Exception as e:
+        cs.log('任务失败：%s' % e, 'err')
+        import traceback
+        cs.log(traceback.format_exc()[-900:], 'err')
+    finally:
+        cs.set_control_hook(None)
+        PAUSE.clear()
+        CANCEL.clear()
+        with LOCK:
+            STATE['running'] = False
+            STATE['done'] = True
+            STATE['paused'] = False
+            STATE['phase'] = ''
+        cs.log('■ 任务结束')
+
+
+def _combo_worker(opts):
+    """「刷课+刷题」的后台线程：先刷选中的视频，再对同一批范围做作业并交卷。
+
+    视频自动刷；作业答完直接走平台完整交卷链（与单独的「做作业并交卷」
+    一致），逐份结果进「交卷结果」面板。
+    """
+    only = [str(k) for k in (opts.get('only') or []) if k]
+    cs.log('')
+    cs.log('▶ 任务开始：刷课 + 刷题（先刷视频，再做作业并交卷）')
+    PAUSE.clear()
+    CANCEL.clear()
+    with LOCK:
+        STATE['paused'] = False
+        STATE['phase'] = 'brushing'
+    try:
+        cfg = cs.load_config()
+        if not (cfg.get('llm_url') and cfg.get('llm_key') and cfg.get('llm_model')):
+            cs.log('还没有配置大模型：刷视频不受影响，但刷题需要先在左侧'
+                   '「大模型答题设置」里填好接口。', 'err')
+
+        def progress(msg, *a):
+            cs.log(msg, a[0] if a else 'info')
+            with LOCK:
+                STATE['task'] = (msg[:54] if msg else '')
+
+        def control():
+            if CANCEL.is_set():
+                return 'stop'
+            if PAUSE.is_set():
+                return 'pause'
+            return 'run'
+
+        # ---- 第一段：刷视频 ----
+        rate = min(max(float(cfg.get('brush_rate', 2) or 2), 1.0), 16.0)
+        cs.log('【第 1 步】刷视频：%sx 倍速 + 静音，真实播放到片尾。' % rate)
+        out = cs.brush_videos(cfg, only, progress=progress, control=control)
+        if out.get('stopped'):
+            with LOCK:
+                STATE['summary'] = {'刷完视频': out.get('done', 0),
+                                    '未完成': out.get('fail', 0),
+                                    '状态': '已停止（未进入刷题）'}
+            cs.log('刷视频被停止，按约定不进入刷题。', 'warn')
+            return
+        # ---- 第二段：做作业并交卷 ----
+        cs.log('')
+        cs.log('【第 2 步】做作业并交卷：答完直接提交。')
+        with LOCK:
+            STATE['phase'] = 'answering'
+        out2 = cs.answer_courses(cfg, only, submit=True,
+                                 progress=progress, control=control)
+        with LOCK:
+            STATE['summary'] = {'刷完视频': out.get('done', 0),
+                                '交卷': out2.get('submitted', 0),
+                                '未确认': out2.get('unverified', 0),
+                                '需人工': out2.get('report', 0)
+                                          + out2.get('skipped', 0),
+                                '失败': out2.get('fail', 0)}
+            if out2.get('stopped'):
+                STATE['summary']['状态'] = '已停止'
+        if out2.get('items'):
+            _set_ares({'time': time.strftime('%H:%M'), 'items': out2['items']})
+        cs.log('刷课+刷题完成：视频完成 %d 个；交卷 %d 份、未确认 %d 份、'
+               '需人工 %d 份，明细在「交卷结果」面板。'
+               % (out.get('done', 0), out2.get('submitted', 0),
+                  out2.get('unverified', 0),
+                  out2.get('report', 0) + out2.get('skipped', 0)), 'ok')
     except cs.NotLoggedIn as e:
         cs.log('%s' % e, 'err')
         with LOCK:
@@ -313,6 +555,15 @@ PAGE = r"""<!DOCTYPE html>
        border:1px solid var(--line);border-radius:6px;font-size:13px;
        font-family:inherit;outline:none;}
   input:focus{border-color:#2f5a5f;background:#0b1315;}
+  .pwdwrap{position:relative;}
+  .pwdwrap input{padding-right:38px;}
+  .eyebtn{position:absolute;right:5px;top:50%;transform:translateY(-50%);
+          width:28px;height:28px;border:none;background:transparent;
+          color:var(--mut);font-size:15px;cursor:pointer;border-radius:5px;
+          display:flex;align-items:center;justify-content:center;
+          filter:grayscale(1) opacity(.75);}
+  .eyebtn:hover{background:#152226;color:var(--tx);filter:none;}
+  .eyebtn.on{filter:none;}
   .chk{display:flex;align-items:flex-start;gap:8px;font-size:12.5px;
        color:#9fb0b3;margin:10px 0 4px;cursor:pointer;line-height:1.5;}
   .chk input{margin-top:3px;accent-color:#4fb3a8;}
@@ -398,6 +649,12 @@ PAGE = r"""<!DOCTYPE html>
                                     border-radius:6px;background:#0d1517;}
   #res details.cbox summary .bkwrap:hover{border-color:var(--ac);color:var(--ac2);}
   #res details.cbox summary .bkwrap input{accent-color:var(--ac);margin:0;cursor:pointer;}
+  /* 章节级勾选（课程折叠里每个章节行左侧的小勾） */
+  #res .ckw{display:inline-flex;align-items:center;margin-right:6px;cursor:pointer;
+            padding:1px 6px;border:1px solid var(--line);border-radius:5px;
+            background:#0d1517;vertical-align:middle;}
+  #res .ckw:hover{border-color:var(--ac);}
+  #res .ckw input{accent-color:var(--ac);margin:0;cursor:pointer;}
   /* 课程勾选面板 */
   .pickhead{display:flex;align-items:center;gap:6px;margin:7px 0 0;
             font-size:11.5px;color:var(--mut);}
@@ -452,7 +709,7 @@ PAGE = r"""<!DOCTYPE html>
 </head>
 <body>
 <header>
-  <h1>学习通巡检工具<small>只读 · 不提交任何作业 · 数据只在本机</small></h1>
+  <h1>学习通巡检工具<small>查询只读 · 刷课/答题需手动触发 · 数据只在本机</small></h1>
 </header>
 <div class="wrap">
   <div class="side">
@@ -461,7 +718,11 @@ PAGE = r"""<!DOCTYPE html>
     <div class="lbl">账号（手机号 / 超星号）</div>
     <input type="text" id="phone" placeholder="例 198xxxxxxxx" autocomplete="username">
     <div class="lbl">密码</div>
-    <input type="password" id="pwd" placeholder="学习通登录密码" autocomplete="current-password">
+    <div class="pwdwrap">
+      <input type="password" id="pwd" placeholder="学习通登录密码" autocomplete="current-password">
+      <button type="button" class="eyebtn" id="beye" title="显示 / 隐藏密码"
+              aria-label="显示或隐藏密码">👁</button>
+    </div>
     <label class="chk"><input type="checkbox" id="remember"> 记住账号（只记手机号，不记密码）</label>
     <div class="lbl">&nbsp;</div>
     <button class="btn primary" id="bquery"><i>▶</i>一键查询未完成事项</button>
@@ -509,6 +770,20 @@ PAGE = r"""<!DOCTYPE html>
     <button class="btn" id="bdir"><i>▣</i>打开输出文件夹</button>
 
     <hr class="hr">
+    <div class="lbl">大模型答题设置</div>
+    <input class="inp" id="llm_url" placeholder="接口地址，如 https://api.xx.com/v1" style="margin-bottom:6px">
+    <input class="inp" id="llm_key" placeholder="API Key" style="margin-bottom:6px">
+    <input class="inp" id="llm_model" placeholder="模型名，如 deepseek-chat" style="margin-bottom:6px">
+    <button class="btn" id="bllm"><i>✓</i>保存大模型设置</button>
+    <button class="btn" id="bllmremember" style="margin-top:6px"><i>💾</i>记住模型信息（下次打开免填写）</button>
+    <button class="btn" id="bllmtest" style="margin-top:6px"><i>⚡</i>验证连通</button>
+    <div class="tip" style="margin-top:6px">
+      任何 OpenAI 兼容接口都能用（填到 /v1 为止）。Key 只保存在本机 config.json。
+      「做作业」用你自己的 Key 按量计费，一份选择题作业通常只花几分钱。
+      填完先「验证连通」，通过后「记住模型信息」，以后打开不用再填。
+    </div>
+
+    <hr class="hr">
     <div class="lbl">退出</div>
     <button class="btn" id="bquit" style="border-color:#a33;color:#e88"><i>⏻</i>退出程序（释放端口）</button>
 
@@ -552,7 +827,12 @@ PAGE = r"""<!DOCTYPE html>
 <div class="toast" id="toast"></div>
 <script>
 let since = 0, timer = null, closed = false, lastDone = 0;
+let pollSeq = 0;        // 轮询代际令牌：按钮重启 poll 时使在途的旧循环作废，
+                        // 否则旧循环 await 完又会排一个新 timer，多循环并行
+                        // 会把同一批日志追加 N 遍（实测出现过 ×2 / ×4）
 let rv = -1;            // 已经拿到的结果版本号（回传给服务端，避免重复下发整份报告）
+let av = -1;            // 交卷结果面板的版本号（机制同 rv）
+let aitems = [];        // 交卷结果面板的数据（重新核实按钮要用）
 let cardFp = '';        // 左侧统计卡片的指纹：内容没变就不重建 DOM
 const $ = id => document.getElementById(id);
 const logEl = $('log');
@@ -751,12 +1031,17 @@ function renderResult(r){
 
   h += '<div class="sec"><h2>三、未完成任务点 <span class="n">' + pg.length + '</span> 门课</h2>';
   if (pg.length){
-    // 刷视频入口：勾哪门刷哪门。视频 2 倍速静音真实播放；测验/作业不碰。
+    // 任务入口：勾哪门/哪节做哪节。课程勾选框 = 该课全部待完成章节，
+    // 章节勾选框 = 只做那一节；两种可以混勾，按钮决定做什么。
     h += '<div class="brushbar"><button class="mini primary" id="bbrush"'
        + ' onclick="startBrush(event)">▶ 刷选中的课的视频</button>'
+       + '<button class="mini" onclick="startCombo(event)">▶ 刷课+刷题</button>'
+       + '<button class="mini" style="background:#1a7f37;border-color:#1a7f37;color:#fff"'
+       + ' onclick="startAnswer(event)">▶ 做作业并交卷（正式提交）</button>'
        + '<button class="mini" onclick="toggleAllBrush(event)">全选</button>'
-       + '<span class="sub">只自动刷视频任务点（2 倍速静音），测验/作业不会替你做；'
-       + '刷完建议重新查询核对。</span></div>';
+       + '<span class="sub">勾课程=全部章节；展开后可只勾某些章节。'
+       + '刷视频=2 倍速静音真实播放；做作业=大模型答题后直接交卷，'
+       + '同题干自动复用上次答案不重复花钱；附件/报告题会跳过并提示。</span></div>';
     // 每门课一个折叠：课程名 + 进度始终露出，只把章节明细收起来（一门课能拉出十几行）。
     for (let i = 0; i < pg.length; i++){
       const it = pg[i], chs = it.chapters || [], idx = String(i);
@@ -772,14 +1057,19 @@ function renderResult(r){
          + '</span><span class="t-open">点这里收起</span></span>'
          // 没有 cid/clsid 的课（旧缓存结果）压根不渲染勾选框——没有定位参数就不能假装能刷
          + (bkey
-            ? '<label class="bkwrap" onclick="event.stopPropagation()" title="勾上后点上面的「刷选中的课的视频」">'
-              + '<input type="checkbox" class="bk" value="' + esc(bkey) + '"> 刷视频</label>'
+            ? '<label class="bkwrap" onclick="event.stopPropagation()" title="勾上后点上面的按钮：刷视频 / 做作业 / 刷课+刷题">'
+              + '<input type="checkbox" class="bk" value="' + esc(bkey) + '"> 选中</label>'
             : '')
          + '</summary>';
       if (chs.length){
         h += '<div class="chap">';
         for (const c of chs){
-          h += '<div>' + esc(c.name) + '　<b>待完成 ' + (c.count||1) + '</b></div>';
+          const ckb = (bkey && c.kid)
+            ? '<label class="ckw" onclick="event.stopPropagation()"'
+              + ' title="只勾这一节：上面的按钮就只处理这一节">'
+              + '<input type="checkbox" class="ck" value="' + esc(bkey + '|' + c.kid) + '"></label>'
+            : '';
+          h += '<div>' + ckb + esc(c.name) + '　<b>待完成 ' + (c.count||1) + '</b></div>';
         }
         h += '</div>';
       } else {
@@ -798,10 +1088,12 @@ function renderResult(r){
 }
 
 async function poll(){
+  const me = ++pollSeq;          // 新循环上岗，旧的在途循环过时
   if (closed) return;
   let busy = false;
   try{
-    const r = await fetch('/api/poll?since=' + since + '&rv=' + rv);
+    const r = await fetch('/api/poll?since=' + since + '&rv=' + rv + '&av=' + av);
+    if (me !== pollSeq) return;  // 等待期间又有新循环启动了 → 这轮作废
     const j = await r.json();
     busy = !!j.running;
     if (j.lines && j.lines.length){ append(j.lines); since = j.total; }
@@ -847,6 +1139,14 @@ async function poll(){
       renderResult(j.result);
       setText($('bartip'), '查询完成');
     }
+    // 交卷结果面板同理：任务结束才生成，换版才重画，重画时切到结果页
+    // 让用户直接看到「哪些可交卷」。
+    if (j.ares && !j.running && j.ares_v !== av){
+      av = j.ares_v;
+      renderAnswerResult(j.ares);
+      setText($('bartip'), '交卷结果已生成');
+      switchTab('res');
+    }
     // 任务收尾时明确交代一句。否则重复点「获取课程列表」而名单没变时，
     // DOM 不会重建、界面毫无动静，用户会以为按钮坏了
     if (!j.running && j.done && j.started && j.started !== lastDone){
@@ -875,7 +1175,7 @@ async function poll(){
     }
     $('bopen').disabled = !j.report;
   }catch(e){}
-  if (closed) return;
+  if (closed || me !== pollSeq) return;
   // 运行中问得密一点（日志和状态跟得更紧），空闲时疏一点，没必要一直戳
   timer = setTimeout(poll, busy ? 400 : 1200);
 }
@@ -947,14 +1247,23 @@ function switchTab(t){
   $('logpane').style.display = t === 'log' ? '' : 'none';
 }
 
-// ---------- 刷视频 ----------
-// 勾选在第三节每门课的折叠条上（勾上即生效，不用再确认）。
-// 只有同时拿得到 cid/clsid 的课才显示勾选框——没有定位参数就刷不了。
+// ---------- 刷视频 / 做作业 / 刷课+刷题 ----------
+// 勾选有两级（勾上即生效，不用再确认）：
+//   课程勾选框 .bk   = cid:clsid        → 该课全部待完成章节；
+//   章节勾选框 .ck   = cid:clsid|kid    → 只做这一个章节节点。
+// 两级可以混勾，后端按「并集」处理。只有同时拿得到 cid/clsid 的课才显示
+// 课程勾选框，章节还要有 kid 才显示章节勾选框——没有定位参数就不能假装能刷。
+function taskKeys(){
+  const ks = [...document.querySelectorAll('#res .bk:checked')].map(b => b.value).filter(Boolean);
+  const kn = [...document.querySelectorAll('#res .ck:checked')].map(b => b.value).filter(Boolean);
+  return ks.concat(kn);
+}
+
 function startBrush(ev){
   if (ev) ev.stopPropagation();
-  const keys = [...document.querySelectorAll('#res .bk:checked')].map(b => b.value).filter(Boolean);
+  const keys = taskKeys();
   if (!keys.length){
-    toast('先在「未完成任务点」里勾选要刷视频的课程', 'warn');
+    toast('先在「未完成任务点」里勾选要刷的课程或章节', 'warn');
     return;
   }
   fetch('/api/brush', {method:'POST', headers:{'Content-Type':'application/json'},
@@ -972,12 +1281,171 @@ function startBrush(ev){
   }).catch(() => toast('连不上本地程序，请确认那个黑色命令行窗口还在运行', 'err'));
 }
 
+// 刷课+刷题：先刷选中范围的视频，再对同一批范围做作业并交卷。
+function startCombo(ev){
+  if (ev) ev.stopPropagation();
+  const keys = taskKeys();
+  if (!keys.length){
+    toast('先在「未完成任务点」里勾选要做的课程或章节', 'warn');
+    return;
+  }
+  fetch('/api/combo', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({only: keys})}).then(r => {
+    if (r.status === 409){ toast('当前有任务在跑，等它结束再做', 'warn'); return; }
+    if (!r.ok){ toast('任务没能启动（HTTP ' + r.status + '）', 'err'); return; }
+    since = 0; logEl.innerHTML = '';
+    $('cards').style.display = 'none'; cardFp = '';
+    $('res').innerHTML = '<div class="empty">正在后台「刷课+刷题」…（先刷视频，'
+      + '再做作业并交卷；进度看「运行日志」，可以随时暂停/停止）</div>';
+    $('bartip').textContent = '刷课+刷题中…';
+    switchTab('log');
+    clearTimeout(timer);
+    poll();
+  }).catch(() => toast('连不上本地程序，请确认那个黑色命令行窗口还在运行', 'err'));
+}
+
 function toggleAllBrush(ev){
   if (ev) ev.stopPropagation();
   const bks = [...document.querySelectorAll('#res .bk')];
   const allOn = bks.length && bks.every(b => b.checked);
   bks.forEach(b => b.checked = !allOn);
 }
+
+// ---------- 大模型答题并交卷 ----------
+function startAnswer(ev){
+  if (ev) ev.stopPropagation();
+  const keys = taskKeys();
+  if (!keys.length){
+    toast('先在「未完成任务点」里勾选要做作业的课程或章节', 'warn');
+    return;
+  }
+  if (!confirm('确定要「做作业并交卷」吗？\n\n大模型答完会直接正式提交并记录成绩，'
+      + '交卷后一般不能再改。')) return;
+  fetch('/api/answer', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({only: keys})}).then(r => {
+    if (r.status === 409){ toast('当前有任务在跑，等它结束再做', 'warn'); return; }
+    if (!r.ok){ toast('答题没能启动（HTTP ' + r.status + '）', 'err'); return; }
+    since = 0; logEl.innerHTML = '';
+    $('cards').style.display = 'none'; cardFp = '';
+    $('res').innerHTML = '<div class="empty">正在后台做作业并交卷…（进度看'
+      + '「运行日志」；可以随时暂停/停止）</div>';
+    $('bartip').textContent = '答题并交卷中…';
+    switchTab('log');
+    clearTimeout(timer);
+    poll();
+  }).catch(() => toast('连不上本地程序，请确认那个黑色命令行窗口还在运行', 'err'));
+}
+
+// ---------- 交卷结果面板 ----------
+// 答题/交卷任务结束后生成：每份作业列课程、节点、状态、网址。
+// 「待平台确认」= 提交请求已发出但当场没核实到受理（平台批阅状态
+// 可能延迟几分钟到十几分钟才翻转，实测多次）——点「重新核实」
+// 逐份重开作业卡，渲染出「已批阅」页即翻案为已交卷。
+const AST = {
+  done:       ['✓ 已交卷', '#6fbf8f'],
+  already:    ['✓ 已交卷（此前已交）', '#6fbf8f'],
+  fail:       ['交卷失败', '#e0776f'],
+  unverified: ['⚠ 已发出 · 待平台确认', '#d8a657'],
+  still:      ['⚠ 仍未确认', '#d8a657'],
+  report:     ['需人工 · 要传附件', '#d8a657'],
+  unsupported:['需人工 · 题型不支持', '#d8a657'],
+  unsolved:   ['需人工 · 模型没把握', '#d8a657'],
+  skip:       ['已跳过', '#7f9397'],
+};
+
+function renderAnswerResult(a){
+  if (!a || !a.items) return;
+  aitems = a.items;
+  const uv = aitems.filter(it => it.status === 'unverified' || it.status === 'still');
+  const need = aitems.filter(it => ['report','unsupported','unsolved'].includes(it.status));
+  let h = '<div class="sec"><h2>交卷结果 <span class="n">' + aitems.length + '</span> 份'
+       + (uv.length ? '　·　<span style="color:#d8a657">' + uv.length + ' 份待核实</span>' : '')
+       + (need.length ? '　·　<span style="color:#d8a657">' + need.length + ' 份需人工</span>' : '')
+       + '</h2>'
+       + '<div class="sub" style="margin-bottom:12px">生成时间 ' + esc(a.time)
+       + '　·　「待平台确认」= 提交已发出、平台还没翻转状态（可能延迟几分钟到十几分钟），'
+       + '点「重新核实」自动翻案；也可以点开作业网址自己确认。</div>';
+  if (uv.length){
+    h += '<div class="brushbar"><button class="mini" style="background:#8a6d1a;'
+       + 'border-color:#8a6d1a;color:#fff;font-weight:600"'
+       + ' onclick="verifyAnswer(event)">↻ 重新核实未确认的（' + uv.length + ' 份）</button>'
+       + '<span class="sub">逐份重开作业卡查「已批阅」，隔一分钟一轮，最多三轮，可随时停止。</span></div>';
+  }
+  h += '<table><tr><th>课程</th><th>作业（章节）</th><th>状态</th><th>操作</th></tr>';
+  aitems.forEach((it) => {
+    const st = AST[it.status] || [it.status, '#7f9397'];
+    h += '<tr><td>' + esc(it.course) + '</td><td>' + esc(it.node)
+       + '</td><td style="color:' + st[1] + ';font-weight:600">' + esc(st[0])
+       + '</td><td style="white-space:nowrap">'
+       + (it.url ? '<a href="' + esc(it.url) + '" target="_blank">打开作业 ↗</a>' : '')
+       + '</td></tr>';
+  });
+  h += '</table></div>';
+  $('res').innerHTML = h;
+}
+
+async function verifyAnswer(ev){
+  if (ev) ev.stopPropagation();
+  const list = aitems.filter(it => it.status === 'unverified' || it.status === 'still');
+  if (!list.length){ toast('没有待核实的作业', 'warn'); return; }
+  try{
+    const r = await fetch('/api/answer-verify', {method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({items: list.map(it => ({
+        key: it.key, kid: it.kid, course: it.course, node: it.node}))})});
+    if (r.status === 409){ toast('当前有任务在跑，等它结束再核实', 'warn'); return; }
+    if (!r.ok){ toast('核实没能启动（HTTP ' + r.status + '）', 'err'); return; }
+    since = 0; logEl.innerHTML = '';
+    $('bartip').textContent = '重新核实中…';
+    switchTab('log');
+    clearTimeout(timer);
+    poll();
+  }catch(e){
+    toast('连不上本地程序，请确认那个黑色命令行窗口还在运行', 'err');
+  }
+}
+
+function llmForm(){ return {llm_url: $('llm_url').value.trim(),
+                             llm_key: $('llm_key').value.trim(),
+                             llm_model: $('llm_model').value.trim()}; }
+// 保存与「记住」走同一个端点：本机 config.json 本来就是持久保存，
+// 区别只在提示语义——「保存」= 本次生效；「记住」= 明确写进本机，
+// 下次打开页面自动回填（页面加载时的 /api/llm-config 回填一直都在）。
+// 后端保存后会回读校验，写盘失败会返回 5xx，toast 如实报错。
+function saveLlm(remember){
+  fetch('/api/llm-config', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify(llmForm())}).then(r => {
+    if (!r.ok){ toast('保存失败：写入本机配置没成功，请重试（HTTP ' + r.status + '）', 'err'); return; }
+    toast(remember ? '已记住：以后在这台电脑打开不用再填' : '大模型设置已保存', 'ok');
+  }).catch(() => toast('连不上本地程序', 'err'));
+}
+$('bllm').onclick = () => saveLlm(false);
+$('bllmremember').onclick = () => {
+  if (!$('llm_url').value.trim() || !$('llm_key').value.trim()
+      || !$('llm_model').value.trim()){
+    toast('三样都填上再记住：接口地址 / API Key / 模型名', 'warn'); return;
+  }
+  saveLlm(true);
+};
+$('bllmtest').onclick = () => {
+  const b = $('bllmtest'), old = b.innerHTML;
+  b.disabled = true; b.innerHTML = '<i>⏳</i>验证中…（最长约 30 秒）';
+  fetch('/api/llm-test', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify(llmForm())}).then(async r => {
+    const j = await r.json().catch(() => ({}));
+    if (r.ok) toast('连通正常（' + $('llm_model').value.trim() + '）', 'ok');
+    else toast('连通失败：' + (j.error || ('HTTP ' + r.status)), 'err');
+  }).catch(() => toast('连不上本地程序', 'err')).finally(() => {
+    b.disabled = false; b.innerHTML = old;
+  });
+};
+// 打开页面就把已有配置带出来（key 是本机文件里的，回显无妨）
+fetch('/api/llm-config').then(r => r.json()).then(c => {
+  if ($('llm_url'))  $('llm_url').value  = c.llm_url  || '';
+  if ($('llm_key'))  $('llm_key').value  = c.llm_key  || '';
+  if ($('llm_model'))$('llm_model').value= c.llm_model|| '';
+}).catch(() => {});
+
 document.querySelectorAll('.tab').forEach(b => b.onclick = () => switchTab(b.dataset.t));
 
 $('bquery').onclick = () => {
@@ -1020,6 +1488,14 @@ $('cpin').onclick = pinPicked;
 $('recentTop').oninput = updateCount;
 $('recentTop').onkeydown = e => { if (e.key === 'Enter') $('bquery').click(); };
 $('bclear').onclick = () => { logEl.innerHTML = ''; };
+// 密码框小眼睛：点一下明文核对，再点一下隐藏（不改变输入内容）
+$('beye').onclick = () => {
+  const pwd = $('pwd'), show = pwd.type === 'password';
+  pwd.type = show ? 'text' : 'password';
+  $('beye').classList.toggle('on', show);
+  $('beye').textContent = show ? '🙈' : '👁';
+  pwd.focus();
+};
 $('bopen').onclick  = () => fetch('/api/open-report', {method:'POST'});
 $('bdir').onclick   = () => fetch('/api/open-dir', {method:'POST'});
 $('bpause').onclick = () => {
@@ -1075,6 +1551,7 @@ class Handler(BaseHTTPRequestHandler):
             q = parse_qs(u.query)
             since = int((q.get('since') or ['0'])[0] or 0)
             rv = int((q.get('rv') or ['-1'])[0] or -1)
+            av = int((q.get('av') or ['-1'])[0] or -1)
             with LOCK:
                 payload = {'lines': STATE['lines'][since:],
                            'total': len(STATE['lines']),
@@ -1086,12 +1563,20 @@ class Handler(BaseHTTPRequestHandler):
                            'courses': STATE['courses'],
                            'login_fail': STATE['login_fail'],
                            'started': STATE['started'],
-                           'result_v': STATE['result_v']}
+                           'result_v': STATE['result_v'],
+                           'ares_v': STATE['ares_v']}
                 # 报告本体可能很大（几十门课的明细）。界面已经拿到这一版时就别再
                 # 重复下发 —— 否则每次轮询都要把整个报告序列化一遍送过去。
                 if rv != STATE['result_v']:
                     payload['result'] = STATE['result']
+                if av != STATE['ares_v']:
+                    payload['ares'] = STATE['ares']
             return self._send(200, json.dumps(payload, ensure_ascii=False).encode('utf-8'))
+        if u.path == '/api/llm-config':
+            cfg = cs.load_config()
+            return self._send(200, json.dumps(
+                {k: cfg.get(k, '') for k in ('llm_url', 'llm_key', 'llm_model')},
+                ensure_ascii=False).encode('utf-8'))
         return self._send(404, b'{"error":"not found"}')
 
     def do_POST(self):
@@ -1132,6 +1617,120 @@ class Handler(BaseHTTPRequestHandler):
             threading.Thread(target=_brush_worker, args=({'only': only},),
                              daemon=True).start()
             return self._send(200, b'{"ok":true}')
+        if u.path == '/api/answer':
+            # 「做勾选课程的章节作业并交卷」。only 必填，答完直接正式提交。
+            try:
+                data = json.loads(raw.decode('utf-8') or '{}')
+            except Exception:
+                data = {}
+            only = [str(k) for k in (data.get('only') or []) if k]
+            if not only:
+                return self._send(400, json.dumps(
+                    {'error': '没有勾选要做作业的课程'}).encode('utf-8'))
+            with LOCK:
+                if STATE['running']:
+                    return self._send(409, b'{"error":"busy"}')
+                STATE.update(running=True, task=TASK_NAME['answer'],
+                             lines=[], done=False, summary=None,
+                             started=time.time(), login_fail=None)
+            threading.Thread(target=_answer_worker,
+                             args=({'only': only},),
+                             daemon=True).start()
+            return self._send(200, b'{"ok":true}')
+        if u.path == '/api/combo':
+            # 「刷课+刷题」：先刷选中范围的视频，再对同一批范围做作业并交卷。
+            try:
+                data = json.loads(raw.decode('utf-8') or '{}')
+            except Exception:
+                data = {}
+            only = [str(k) for k in (data.get('only') or []) if k]
+            if not only:
+                return self._send(400, json.dumps(
+                    {'error': '没有勾选要刷的课程/章节'}).encode('utf-8'))
+            with LOCK:
+                if STATE['running']:
+                    return self._send(409, b'{"error":"busy"}')
+                STATE.update(running=True, task=TASK_NAME['combo'],
+                             lines=[], done=False, summary=None,
+                             started=time.time(), login_fail=None)
+            threading.Thread(target=_combo_worker, args=({'only': only},),
+                             daemon=True).start()
+            return self._send(200, b'{"ok":true}')
+        if u.path == '/api/answer-verify':
+            # 「重新核实」：把未确认的作业逐份重开，翻案或继续等平台翻转。
+            try:
+                data = json.loads(raw.decode('utf-8') or '{}')
+            except Exception:
+                data = {}
+            items = [it for it in (data.get('items') or [])
+                     if isinstance(it, dict) and it.get('key') and it.get('kid')]
+            if not items:
+                return self._send(400, json.dumps(
+                    {'error': '没有待核实的作业'}).encode('utf-8'))
+            with LOCK:
+                if STATE['running']:
+                    return self._send(409, b'{"error":"busy"}')
+                STATE.update(running=True, task=TASK_NAME['verify'],
+                             lines=[], done=False, summary=None,
+                             started=time.time(), login_fail=None)
+            threading.Thread(target=_verify_worker, args=({'items': items},),
+                             daemon=True).start()
+            return self._send(200, b'{"ok":true}')
+        if u.path == '/api/llm-config':
+            try:
+                data = json.loads(raw.decode('utf-8') or '{}')
+            except Exception:
+                data = {}
+            cfg = cs.load_config()
+            for k in ('llm_url', 'llm_key', 'llm_model'):
+                if k in data:
+                    cfg[k] = str(data.get(k) or '').strip()
+            cs.save_config(cfg)
+            # 写完必须回读确认。以前只写不查，「保存成功」的 toast 是
+            # 假的：一旦写盘有竞态/权限问题，查询线程读不到 llm 键，
+            # 刷作业就会提示「先配置大模型」（用户实测踩过）
+            back = cs.load_config()
+            ok = all(back.get(k) for k in ('llm_url', 'llm_key', 'llm_model')
+                     if str(data.get(k) or '').strip())
+            if not ok:
+                cs.log('⚠ 模型信息写入后回读校验未通过，请重试保存。', 'err')
+                return self._send(500, b'{"error":"save-verify-failed"}')
+            cs.log('大模型设置已保存（模型：%s）' % (cfg.get('llm_model') or '未填'))
+            return self._send(200, b'{"ok":true}')
+        if u.path == '/api/llm-test':
+            # 「验证连通」：拿界面当前填的模型信息真调一次 LLM（短问答）。
+            # ThreadingHTTPServer 每请求一线程，这里同步等待不阻塞页面轮询。
+            try:
+                data = json.loads(raw.decode('utf-8') or '{}')
+            except Exception:
+                data = {}
+            tcfg = dict(cs.load_config())
+            for k in ('llm_url', 'llm_key', 'llm_model'):
+                v = str(data.get(k) or '').strip()
+                if v:
+                    tcfg[k] = v
+            miss = [k for k in ('llm_url', 'llm_key', 'llm_model')
+                    if not tcfg.get(k)]
+            if miss:
+                return self._send(400, json.dumps(
+                    {'error': '还没填完：%s' % '、'.join(
+                        {'llm_url': '接口地址', 'llm_key': 'API Key',
+                         'llm_model': '模型名'}[k] for k in miss)},
+                    ensure_ascii=False).encode('utf-8'))
+            try:
+                # timeout 给短值：连通测试只发「回复两个字」，12 秒足够，
+                # 也避免网络不通时用户对着按钮等太久（llm_chat 内部最多重试 3 次）
+                reply = cs.llm_chat(tcfg, '请只回复两个字：连通', timeout=12)
+                cs.log('大模型连通验证通过（%s）：%s'
+                       % (tcfg['llm_model'], (reply or '')[:40]))
+                return self._send(200, json.dumps(
+                    {'ok': True, 'reply': (reply or '')[:80]},
+                    ensure_ascii=False).encode('utf-8'))
+            except Exception as e:
+                cs.log('大模型连通验证失败：%s' % str(e)[:160], 'err')
+                return self._send(502, json.dumps(
+                    {'error': str(e)[:300]},
+                    ensure_ascii=False).encode('utf-8'))
         if u.path in ('/api/pause', '/api/resume', '/api/cancel'):
             with LOCK:
                 busy = STATE['running']

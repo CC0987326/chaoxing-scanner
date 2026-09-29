@@ -50,6 +50,9 @@ if str(HERE) not in sys.path:
 RUNTIME = HERE / 'runtime'
 PROFILE_DIR = RUNTIME / 'profile'
 STATE_FILE = RUNTIME / 'state.json'
+# 大模型答案的本地缓存（按题干哈希复用，省重复问模型的钱）。
+# 放 runtime/ 里——打包流程本来就排除 runtime，天然不会带进分发包。
+ANSWER_CACHE_FILE = RUNTIME / 'answer_cache.json'
 CHROME_DIR = RUNTIME / 'chrome'
 SHOT_DIR = RUNTIME / 'screenshots'
 LOG_FILE = RUNTIME / 'run.log'
@@ -76,6 +79,9 @@ DEFAULT_CONFIG = {
     'open_report': True,    # 生成后自动打开报告
     'cpi': '',              # 学习通个人参数，留空 = 自动获取
     'user_agent': '',       # 留空 = 自动按内核版本生成
+    'llm_url': '',          # 大模型接口地址（OpenAI 兼容，如 https://api.xx.com/v1）
+    'llm_key': '',          # 大模型 API Key（只存在本机 config.json）
+    'llm_model': '',        # 模型名（如 gpt-4o-mini / deepseek-chat）
 }
 
 # ================================================================ 日志
@@ -117,15 +123,32 @@ def load_config() -> dict:
         try:
             cfg.update(json.loads(CONFIG_FILE.read_text(encoding='utf-8')))
         except Exception as e:
-            log('配置文件解析失败，用默认值：%s' % e, 'warn')
+            # 解析失败绝不能「静默用默认」就完事：任务线程随后 save_config
+            # 会用不含 llm 键的默认 cfg 覆盖写回，用户保存的大模型信息
+            # 就这么被抹掉（实测：查询中保存的模型信息莫名消失）。把坏
+            # 文件留档，方便排查是并发写坏还是手改坏了。
+            bak = CONFIG_FILE.with_suffix('.json.bad')
+            try:
+                CONFIG_FILE.replace(bak)
+                log('config.json 解析失败（%s），已把原文件留档到 %s，'
+                    '用默认值继续。' % (e, bak.name), 'warn')
+            except Exception:
+                log('配置文件解析失败，用默认值：%s' % e, 'warn')
     else:
         save_config(cfg)
     return cfg
 
 
 def save_config(cfg: dict):
-    CONFIG_FILE.write_text(
+    # 原子写：先写临时文件再替换。直接截断写 config.json 时，并发的
+    # load_config 会读到半截 JSON → 解析失败 → 默认值覆盖写回 →
+    # 用户保存的大模型信息丢失（v2.11.2 前的实测丢失路径）。
+    # 临时名带线程 id：界面保存与任务线程同时落盘也不会互抢同一文件
+    import threading
+    tmp = CONFIG_FILE.with_suffix('.json.tmp%d' % threading.get_ident())
+    tmp.write_text(
         json.dumps(cfg, ensure_ascii=False, indent=2), encoding='utf-8')
+    tmp.replace(CONFIG_FILE)
 
 
 # ================================================================ 浏览器内核
@@ -536,22 +559,30 @@ def ensure_login(cfg, ctx, page, interactive=True):
 
 
 # ================================================================ 登录
-def do_login(cfg, auto=False, phone=''):
-    """登录并保存会话。auto=True 时走短信验证码全自动流程"""
+def do_login(cfg, auto=False, phone='', fresh=False):
+    """登录并保存会话。auto=True 时走短信验证码全自动流程
+
+    fresh=True：强制重新登录（界面「扫码 / 短信登录」按钮换账号用）。
+    不注入已保存的会话、也不走「原会话仍然有效」的短路——否则用户
+    想换账号时一点登录按钮就自动登回旧号，根本没机会扫码（实测踩过）。
+    """
     if auto:
         return _login_auto(cfg, phone)
 
     ctx = launch(cfg, headless=False)
     page = ctx.new_page()
     try:
-        restore_state(ctx)
-        page.goto(BASE_URL, wait_until='domcontentloaded')
-        # 上限仍是 3 秒；已经是登录态就立刻往下走
-        _poll(page, JS_IS_LOGINED, _logined_enough, 3000)
-        if check_login(page, navigate=False):
-            save_state(ctx)
-            log('原有会话仍然有效，无需重新登录 ✓')
-            return True
+        if fresh:
+            log('本次为重新登录：已忽略旧登录会话，请直接扫码或登录新账号。')
+        else:
+            restore_state(ctx)
+            page.goto(BASE_URL, wait_until='domcontentloaded')
+            # 上限仍是 3 秒；已经是登录态就立刻往下走
+            _poll(page, JS_IS_LOGINED, _logined_enough, 3000)
+            if check_login(page, navigate=False):
+                save_state(ctx)
+                log('原有会话仍然有效，无需重新登录 ✓')
+                return True
 
         page.goto(LOGIN_URL, wait_until='domcontentloaded')
         banner('请在弹出的浏览器窗口中登录')
@@ -778,9 +809,17 @@ def do_login_password(cfg, phone, password, headless=False) -> bool:
             # 界面上的红字提示 / 开始扫描也就来得更快
             page.wait_for_timeout(800)
             if check_login(page, navigate=False):
-                save_state(ctx)
-                log('登录成功 ✓')
-                return True
+                # 快速判定过了还要真导航复核一次：提交后平台有时把页面
+                # 跳到「个人空间」游客态，body 含「个人空间」三个字就骗过
+                # 了快速判定，存下来的却是只有 10 条 cookie 的废会话
+                # （实测：1 秒「登录成功」→ 会话不可用 → 0 门课程）。
+                time.sleep(2)
+                if check_login(page, navigate=True):
+                    save_state(ctx)
+                    log('登录成功 ✓')
+                    return True
+                log('  登录还没真正建立，继续等 …', 'warn')
+                continue
             # 点选验证码：先试自动识别（装了 ddddocr 才有）
             try:
                 from captcha_solver import read_targets, solve_point_captcha
@@ -1503,6 +1542,29 @@ def course_key(c) -> str:
     return '%s:%s' % (c.get('cid', ''), c.get('clsid', ''))
 
 
+def split_only(only):
+    """把任务范围列表拆成（课程 key 集合, {课程 key: kid 集合}）。
+
+    支持两种规格混用：
+      「cid:clsid」     整门课（该课全部待完成节点）；
+      「cid:clsid|kid」 课程里的某一个章节节点。
+    界面上课程勾选框传前者、章节勾选框传后者，两种可以同时勾。
+    """
+    keys, nodes = set(), {}
+    for s in (only or []):
+        s = str(s or '')
+        if not s:
+            continue
+        if '|' in s:
+            k, kid = s.split('|', 1)
+            if k and kid:
+                keys.add(k)
+                nodes.setdefault(k, set()).add(kid)
+        else:
+            keys.add(s)
+    return keys, nodes
+
+
 def list_courses(cfg, headless=None) -> dict:
     """只读课程名录（不抓作业 / 考试 / 任务点），供界面做勾选。
 
@@ -1695,7 +1757,7 @@ def brush_video_frame(vf, cfg, progress, control) -> str:
                 vf.evaluate(JS_VIDEO_PLAY, rate)
             except Exception:
                 pass
-        if st['t'] - last_report >= 10:
+        if st['t'] - last_report >= 300:
             last_report = st['t']
             progress('    播放中 %s / %s（%sx 静音）'
                      % (fmt_t(st['t']), fmt_t(st['dur']), g_rate(cfg)))
@@ -1704,6 +1766,1068 @@ def brush_video_frame(vf, cfg, progress, control) -> str:
 
 def g_rate(cfg):
     return min(max(float(cfg.get('brush_rate', 2) or 2), 1.0), 16.0)
+
+
+# ================================================================ LLM 自动答题（v2.9，v2.11 改直接交卷）
+# 思路：作业卡就是 doHomeWorkNew 的表单页。解析 .TiMu 题目 → 交给用户配置的
+# 大模型（OpenAI 兼容接口）作答 → 点选/填入 → 调平台自己的 btnBlueSubmit()
+# 完整链交卷（等价于人工点提交），并核实受理结果。安全阀：
+#   · LLM 没给出答案（返回 ? / 解析失败）的题 → 整份不填表不交卷
+#   · 要上传附件（实验报告）的整份跳过并提示
+#   · 交卷结果必须核实（响应监听 + 重开作业卡），核实不到如实报「未确认」
+#   · 答案按题干哈希落本地缓存（runtime/answer_cache.json），同题不重复花钱
+ATYPES = {'0': '单选', '1': '多选', '3': '判断'}   # 客观题：直接选
+STYPES = {'2': '填空', '4': '简答'}                # 主观题：LLM 写文本
+# 「上传附件」型主观题（题干要求交实验报告/附件）LLM 替不了，单独跳过并说明
+# 模型拒答特征（题干是反爬乱码时模型可能"猜懂"后拒绝作答，这种话不能进作业）
+_REFUSE_RE = None  # 延迟编译，见 llm_solve
+
+# 解析作业题。inputs 里带上隐藏的 answertype（题型码）与可点选项。
+JS_PARSE_TIMUS = r"""
+() => {
+  const out = [];
+  document.querySelectorAll('.TiMu').forEach((li, idx) => {
+    const at = li.querySelector('input[name^=answertype]');
+    const stem = ((li.querySelector('.Zy_TItle') || {}).textContent || '')
+      .replace(/\s+/g, ' ').trim();
+    const opts = [], fills = [];
+    li.querySelectorAll('input[name^=answer]').forEach(x => {
+      if (x.type === 'hidden') return;
+      const label = (x.closest('li') || x.parentElement);
+      opts.push({name: x.name, val: x.value, type: x.type,
+                 label: ((label && label.textContent) || x.value)
+                        .replace(/\s+/g, ' ').trim().slice(0, 150)});
+    });
+    li.querySelectorAll('textarea, input[type=text]').forEach(x => {
+      fills.push({name: x.name || ''});
+    });
+    // 「上传附件」型主观题：有文件选择控件或题干点名要上传/提交附件
+    const upload = !!li.querySelector('input[type=file]') ||
+      /上传附件|提交附件|上传.*报告|附件.*上传/.test(stem);
+    out.push({no: idx + 1, stem: stem.slice(0, 500),
+              atype: at ? at.value : '',
+              opts, fills, upload});
+  });
+  return out;
+}
+"""
+
+# 按答案填表：answers = [{name, vals:[选项值...]}]；用 click() 触发平台自己的监听
+JS_FILL_ANSWERS = r"""
+(answers) => {
+  let ok = 0, miss = 0;
+  answers.forEach(a => {
+    a.vals.forEach(v => {
+      const el = [...document.querySelectorAll('input[name="' + a.name + '"]')]
+        .find(x => x.value === v && x.type !== 'hidden');
+      if (el) { el.click(); ok++; } else { miss++; }
+    });
+  });
+  return {ok, miss};
+}
+"""
+
+# 主观题填文本：UEditor 实例化后正文在它自己的 iframe 里，textarea 只是壳，
+# 直接设 textarea.value 平台根本读不到（实测 serialize 里是空的）。
+# 所以必须优先走 UE API：UE.instants 的 key 就是 textarea 的 name。
+JS_FILL_TEXT = r"""
+(items) => {
+  let ok = 0, miss = 0;
+  items.forEach(a => {
+    let done = false;
+    try {
+      if (window.UE && UE.instants) {
+        for (const k in UE.instants) {
+          const e = UE.instants[k];
+          if ((e.key || k) === a.name) {
+            e.setContent('<p>' + String(a.val)
+              .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+              .replace(/\n/g, '<br>') + '</p>');
+            done = !!e.getContent();
+            break;
+          }
+        }
+      }
+    } catch (e) { /* 编辑器未就绪则退回 textarea */ }
+    if (!done) {
+      const ta = document.querySelector('textarea[name="' + a.name + '"],'
+                      + ' input[type=text][name="' + a.name + '"]');
+      if (!ta) { miss++; return; }
+      ta.value = a.val;
+      ta.dispatchEvent(new Event('input', {bubbles: true}));
+      ta.dispatchEvent(new Event('change', {bubbles: true}));
+      // 兜底：找同容器的编辑器 iframe body 直接写
+      const wrap = ta.closest('.TiMu') || document;
+      const body = wrap.querySelector('.edui-editor iframe, .edui-editor-body iframe');
+      try {
+        if (body && body.contentDocument && body.contentDocument.body) {
+          body.contentDocument.body.innerHTML = a.val
+            .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+            .replace(/\n/g, '<br>');
+        }
+      } catch (e) { /* 跨域/未就绪则放弃 */ }
+    }
+    ok++;
+  });
+  return {ok, miss};
+}
+"""
+
+# 提交/暂存前必须补的隐藏字段：#answerwqbid = 题目 ID 逗号清单。
+# 不补它服务端回「无效的参数：code-1」，保存直接被拒（实测）。
+# 权威来源是页面 toadd() 里硬编码的清单，取不到再从 answertype 隐藏域反推。
+JS_PREP_WQB = r"""
+() => {
+  let ids = '';
+  try {
+    const m = toadd.toString().match(/var a = "([0-9,]+)"/);
+    if (m) ids = m[1];
+  } catch (e) {}
+  if (!ids) {
+    ids = [...document.querySelectorAll('input[id^="answertype"]')]
+      .map(x => x.id.replace(/^answertype/, '')).join(',') + ',';
+  }
+  const el = document.querySelector('#answerwqbid');
+  if (el) el.value = ids;
+  return ids;
+}
+"""
+
+# 正式交卷：走平台完整链路 btnBlueSubmit（validate → toadd 设 enc/answerwqbid
+# → 字数校验 → form1submit → confirmSubmitWork）。它是异步链，调用后要等几秒。
+JS_DO_SUBMIT = r"""
+() => {
+  // confirmSubmitWork 是真正 POST form1 的函数（form1submit 是它的别名）。
+  // 旧版优先调 btnBlueSubmit（UI 入口）——它的异步链停在「确认提交」
+  // 弹窗，没人点确定就永远没有 POST，却照样返回 ok（测试账号实测：
+  // 两份作业 unverified、重开仍是待完成，根因即此）。
+  // 完整性/字数检查由本工具的填答逻辑保证（缺题不提交）；提交次数
+  // 超限或平台要求验证码时服务端会拒绝，响应监听如实上报，不假成功。
+  if (typeof confirmSubmitWork === 'function') {
+    try { confirmSubmitWork(); return 'ok'; }
+    catch (e) { return 'err:' + String(e).slice(0, 80); }
+  }
+  if (typeof form1submit === 'function') {
+    try { form1submit(); return 'ok'; }
+    catch (e) { return 'err:' + String(e).slice(0, 80); }
+  }
+  if (typeof btnBlueSubmit === 'function') {
+    try { btnBlueSubmit(); return 'ok'; }
+    catch (e) { return 'err:' + String(e).slice(0, 80); }
+  }
+  return 'nofn';
+}
+"""
+
+# 暂存（不交卷）：saveWork 是平台自己的「临时保存」
+JS_DO_SAVE = r"""
+() => {
+  if (typeof saveWork !== 'function') return 'nofn';
+  try { saveWork(); return 'ok'; }
+  catch (e) { return 'err:' + String(e).slice(0, 80); }
+}
+"""
+
+
+def llm_chat(cfg, prompt, timeout=120):
+    """OpenAI 兼容 /chat/completions。返回回复文本；失败抛 RuntimeError。"""
+    import urllib.request
+    import urllib.error
+    base = (cfg.get('llm_url') or '').rstrip('/')
+    key = cfg.get('llm_key') or ''
+    model = cfg.get('llm_model') or ''
+    if not (base and key and model):
+        raise RuntimeError('大模型没有配置好：请在设置里填「接口地址 / API Key / 模型名」'
+                           '（接口地址一般以 /v1 结尾）')
+    url = base + '/chat/completions' if base.endswith('/v1') else base + '/v1/chat/completions'
+    body = json.dumps({
+        'model': model,
+        'messages': [{'role': 'user', 'content': prompt}],
+        'temperature': 0,
+    }).encode('utf-8')
+    last = ''
+    for attempt in (1, 2, 3):
+        try:
+            req = urllib.request.Request(url, data=body, method='POST',
+                                         headers={'Content-Type': 'application/json',
+                                                  'Authorization': 'Bearer ' + key})
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                data = json.loads(r.read().decode('utf-8'))
+            msg = ((data.get('choices') or [{}])[0].get('message') or {})
+            # 推理模型（如 deepseek-flash/reasoner）可能把最终答案放
+            # reasoning_content、content 为空——两者都试。
+            txt = (msg.get('content') or '').strip()
+            if not txt:
+                txt = (msg.get('reasoning_content') or '').strip()
+            if txt:
+                return txt
+            last = '响应里没有回复内容'
+        except Exception as e:
+            last = str(e)[:160]
+        time.sleep(2 * attempt)
+    raise RuntimeError('大模型调用失败（3 次）：%s' % last)
+
+
+def _parse_llm_answers(txt, n, types=None):
+    """从 LLM 回复里抠出 {题号: 答案}。容忍 ```json 包裹、单引号、多余文字。
+
+    推理模型的 reasoning_content 可能很长且带干扰花括号：找出全部候选
+    JSON 片段，从后往前（答案通常在结尾）取第一个能解析且含数字键的。
+    types = {题号: atype}：传入时按题型精确规范化（选择题才大写字母、
+    判断题才转对错，简答/填空文本原样保留）；未传时用启发式（≤4 个
+    字母才大写化，避免把纯字母的简答文本误当选项）。
+    """
+    import re
+    cands = re.findall(r'\{[^{}]*\}', txt, re.S)
+    for cand in reversed(cands):
+        try:
+            raw = json.loads(cand.replace("'", '"'))
+        except Exception:
+            continue
+        if not isinstance(raw, dict):
+            continue
+        out = {}
+        for k, v in raw.items():
+            try:
+                i = int(k)
+            except (TypeError, ValueError):
+                continue
+            if not (1 <= i <= n) or not isinstance(v, str):
+                continue
+            v = v.strip()
+            t = (types or {}).get(i)
+            if t in ('0', '1'):                  # 选择题：大写字母
+                v = re.sub(r'[^A-Za-z]', '', v).upper()
+            elif t == '3':                       # 判断题：统一对/错
+                v = '对' if v in ('对', '正确', 'TRUE', 'T', '√', 'true') else '错'
+            elif t in ('2', '4'):                # 填空/简答：文本原样
+                pass
+            elif re.fullmatch(r'[A-Za-z]{1,4}', v):
+                v = v.upper()
+            elif v in ('TRUE', 'T', '√', 'true'):
+                v = '对'
+            elif v in ('FALSE', 'F', 'false'):
+                v = '错'
+            out[i] = v
+        if out:
+            return out
+    return {}
+
+
+def _stem_key(stem):
+    """题干 → 缓存键。去空白后取 sha1 前 16 位。"""
+    import hashlib
+    norm = re.sub(r'\s+', '', stem or '')
+    return hashlib.sha1(norm.encode('utf-8')).hexdigest()[:16]
+
+
+def _answer_cache_load():
+    """读本地答案缓存（runtime/answer_cache.json）。坏了就当没有。"""
+    try:
+        return json.loads(ANSWER_CACHE_FILE.read_text(encoding='utf-8'))
+    except Exception:
+        return {}
+
+
+def _answer_cache_save(cache):
+    try:
+        ANSWER_CACHE_FILE.write_text(
+            json.dumps(cache, ensure_ascii=False), encoding='utf-8')
+    except Exception as e:
+        log('答案缓存写入失败（不影响答题）：%s' % str(e)[:60], 'warn')
+
+
+def llm_solve(cfg, timus, progress):
+    """把整卷发给大模型。返回 {题号: 答案}，没答上的题不出现。
+
+    客观题答案是大写字母/对错；主观题（填空/简答）答案是文本。
+    「上传附件」型主观题（upload=True）不发给模型，替不了。
+    本地答案缓存：按题干哈希查 runtime/answer_cache.json，命中直接复用
+    （同题干=同一道题，不重复花模型的钱）；模型答上的新题写回缓存。
+    """
+    todo = [t for t in timus if not t.get('upload')]
+    if not todo:
+        return {}
+    # ---- 先查本地缓存 ----
+    cache = _answer_cache_load()
+    ans, rest = {}, []
+    for t in todo:
+        hit = cache.get(_stem_key(t.get('stem')))
+        if hit:
+            ans[t['no']] = hit
+        else:
+            rest.append(t)
+    if ans:
+        progress('    本地答案缓存命中 %d/%d 题%s。' % (
+            len(ans), len(todo), '，其余问模型' if rest else ''))
+    if not rest:
+        return ans
+    todo = rest
+    lines = []
+    for t in todo:
+        tn = ATYPES.get(t['atype']) or STYPES.get(t['atype']) or '其他'
+        line = '%d.【%s】%s' % (t['no'], tn, t['stem'])
+        if t['atype'] == '3':
+            line += '（判断题：对/错）'
+        elif t['atype'] == '2':
+            line += '（填空：只输出空里应填的内容本身）'
+        elif t['atype'] == '4':
+            line += '（简答：150 字以内直接作答，不要客套话）'
+        else:
+            for o in t['opts']:
+                line += '\n   %s' % o['label']
+        lines.append(line)
+    prompt = ('你是答题助手。请回答下面的题目。\n'
+              '输出要求：只输出一个 JSON 对象，键为题号（字符串），值为答案。\n'
+              '单选/多选输出大写字母（多选如 "AC"）；判断题输出 "对" 或 "错"；\n'
+              '填空只输出应填内容本身；简答输出答案文本（150 字内）。\n'
+              '没有把握的题输出 "?"。不要输出 JSON 以外的任何文字。\n\n'
+              + '\n\n'.join(lines))
+    txt = llm_chat(cfg, prompt)
+    ans = _parse_llm_answers(txt, len(timus),
+                             types={t['no']: t['atype'] for t in todo})
+    # 模型拒答拦截：「无法代为提交…」「我不能替你…」这类话不算答案。
+    # 乱码题干（平台字体反爬）会诱发拒答，拒答文本绝不能写进作业。
+    import re as _re
+    refuse = _re.compile(
+        r'(无法|不能|不会).{0,8}(代[替理]|提交|上传|完成)'
+        r'|(请|需要).{0,8}(自行|亲自|本人).{0,4}(上传|提交|完成)'
+        r'|(语言模型|AI\s*助手|作为一个\s*AI)')
+    for t in todo:
+        a = ans.get(t['no'])
+        if a and t['atype'] in STYPES and refuse.search(a):
+            progress('    第 %d 题模型拒答（%s…），按没把握处理。'
+                     % (t['no'], a[:24]))
+            del ans[t['no']]
+    # 新答上的题写回缓存（'?' = 没把握，绝不能进缓存）
+    fresh = {t['no']: t for t in todo if ans.get(t['no']) not in (None, '?', '')}
+    if fresh:
+        for t in fresh.values():
+            cache[_stem_key(t.get('stem'))] = ans[t['no']]
+        _answer_cache_save(cache)
+    progress('    大模型返回：%s' % json.dumps(ans, ensure_ascii=False)[:200])
+    return ans
+
+
+_GRADED_TEXT_MARKS = ('本次成绩', '重新测试')
+
+
+def _looks_graded(frame):
+    """doHomeWorkNew 帧是否其实渲染的是「已批阅」内容。
+
+    平台对已批阅作业不一定 302 到 YiPiYue：强制解析出的最终地址、
+    以及部分场景的自然渲染，都是 doHomeWorkNew 的 URL，但页面里
+    是批阅详情（本次成绩 x 分 / 重新测试按钮）。只看 URL 会把
+    已交上的作业永远判成「还没翻转」（22:23 核实两份 100 分作业
+    三轮翻不了案的实测教训），必须看正文。
+    """
+    try:
+        if 'selectWorkQuestionYiPiYue' in (frame.url or ''):
+            return True
+        txt = frame.evaluate(
+            '() => document.body ? document.body.innerText : ""') or ''
+    except Exception:
+        return False
+    return any(m in txt for m in _GRADED_TEXT_MARKS)
+
+
+def _wait_hw_iframe(page, url, log):
+    """打开 cards 页等 doHomeWorkNew 内层 iframe。
+
+    作业卡结构是两跳异步重定向：壳(ananas/modules/work) →
+    中间层(api/work?needRedirect=true) → 内层(doHomeWorkNew)。
+    中间层的跳转平台侧**每次独立地时灵时不灵**（实测约 1/4 成功率，
+    与时间窗/冷却无关），所以光等和重开都靠不住。策略：
+      ① 快速路径：6 秒内连壳都没有 → 非作业节点提前收工；
+      ② 壳在而内层没出 → 用页面 cookie 直接请求中间层 URL 解析出
+         最终答题页地址（请求层不受骰子影响），直接塞给壳内 iframe
+         强制加载；
+      ③ 仍不出 → 重开一次 cards，再走一遍。
+    返回 (hw | None, note)。
+    """
+    for attempt in (1, 2):
+        try:
+            page.goto(url, wait_until='domcontentloaded')
+        except Exception as e:
+            log('    打开章节页失败：%s' % str(e)[:80], 'warn')
+            return None, 'failed'
+        deadline = time.time() + 25
+        shell_dl = time.time() + 6
+        forced = False
+        while time.time() < deadline:
+            hw = next((f for f in page.frames
+                       if 'doHomeWorkNew' in (f.url or '')), None)
+            if hw:
+                # URL 是 doHomeWorkNew 不代表还能作答——已批阅的作业
+                # 也可能渲染在这个 URL 下（见 _looks_graded 注释）
+                time.sleep(0.8)          # 给正文一点渲染时间
+                if _looks_graded(hw):
+                    return hw, 'already'
+                return hw, ''
+            # 已经交过卷的作业，平台渲染的是「已批阅」页而不是答题页——
+            # 这不是渲染失败，别让用户对着 ✗失败 以为没交上（实测踩过）
+            done = next((f for f in page.frames
+                         if 'selectWorkQuestionYiPiYue' in (f.url or '')), None)
+            if done:
+                return done, 'already'
+            shell = next((f for f in page.frames
+                          if 'ananas/modules/work' in (f.url or '')), None)
+            if time.time() > shell_dl and shell is None:
+                return None, 'nocard'    # 无壳 = 视频/文档等非作业节点
+            if shell is not None and time.time() > shell_dl and not forced:
+                forced = True            # 壳在而内页不出 → 强制解析跳转链
+                try:
+                    mid = shell.evaluate(
+                        "() => { const f = document.querySelector('iframe');"
+                        " return f ? f.src : ''; }")
+                    if mid:
+                        r = page.request.get(mid)      # 共享 cookie，跟随 302
+                        final = r.url
+                        if 'doHomeWorkNew' in final:
+                            log('    内页跳转没发生（平台偶发），已强制解析出'
+                                '答题页地址，直接加载…')
+                            shell.evaluate(
+                                "u => { const f = document.querySelector('iframe');"
+                                " f.src = u; }", final)
+                except Exception:
+                    pass
+            time.sleep(0.5)
+        if attempt == 1:
+            log('    作业卡内页还是没出来，隔 3 秒重开一次…', 'warn')
+            time.sleep(3)
+    return None, 'norender'
+
+
+def _same_stem(a, b):
+    """两段题干是否指同一道题（去空白后比前 60 字）。
+
+    交卷复用预演答案时靠它把关：题干对不上宁可重新问模型，
+    也不能把上一份的答案填进这一份。
+    """
+    a = re.sub(r'\s+', '', a or '')
+    b = re.sub(r'\s+', '', b or '')
+    if not a or not b:
+        return False
+    return a[:60] == b[:60]
+
+
+def _submit_ok(resp_seen):
+    """提交窗口内抓到的响应里，是否有「平台受理」的标志。"""
+    for x in resp_seen:
+        if x.get('st') != 200:
+            continue
+        b = (x.get('body') or '').replace(' ', '')
+        if ('"status":true' in b or '"status":1' in b
+                or '"status":"true"' in b or '提交成功' in b):
+            return True
+    return False
+
+
+def answer_one(page, c, cpi, kid, cfg, submit, progress, pre=None, detail=None):
+    """对单个章节节点：有作业卡就解析-作答-填表。
+
+    submit 三态：
+      True   = 答完走平台完整交卷链（正式提交，记录成绩）；
+      False  = 平台「暂存保存」。⚠ 实测平台侧暂存被接受后任务点同样
+               立即标记完成——「只存答案不记完成」在学习通并不存在，
+               所以界面的「暂存」不用这个模式（保留给 CLI）；
+      'dry'  = 预演：解析题目 + 大模型作答，但**不填表、不保存、不碰
+               平台**，零痕迹。答案通过 detail 交回去，列清单由用户
+               复核后手动或一键交卷。
+    pre: {'answers': {题号: 答案}, 'stems': {题号: 题干}} —— 交卷时复用
+         预演阶段的答案，题干对不上的题重新问模型。
+    detail: 传 dict 时收回 {answers, stems, total, miss}（dry 模式的产物）。
+
+    返回 'nohw'(没有作业卡) | 'ok'(已暂存) | 'submitted'(已交卷，已核实)
+         | 'dry'(预演完成) | 'already'(平台显示已批阅，此前已交)
+         | 'unsupported'(含不支持的题型)
+         | 'unsolved'(有题没答上) | 'report'(整份是上传附件型，LLM 替不了)
+         | 'failed' | 'norender'。
+    """
+    from urllib.parse import urlencode  # noqa: F401  (仅说明用)
+    url = CARDS_URL.format(clsid=c['clsid'], cid=c['cid'], kid=kid, cpi=cpi)
+    hw, note = _wait_hw_iframe(page, url, log)
+    if note == 'already':
+        log('    平台显示这份作业已批阅（此前已交过），无需再答再交。')
+        return 'already'
+    if hw is None:
+        if note == 'norender':
+            log('    作业卡两次都没渲染出答题页。', 'warn')
+            return 'norender'
+        return 'nohw'                        # 视频/文档卡，答题模块不碰
+    timus = _poll(hw, JS_PARSE_TIMUS, lambda v: bool(v), 12000, 400) or []
+    if not timus:
+        log('    作业卡打开但没解析到题目（可能结构变了），跳过。', 'warn')
+        return 'failed'
+    # 题目分三类：客观题（选字母/对错）、文本主观题（LLM 写）、附件题（替不了）
+    attach = [t for t in timus if t.get('upload') and t['atype'] in STYPES]
+    todo = [t for t in timus if not (t.get('upload') and t['atype'] in STYPES)]
+    bad = [t['no'] for t in todo if t['atype'] not in ATYPES
+           and t['atype'] not in STYPES]
+    if bad:
+        log('    含 %d 道不支持的题型（第 %s 题），整份跳过。'
+            % (len(bad), '、'.join(map(str, bad[:6]))), 'warn')
+        return 'unsupported'
+    if attach:
+        # 保存会让任务点直接标记完成 → 用户就没法再上传报告了，必须整份不碰
+        log('    第 %s 题要求上传附件（实验报告/文件），LLM 替不了，'
+            '需要你本人完成，整份跳过。'
+            % '、'.join(str(t['no']) for t in attach[:6]), 'warn')
+        return 'report'
+    if not todo:
+        log('    这份作业要求上传附件（实验报告/文件），LLM 替不了，'
+            '需要你本人完成，跳过。', 'warn')
+        return 'report'
+
+    # ---- 预演模式：只出答案，不碰平台 ----
+    if submit == 'dry':
+        ans = llm_solve(cfg, todo, progress)
+        answered = {t['no']: ans[t['no']] for t in todo
+                    if ans.get(t['no']) not in (None, '?', '')}
+        miss = [t['no'] for t in todo if t['no'] not in answered]
+        if detail is not None:
+            detail.update({'answers': {str(k): v for k, v in answered.items()},
+                           'stems': {str(t['no']): t['stem'] for t in todo},
+                           'total': len(timus), 'miss': miss})
+        if not answered:
+            log('    ⚠ 这一整份都没答上（模型没把握），列入手动清单。', 'warn')
+            return 'unsolved'
+        log('    ✓ 预演完成：答上 %d/%d 题（未填表未保存，平台零痕迹）。'
+            % (len(answered), len(timus)))
+        return 'dry'
+
+    # ---- 填表模式（交卷 / 平台暂存）：优先复用预演答案 ----
+    ans = {}
+    pre_a = (pre or {}).get('answers') or {}
+    pre_s = (pre or {}).get('stems') or {}
+    reused = 0
+    for t in todo:
+        a = pre_a.get(str(t['no']))
+        if a and a != '?' and _same_stem(pre_s.get(str(t['no'])), t['stem']):
+            ans[t['no']] = a
+            reused += 1
+    rest = [t for t in todo if t['no'] not in ans]
+    if reused:
+        log('    复用预演答案 %d/%d 题%s。' % (reused, len(todo),
+            '，其余重新问模型' if rest else ''))
+    if rest:
+        ans.update(llm_solve(cfg, rest, progress))
+    fills, missing = [], []
+    for t in todo:
+        a = ans.get(t['no'], '?')
+        if not a or a == '?':
+            # 题干没有字母/数字 → 大概率被平台字体反爬加密（此类历来是
+            # 实验报告/附件题），归到「需人工」而不是「没把握」
+            stem = t.get('stem') or ''
+            if t['atype'] in STYPES and not re.search(r'[A-Za-z0-9]', stem):
+                log('    第 %d 题题干被平台字体加密无法读取（此类多为'
+                    '实验报告/附件题），需要你本人完成。' % t['no'], 'warn')
+                return 'report'
+            missing.append(t['no'])
+            continue
+        if t['atype'] in STYPES:             # 主观题：文本 → textarea
+            if not t['fills']:
+                missing.append(t['no'])
+                continue
+            for f in t['fills']:
+                if f['name']:
+                    fills.append({'name': f['name'], 'val': a})
+            continue
+        if t['atype'] == '3':                # 判断题：统一转平台认的值
+            a = '对' if a in ('对', '正确', 'TRUE', 'T', '√') else '错'
+            vals = [a]
+            if not any(o['val'] == a for o in t['opts']):
+                # 有的判断题选项值是 true/false
+                vals = ['true' if a == '对' else 'false']
+        else:
+            vals = list(a)                   # 多选 "AC" → ['A','C']
+        names = {o['name'] for o in t['opts'] if o['val'] in vals}
+        if not names:
+            missing.append(t['no'])
+            continue
+        for nm in names:
+            fills.append({'name': nm, 'vals': vals})
+    if missing:
+        log('    ⚠ 有 %d 道题没答上（第 %s 题）：不保存不交卷，这份需要你手动做。'
+            % (len(missing), '、'.join(map(str, missing[:8]))), 'warn')
+        return 'unsolved'
+    picked = [f for f in fills if 'val' in f]
+    opt_fills = [f for f in fills if 'vals' in f]
+    if opt_fills:
+        r = hw.evaluate(JS_FILL_ANSWERS, opt_fills)
+        log('    已填 %d 个选项（未命中 %d）。' % (r.get('ok', 0), r.get('miss', 0)))
+    if picked:
+        r = hw.evaluate(JS_FILL_TEXT, picked)
+        log('    已填 %d 道主观题（未命中 %d）。' % (r.get('ok', 0), r.get('miss', 0)))
+    ids = hw.evaluate(JS_PREP_WQB)
+    if not ids:
+        log('    ⚠ 没拿到题目清单（answerwqbid），平台会拒绝保存。', 'warn')
+        return 'failed'
+    # 交卷必须「核实后再报成功」：监听平台的提交响应，btnBlueSubmit 是异步链，
+    # 调用返回 ok 只代表链路启动了，不代表服务端收下了（实测踩过假 ✓）。
+    # 测试桩的 FakePage 没有事件接口，跳过监听、维持旧的直接判定。
+    # 注意端点不限于 addStudentWorkNew：实测有一次提交延迟数分钟才生效，
+    # 期间响应抓不到——所以捕获放宽到全部 work 请求，核实允许多次重开。
+    resp_seen = []      # work 相关响应（证据 + 成功判定）
+    req_seen = []       # work 相关 POST（判定「请求到底发没发出去」）
+    can_listen = hasattr(page, 'on')
+
+    def _is_work(u):
+        u = u or ''
+        return 'chaoxing.com' in u and ('/work/' in u or 'work/' in u.split('?')[0])
+
+    def _on_resp(r):
+        if not _is_work(r.url):
+            return
+        try:
+            body = (r.text() or '')[:300]
+        except Exception:
+            body = ''
+        resp_seen.append({'st': r.status, 'url': (r.url or '')[-110:],
+                          'body': body})
+
+    def _on_req(r):
+        try:
+            if r.method == 'POST' and _is_work(r.url):
+                req_seen.append((r.url or '')[-110:])
+        except Exception:
+            pass
+
+    if can_listen:
+        page.on('response', _on_resp)
+        page.on('request', _on_req)
+    try:
+        act = hw.evaluate(JS_DO_SUBMIT if submit else JS_DO_SAVE)
+        if act != 'ok':
+            log('    %s调用失败：%s' % ('交卷' if submit else '暂存', act), 'warn')
+            return 'failed'
+        if submit and can_listen:
+            # 平台受理可能要几十秒甚至几分钟（实测一次 20 秒内毫无动静、
+            # 数分钟后已批阅），轮询着等。窗口可在 config 调（submit_verify_window）。
+            vwin = max(int(cfg.get('submit_verify_window') or 30), 10)
+            deadline = time.time() + vwin
+            while time.time() < deadline:
+                time.sleep(2)
+                if _submit_ok(resp_seen):
+                    break
+    finally:
+        if can_listen:
+            try:
+                page.remove_listener('response', _on_resp)
+                page.remove_listener('request', _on_req)
+            except Exception:
+                pass
+    if not submit:
+        log('    ✓ 已保存（平台接受，任务点会标记完成；未走正式交卷弹窗）。')
+        return 'ok'
+    if not can_listen:
+        log('    ✓ 已交卷（平台完整提交流程）。')
+        return 'submitted'
+    if _submit_ok(resp_seen):
+        log('    ✓ 已交卷（平台已受理提交）。')
+        return 'submitted'
+    # 响应没抓到 → 重开作业卡核实是否已切「已批阅」。平台翻转状态可能
+    # 要几分钟，一次没翻不算数：次数/间隔可在 config 调
+    # （submit_recheck_times / submit_recheck_interval）。
+    rtimes = max(int(cfg.get('submit_recheck_times') or 3), 1)
+    rgap = max(int(cfg.get('submit_recheck_interval') or 10), 3)
+    for attempt in range(rtimes):
+        if attempt:
+            time.sleep(rgap)
+        log('    没直接观察到受理响应，重开作业卡核实（第 %d/%d 次）…'
+            % (attempt + 1, rtimes))
+        _, note2 = _wait_hw_iframe(page, url, log)
+        if note2 == 'already':
+            log('    ✓ 已交卷（平台显示已批阅）。')
+            return 'submitted'
+    if req_seen:
+        log('    ⚠ 提交请求已发出（%s…）但 %d 秒内没核实到受理结果；'
+            '平台可能延迟生效，请稍后打开作业网址确认这份的状态。'
+            % (req_seen[0], vwin), 'warn')
+    else:
+        log('    ⚠ 没观察到平台的提交请求，这份大概率没交上，'
+            '请打开作业网址手动确认。', 'warn')
+    return 'unverified'
+
+
+def answer_courses(cfg, only, submit=False, progress=None, control=None,
+                   headless=None) -> dict:
+    """按课程自动做章节任务点里的作业。
+
+    only: 课程 key（cid:clsid）与「key|kid」章节规格混用的列表（界面勾选），
+          必填。key = 该课全部待完成节点；key|kid = 只做这个章节节点。
+    submit: True = 答完直接交卷；False = 平台暂存（仅 CLI，见 answer_one
+            的说明）；'dry' = 预演：不落库，收集 items 清单由用户复核交卷。
+    """
+    progress = progress or (lambda m, *a: log(m, a[0] if a else 'info'))
+    control = control or (lambda: 'run')
+    t0 = time.time()
+    ctx = launch(cfg, headless=headless)
+    page = ctx.new_page()
+    out = {'courses': [], 'submitted': 0, 'saved': 0, 'skipped': 0,
+           'fail': 0, 'stopped': False, 'items': []}
+    if submit == 'dry':
+        progress('预演模式：只答题不落库，答完列出清单，由你核对后手动或一键交卷。')
+    try:
+        banner('检查登录状态')
+        if not check_login(page):
+            if restore_state(ctx) and check_login(page):
+                log('已用本地会话自动登录 ✓')
+            else:
+                log('本地没有可用登录态，请先登录。', 'err')
+                raise NotLoggedIn('未登录')
+        courses, cpi = collect_courses(page, cfg)
+        keep, node_keep = split_only(only)
+        picked = [c for c in courses if course_key(c) in keep]
+        if not picked:
+            raise RuntimeError('要做的课程没匹配到（课程可能有变动），'
+                               '请重新「获取课程列表」后再试')
+        progress('共 %d 门课要做作业：%s' % (
+            len(picked), '、'.join(cut(c['name'], 16) for c in picked)))
+        banner('逐门课做章节作业（共 %d 门，%s）'
+               % (len(picked), {True: '答完交卷', False: '答完保存（不交卷）',
+                                'dry': '预演不落库'}.get(submit, str(submit))))
+        for i, c in enumerate(picked, 1):
+            if _wait_control(control, progress) == 'stop':
+                out['stopped'] = True
+                log('已停止。', 'warn')
+                break
+            progress('【%d/%d】%s' % (i, len(picked), c['name']))
+            pd = fetch_progress_detail(page, c, cpi, cfg)
+            if pd.get('page_failed'):
+                progress('  ⚠ 页面没加载成功（%s），这门课先跳过。'
+                         % pd.get('reason', ''), 'warn')
+                out['courses'].append({'name': c['name'], 'note': '页面未加载'})
+                continue
+            nodes = [n for n in (pd.get('pending') or []) if n.get('kid')]
+            want = node_keep.get(course_key(c))
+            if want is not None:
+                nodes = [n for n in nodes if n['kid'] in want]
+                if not nodes:
+                    progress('  勾选的章节已经不在待完成清单里（可能已完成）。')
+                    continue
+            if not nodes:
+                progress('  没有待完成的章节节点。')
+                continue
+            progress('  待处理节点 %d 个，逐个找作业卡…' % len(nodes))
+            s = su = sk = f = rp = uw = 0
+            stopped_here = False
+            nr = 0          # 连续「作业卡内页打不开」数（疑似限流的信号）
+            cooled = False  # 本门课是否已冷却过一次
+
+            def _cool(seconds):
+                """可中断冷却。返回 True = 用户点了停止。"""
+                progress('  ⚠ 连续 %d 个作业卡打不开（疑似平台限流），冷却 %d 秒…'
+                         '（冷却中可点停止）' % (nr, seconds), 'warn')
+                for _ in range(seconds):
+                    time.sleep(1.0)
+                    if _wait_control(control, progress) == 'stop':
+                        return True
+                progress('  冷却结束，重试这个节点。')
+                return False
+
+            for j, node in enumerate(nodes, 1):
+                if _wait_control(control, progress) == 'stop':
+                    stopped_here = True
+                    break
+                progress('  · 节点 %d/%d：%s' % (j, len(nodes),
+                                                 cut(node.get('name', ''), 30)))
+                det = {} if submit == 'dry' else None
+                r = answer_one(page, c, cpi, node['kid'], cfg, submit, progress,
+                               detail=det)
+                if r == 'norender':
+                    if cooled:
+                        progress('  ⚠ 冷却后作业卡仍打不开，限流没解除，这门课先中止'
+                                 '（稍后再来）。', 'warn')
+                        out['courses'].append({'name': c['name'], 'note': '限流中止'})
+                        break
+                    nr += 1
+                    if nr >= 2:
+                        if _cool(max(int(cfg.get('risk_cooldown') or 90), 30)):
+                            stopped_here = True
+                            break
+                        cooled = True
+                        nr = 0
+                        r = answer_one(page, c, cpi, node['kid'], cfg, submit,
+                                       progress, detail=det)
+                elif r != 'nohw':
+                    nr = 0       # 真正处理了作业卡（无论成败）→ 重置嫌疑计数
+                if submit == 'dry' and r in ('dry', 'unsolved', 'report',
+                                             'unsupported', 'failed', 'norender'):
+                    # dry 模式：把每一份都列进清单（含需人工/失败的），交卷入口统一
+                    out['items'].append({
+                        'key': course_key(c), 'kid': node['kid'],
+                        'course': c['name'],
+                        'node': node.get('name') or ('节点 %d' % j),
+                        'url': CARDS_URL.format(clsid=c['clsid'], cid=c['cid'],
+                                                kid=node['kid'], cpi=cpi),
+                        'answers': det.get('answers', {}) if det else {},
+                        'stems': det.get('stems', {}) if det else {},
+                        'total': det.get('total', 0) if det else 0,
+                        'miss': det.get('miss', []) if det else [],
+                        'status': ('ready' if r == 'dry' else
+                                   {'report': 'report', 'unsupported': 'unsupported',
+                                    'unsolved': 'unsolved'}.get(r, 'failed')),
+                    })
+                elif submit is True and r in ('submitted', 'already', 'unverified',
+                                              'report', 'unsupported', 'unsolved'):
+                    # 正式交卷模式：逐份结果也进清单，界面据此渲染「交卷结果」，
+                    # 其中未确认的作业可以在面板里「重新核实」。
+                    out['items'].append({
+                        'key': course_key(c), 'kid': node['kid'],
+                        'course': c['name'],
+                        'node': node.get('name') or ('节点 %d' % j),
+                        'url': CARDS_URL.format(clsid=c['clsid'], cid=c['cid'],
+                                                kid=node['kid'], cpi=cpi),
+                        'answers': {}, 'stems': {}, 'total': 0, 'miss': [],
+                        'status': {'submitted': 'done', 'already': 'already',
+                                   'unverified': 'unverified'}.get(r, r),
+                    })
+                if r == 'submitted' or (r == 'already' and submit is True):
+                    su += 1
+                elif r == 'already':
+                    sk += 1    # 预演/暂存模式遇到已批阅的：没东西可做，跳过
+                elif r == 'unverified' and submit is True:
+                    uw += 1    # 请求发出但没核实到结果，单独记账不混进失败
+                elif r == 'ok':
+                    s += 1
+                elif r == 'dry':
+                    s += 1       # 预演完成，计进「已答」一路的计数
+                elif r == 'report':
+                    rp += 1     # 上传附件型：需要用户本人完成，不算失败
+                elif r in ('nohw', 'unsupported', 'unsolved'):
+                    sk += 1
+                elif r == 'norender':
+                    f += 1
+                else:
+                    f += 1
+                time.sleep(max(float(cfg.get('course_delay', 1.2)), 1.0))
+            out['courses'].append({'name': c['name'], 'submitted': su,
+                                   'saved': s, 'skipped': sk, 'fail': f,
+                                   'report': rp, 'unverified': uw})
+            out['submitted'] += su
+            out['saved'] += s
+            out['skipped'] += sk
+            out['fail'] += f
+            out['report'] = out.get('report', 0) + rp
+            out['unverified'] = out.get('unverified', 0) + uw
+            progress('  ✓ %s 做完：交卷 %d，已答/保存 %d，需人工 %d，失败 %d%s。'
+                     % (cut(c['name'], 24), su, s, rp, f,
+                        '，未确认 %d' % uw if uw else ''))
+            if stopped_here:
+                out['stopped'] = True
+                break
+            time.sleep(max(float(cfg.get('course_delay', 1.2)), 2.0))
+        if submit == 'dry':
+            n_ready = sum(1 for it in out['items'] if it['status'] == 'ready')
+            n_need = sum(1 for it in out['items']
+                         if it['status'] in ('report', 'unsupported', 'unsolved'))
+            progress('预演结束：可交卷 %d 份，需人工 %d 份，失败 %d 份，'
+                     '用时 %.0f 分钟。'
+                     % (n_ready, n_need, out['fail'], (time.time() - t0) / 60))
+            for it in out['items']:
+                if it['status'] == 'ready':
+                    progress('  ▶ 可交卷：%s · %s（答上 %d/%d 题，未把握：%s）%s'
+                             % (cut(it['course'], 16), cut(it['node'], 26),
+                                len(it['answers']), it['total'] or len(it['answers']),
+                                ('第 ' + '、'.join(map(str, it['miss'][:6])) + ' 题')
+                                if it['miss'] else '无',
+                                it['url']))
+                elif it['status'] in ('report', 'unsupported', 'unsolved'):
+                    progress('  ⚠ 需人工：%s · %s（要上传附件/模型没把握/不支持'
+                             '的题型，打开网址自己核对）'
+                             % (cut(it['course'], 16), cut(it['node'], 26)), 'warn')
+        else:
+            progress('做作业结束：交卷 %d 份，保存 %d 份，需人工 %d 份，'
+                     '失败 %d 份%s，用时 %.0f 分钟。'
+                     % (out['submitted'], out['saved'], out.get('report', 0),
+                        out['fail'],
+                        ('，未确认 %d 份（稍后打开作业网址核对）'
+                         % out['unverified']) if out.get('unverified') else '',
+                        (time.time() - t0) / 60))
+            if out.get('report'):
+                names = ['%s（%d 份）' % (it['name'], it['report'])
+                         for it in out['courses'] if it.get('report')]
+                progress('⚠ 有 %d 份作业需要你本人完成（要上传实验报告/附件，'
+                         '或题干被平台字体加密无法读取），涉及：%s。'
+                         '工具不代交这类作业，记得手动上传。'
+                         % (out['report'], '、'.join(names)), 'warn')
+            uv = [it for it in out['items'] if it['status'] == 'unverified']
+            out['unverified_items'] = uv
+            if uv:
+                progress('⚠ 有 %d 份作业没当场核实到结果（平台可能延迟生效）：'
+                         '在「交卷结果」面板点「重新核实」，或稍后打开作业网址'
+                         '自己确认。' % len(uv), 'warn')
+        progress('重新点「一键查询」可核对最新状态。')
+    finally:
+        save_state(ctx)
+        close_ctx(ctx)
+    return out
+
+
+def submit_items(cfg, items, progress=None, control=None, headless=None) -> dict:
+    """把预演过的作业逐份正式交卷。
+
+    items: answer_courses(submit='dry') 收集的清单。带 answers/stems 缓存的
+           题直接复用（题干比对一致才用），缓存没有或对不上的题重新问模型。
+    返回 {'submitted': n, 'fail': n, 'skip': n, 'stopped': bool,
+          'results': [{'key','kid','status'}]}
+    """
+    progress = progress or (lambda m, *a: log(m, a[0] if a else 'info'))
+    control = control or (lambda: 'run')
+    t0 = time.time()
+    ctx = launch(cfg, headless=headless)
+    page = ctx.new_page()
+    out = {'submitted': 0, 'fail': 0, 'skip': 0, 'unverified': 0,
+           'stopped': False, 'results': []}
+    try:
+        banner('检查登录状态')
+        if not check_login(page):
+            if restore_state(ctx) and check_login(page):
+                log('已用本地会话自动登录 ✓')
+            else:
+                log('本地没有可用登录态，请先登录。', 'err')
+                raise NotLoggedIn('未登录')
+        courses, cpi = collect_courses(page, cfg)
+        by_key = {course_key(c): c for c in courses}
+        progress('开始正式交卷：共 %d 份。' % len(items))
+        for i, it in enumerate(items, 1):
+            if _wait_control(control, progress) == 'stop':
+                out['stopped'] = True
+                log('已停止。', 'warn')
+                break
+            c = by_key.get(it.get('key') or '')
+            if not c:
+                progress('  ⚠ 找不到课程（可能已变动），跳过：%s'
+                         % cut(it.get('course', ''), 20), 'warn')
+                out['skip'] += 1
+                out['results'].append({'key': it.get('key'), 'kid': it.get('kid'),
+                                       'status': 'skip'})
+                continue
+            progress('【%d/%d】交卷：%s · %s' % (i, len(items), cut(c['name'], 18),
+                                                 cut(it.get('node', ''), 28)))
+            r = answer_one(page, c, cpi, it.get('kid'), cfg, True, progress,
+                           pre={'answers': it.get('answers') or {},
+                                'stems': it.get('stems') or {}})
+            if r == 'submitted':
+                out['submitted'] += 1
+                st = 'done'
+            elif r == 'already':
+                out['submitted'] += 1      # 已批阅 = 这份作业已是完成态
+                st = 'already'
+            elif r == 'unverified':
+                out['unverified'] += 1     # 请求发了但没核实到结果，不算失败
+                st = 'unverified'
+            elif r in ('unsolved', 'report', 'unsupported'):
+                out['skip'] += 1
+                st = r
+            else:
+                out['fail'] += 1
+                st = 'fail'
+            out['results'].append({'key': it.get('key'), 'kid': it.get('kid'),
+                                   'status': st})
+            time.sleep(max(float(cfg.get('course_delay', 1.2)), 1.5))
+        progress('交卷结束：成功 %d 份，未确认 %d 份，失败 %d 份，需人工 %d 份，'
+                 '用时 %.0f 分钟。'
+                 % (out['submitted'], out['unverified'], out['fail'],
+                    out['skip'], (time.time() - t0) / 60))
+    finally:
+        save_state(ctx)
+        close_ctx(ctx)
+    return out
+
+
+def verify_items(cfg, items, progress=None, control=None, headless=None) -> dict:
+    """事后核实「未确认」的作业到底交上没有。
+
+    平台批阅状态可能延迟几分钟到十几分钟才翻转（实测多次），交卷当场
+    核实不到不代表没交上。这里把未确认清单逐份重开：作业卡渲染成
+    「已批阅」页 = 翻案为已交卷；仍是答题页 = 平台还没翻转（或真没交上），
+    隔一段时间再核，最多 verify_rounds 轮（间隔 verify_round_gap 秒，
+    都可在 config 调）。
+
+    items: [{'key','kid','course','node'}]（交卷结果面板里的未确认行）。
+    返回 {'confirmed': n, 'still': n, 'stopped': bool,
+          'results': [{'key','kid','status'}]}   status ∈ already/still
+    """
+    progress = progress or (lambda m, *a: log(m, a[0] if a else 'info'))
+    control = control or (lambda: 'run')
+    t0 = time.time()
+    ctx = launch(cfg, headless=headless)
+    page = ctx.new_page()
+    rounds = max(int(cfg.get('verify_rounds') or 3), 1)
+    gap = max(int(cfg.get('verify_round_gap') or 120), 15)
+    out = {'confirmed': 0, 'still': 0, 'stopped': False, 'results': []}
+    try:
+        banner('检查登录状态')
+        if not check_login(page):
+            if restore_state(ctx) and check_login(page):
+                log('已用本地会话自动登录 ✓')
+            else:
+                log('本地没有可用登录态，请先登录。', 'err')
+                raise NotLoggedIn('未登录')
+        courses, cpi = collect_courses(page, cfg)
+        by_key = {course_key(c): c for c in courses}
+        # 初始就是 still：核实不中的项最后必须计入「仍未确认」。
+        # 旧初始值 'unverified' 不在 already/still 统计里 → 出现过
+        # 「确认已交 0 份，仍未确认 0 份」的矛盾账（22:23 实测踩过）
+        st = {(it.get('key'), it.get('kid')): 'still' for it in items}
+        pending = list(items)
+        for rd in range(1, rounds + 1):
+            progress('核实第 %d/%d 轮：共 %d 份待确认。' % (rd, rounds, len(pending)))
+            confirmed_this = []
+            for i, it in enumerate(pending, 1):
+                if _wait_control(control, progress) == 'stop':
+                    out['stopped'] = True
+                    break
+                c = by_key.get(it.get('key') or '')
+                if not c:
+                    progress('  ⚠ 找不到课程，没法核实：%s'
+                             % cut(it.get('course', ''), 20), 'warn')
+                    st[(it.get('key'), it.get('kid'))] = 'still'
+                    continue
+                progress('  【%d/%d】核实：%s · %s'
+                         % (i, len(pending), cut(c['name'], 18),
+                            cut(it.get('node', ''), 28)))
+                _, note = _wait_hw_iframe(
+                    page, CARDS_URL.format(clsid=c['clsid'], cid=c['cid'],
+                                           kid=it.get('kid'), cpi=cpi), log)
+                if note == 'already':
+                    progress('  ✓ 平台显示已批阅——这份确实交上了。')
+                    st[(it.get('key'), it.get('kid'))] = 'already'
+                    confirmed_this.append(it)
+                else:
+                    progress('  … 平台还没翻转状态，下一轮再看。')
+            for it in confirmed_this:
+                pending.remove(it)
+            out['confirmed'] += len(confirmed_this)
+            if out['stopped'] or not pending:
+                break
+            if rd < rounds:
+                progress('  还有 %d 份没核实到，隔 %d 秒再核一轮'
+                         '（等待中可点停止）…' % (len(pending), gap))
+                for _ in range(gap):
+                    time.sleep(1.0)
+                    if _wait_control(control, progress) == 'stop':
+                        out['stopped'] = True
+                        break
+                if out['stopped']:
+                    break
+        for it in items:
+            s = st.get((it.get('key'), it.get('kid')), 'still')
+            out['results'].append({'key': it.get('key'), 'kid': it.get('kid'),
+                                   'status': s})
+            if s == 'still':
+                out['still'] += 1
+        progress('核实结束：确认已交 %d 份，仍未确认 %d 份%s，用时 %.0f 分钟。'
+                 % (out['confirmed'], out['still'],
+                    '（可过几分钟再点一次「重新核实」，或打开作业网址手动确认）'
+                    if out['still'] else '',
+                    (time.time() - t0) / 60))
+    finally:
+        save_state(ctx)
+        close_ctx(ctx)
+    return out
 
 
 def brush_node(page, c, cpi, kid, cfg, progress, control):
@@ -1769,8 +2893,9 @@ def _wait_control(control, progress):
 def brush_videos(cfg, only, progress=None, control=None, headless=None) -> dict:
     """按课程自动刷未完成的「任务点视频」。
 
-    only: course_key() 列表（界面勾选的课），必填——不提供「全部课程都刷」，
-          防止误触发把几十门课全部挂后台。
+    only: 课程 key（cid:clsid）与「key|kid」章节规格混用的列表（界面勾选），
+          必填——不提供「全部课程都刷」，防止误触发把几十门课全部挂后台。
+          key = 该课全部待完成节点；key|kid = 只刷这个章节节点。
     progress(msg): 进度回调（界面把它写进日志和状态行）。
     control(): 'run' | 'pause' | 'stop'，界面注入；CLI 用默认的「一直 run」。
     返回 {'courses': [...], 'done': n, 'fail': n, 'stopped': bool}
@@ -1790,7 +2915,7 @@ def brush_videos(cfg, only, progress=None, control=None, headless=None) -> dict:
                 log('本地没有可用登录态，请先登录。', 'err')
                 raise NotLoggedIn('未登录')
         courses, cpi = collect_courses(page, cfg)
-        keep = set(only or [])
+        keep, node_keep = split_only(only)
         picked = [c for c in courses if course_key(c) in keep]
         if not picked:
             raise RuntimeError('要刷的课程没匹配到（课程可能有变动），'
@@ -1817,6 +2942,14 @@ def brush_videos(cfg, only, progress=None, control=None, headless=None) -> dict:
                                        'note': '无待完成节点'})
                 continue
             nodes = [n for n in pd['pending'] if n.get('kid')]
+            want = node_keep.get(course_key(c))
+            if want is not None:
+                nodes = [n for n in nodes if n['kid'] in want]
+                if not nodes:
+                    progress('  勾选的章节已经不在待完成清单里（可能已完成），跳过。')
+                    out['courses'].append({'name': c['name'], 'done': 0, 'fail': 0,
+                                           'note': '勾选章节已完成'})
+                    continue
             progress('  待完成节点 %d 个，开始刷…' % len(nodes))
             cd = cf = 0
             stopped_here = False
@@ -1835,6 +2968,9 @@ def brush_videos(cfg, only, progress=None, control=None, headless=None) -> dict:
             out['courses'].append({'name': c['name'], 'done': cd, 'fail': cf})
             out['done'] += cd
             out['fail'] += cf
+            # 一门课刷完立刻汇报一次；中途停止也汇报已刷的部分
+            progress('  ✓ %s 刷完：完成 %d 个节点，未完成 %d 个。'
+                     % (cut(c['name'], 24), cd, cf))
             if stopped_here:
                 out['stopped'] = True
                 break
@@ -2404,7 +3540,7 @@ def _selftest_finish(checks, notes) -> dict:
 def main(argv=None):
     ap = argparse.ArgumentParser(
         prog='chaoxing_scanner',
-        description='学习通未完成事项巡检工具（只读，不提交任何作业）')
+        description='学习通未完成事项巡检工具（查询只读；刷课/答题需手动触发）')
     sub = ap.add_subparsers(dest='cmd')
 
     p = sub.add_parser('login', help='登录并保存会话')
@@ -2431,6 +3567,14 @@ def main(argv=None):
     p.add_argument('--headed', action='store_true', help='显示浏览器窗口')
     p.add_argument('--rate', type=float, default=None,
                    help='播放倍速（默认取 config 的 brush_rate，再默认 2）')
+
+    p = sub.add_parser('answer',
+                       help='用大模型自动做章节任务点里的作业（先在 config 填 llm_url/llm_key/llm_model）')
+    p.add_argument('courses', nargs='+',
+                   help='课程名（支持部分匹配，可给多个）')
+    p.add_argument('--headed', action='store_true', help='显示浏览器窗口')
+    p.add_argument('--submit', action='store_true',
+                   help='答完直接交卷（默认预演：只答题不落库，答完列出可交卷清单）')
 
     sub.add_parser('doctor', help='检查运行环境')
     sub.add_parser('selftest',
@@ -2517,6 +3661,42 @@ def main(argv=None):
             return 130
         except Exception as e:
             log('刷视频失败：%s' % e, 'err')
+            import traceback
+            log(traceback.format_exc()[-1200:], 'err')
+            return 1
+
+    if args.cmd == 'answer':
+        try:
+            ctx = launch(cfg, headless=False if args.headed else None)
+            page = ctx.new_page()
+            try:
+                if not check_login(page):
+                    if not (restore_state(ctx) and check_login(page)):
+                        log('未登录，请先 login', 'err')
+                        return 1
+                courses, cpi = collect_courses(page, cfg)
+            finally:
+                save_state(ctx)
+                close_ctx(ctx)
+            keys = []
+            for name in args.courses:
+                hit = [c for c in courses if name in c['name']]
+                if not hit:
+                    log('没找到课程：%s（可先跑 list 看名单）' % name, 'warn')
+                    continue
+                keys += [course_key(c) for c in hit]
+            if not keys:
+                return 1
+            answer_courses(cfg, keys, submit=True if args.submit else 'dry')
+            return 0
+        except NotLoggedIn as e:
+            log(str(e), 'err')
+            return 2
+        except KeyboardInterrupt:
+            log('已中断', 'warn')
+            return 130
+        except Exception as e:
+            log('答题失败：%s' % e, 'err')
             import traceback
             log(traceback.format_exc()[-1200:], 'err')
             return 1

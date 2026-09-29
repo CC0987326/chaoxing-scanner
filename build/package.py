@@ -21,7 +21,8 @@ OUT = HERE.parent / (ZIP_NAME + '.zip')
 EXCLUDE = {'runtime', '输出', '__pycache__', '.pytest_cache'}
 
 # config.json 里跟「本机 + 本账号」绑定的字段，打包前必须清空
-SENSITIVE_KEYS = ('cpi', 'chrome_path')
+# （llm_key 是用户的 API Key，随包发出去等于把付费接口送人）
+SENSITIVE_KEYS = ('cpi', 'chrome_path', 'llm_key')
 
 
 def _scrub_config():
@@ -77,6 +78,61 @@ def _check_fresh():
     return True
 
 
+# 出包前泄漏扫描：文本文件里出现 API Key 形态的字符串就拒绝出包。
+# sk- 开头跟一长串字母数字（OpenAI/DeepSeek 等家的 key 都这个形）。
+# 限长度防误伤普通单词；扫描的是将要进包的文件（已排除 EXCLUDE 目录）。
+import re
+_KEY_RE = re.compile(r'sk-[A-Za-z0-9_-]{16,}')
+_TEXT_SUFFIX = {'.py', '.json', '.txt', '.md', '.js', '.html', '.css',
+                '.cfg', '.ini', '.csv', '.xml', '.bat', '.sh'}
+
+
+def _scan_leaks():
+    """出包前最后一道闸：扫包内文件，发现敏感内容拒绝出包（退出码 4）。
+
+    查三样：① sk- 形态的 API Key；② config.json 敏感字段没清干净；
+    ③ 登录态文件（runtime/answer_cache.json 也一样不该有——runtime
+    整个目录在 EXCLUDE 里，出现在这里说明目录结构被动过）。
+    """
+    problems = []
+    app = SRC / 'app'
+    cfg = app / 'config.json'
+    try:
+        import json
+        d = json.loads(cfg.read_text(encoding='utf-8'))
+        hit = [k for k in SENSITIVE_KEYS if d.get(k)]
+        if hit:
+            problems.append('config.json 的 %s 不是空的' % '、'.join(hit))
+    except FileNotFoundError:
+        problems.append('config.json 不存在')
+    except Exception as e:
+        problems.append('config.json 读不出来（%s）' % type(e).__name__)
+    for p in SRC.rglob('*'):
+        rel = p.relative_to(SRC)
+        if any(part in EXCLUDE for part in rel.parts):
+            problems.append('包内出现排除目录的内容：%s' % rel)
+            continue
+        if not p.is_file() or p.suffix.lower() not in _TEXT_SUFFIX:
+            continue
+        if p.stat().st_size > 4 * 1048576:
+            continue
+        try:
+            text = p.read_text(encoding='utf-8')
+        except Exception:
+            continue
+        m = _KEY_RE.search(text)
+        if m:
+            problems.append('%s 里发现疑似 API Key（%s…）'
+                            % (rel, m.group(0)[:8]))
+    if problems:
+        print('⛔ 打包中止：出包前扫描发现敏感内容：')
+        for b in problems:
+            print('   - ' + b)
+        return False
+    print('出包前扫描通过：无 API Key、config 干净、无登录态/缓存混入。')
+    return True
+
+
 def main():
     if not SRC.exists():
         print('找不到 %s，请先执行 build_all.sh' % SRC)
@@ -86,6 +142,8 @@ def main():
     scrubbed = _scrub_config()
     if scrubbed:
         print('已清空 config.json 里的私有字段：%s' % '、'.join(scrubbed))
+    if not _scan_leaks():
+        return 4
     if OUT.exists():
         try:
             OUT.unlink()
