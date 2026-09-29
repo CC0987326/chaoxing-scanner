@@ -970,7 +970,7 @@ PAGE = r"""<!DOCTYPE html>
       <b>用完怎么退出：</b>点上面的「退出程序」，或者直接关掉那个黑色命令行窗口。
       只关浏览器页面是不会退出的，后台程序还在跑、端口还占着。
       <br><br>
-      如果有问题或者建议，可联系 QQ：2030161963<br>
+      如果有问题或者建议，可联系 QQ：3547502147<br>
       最新版下载地址：<a href="https://github.com/CC0987326/chaoxing-scanner"
         target="_blank" rel="noopener"
         style="color:var(--ac2);text-decoration:none;overflow-wrap:anywhere;"

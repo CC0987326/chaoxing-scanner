@@ -290,7 +290,7 @@ Q: 第一次运行比较久？
 A: 正常。首次要启动浏览器内核并登录，之后会快很多。
 
 ------------------------------------------------------------
-如果有问题或者建议，可联系 QQ：2030161963
+如果有问题或者建议，可联系 QQ：3547502147
 最新版下载地址：https://github.com/CC0987326/chaoxing-scanner
 
 本工具仅供个人学习管理使用。请勿用于任何商业用途。
@@ -303,13 +303,13 @@ def main():
         BAT.replace('\n', '\r\n').encode('gbk', errors='replace'))
     (PKG / '使用说明.txt').write_text(README, encoding='utf-8-sig')
     (PKG / '最新版下载地址.txt').write_text(
-        '如果有问题或者建议，可联系 QQ：2030161963\n'
+        '如果有问题或者建议，可联系 QQ：3547502147\n'
         '最新版下载地址：https://github.com/CC0987326/chaoxing-scanner\n',
         encoding='utf-8-sig')
-    (PKG / '先解压,再点击一键启动.txt').write_text(
+    (PKG / '先看使用说明!!.txt').write_text(
         '使用方法:先解压,再点击一键启动', encoding='utf-8-sig')
     print('  已生成 1-一键启动.bat / 使用说明.txt / 最新版下载地址.txt'
-          ' / 先解压,再点击一键启动.txt')
+          ' / 先看使用说明!!.txt')
     return 0
 
 
