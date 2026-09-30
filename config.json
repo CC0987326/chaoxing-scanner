@@ -13,5 +13,6 @@
   "auto_captcha": false,
   "brush_rate": 1.25,
   "brush_rest_every": 6,
-  "brush_rest_seconds": 30
+  "brush_rest_seconds": 30,
+  "brush_minimize": true
 }

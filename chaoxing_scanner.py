@@ -70,7 +70,7 @@ EXAM_LIST = ('https://mooc1.chaoxing.com/exam-ans/mooc2/exam/exam-list'
 LOGIN_URL = 'https://passport2.chaoxing.com/login?fid=12'
 
 # 版本号：界面侧栏、启动日志、使用说明都引它，别再各处手写一份
-VERSION = 'v3.4'
+VERSION = 'v3.5'
 
 # 平台自身算「已完成」的状态；除此之外都视为未完成
 DONE_STATES = ('已完成', '已互评', '待批阅', '已提交', '待互评', '已结束', '已过期')
@@ -107,6 +107,7 @@ DEFAULT_CONFIG = {
     'brush_rest_every': 6,     # 每连刷 6 个视频歇一次（0 = 不歇）
     'brush_rest_seconds': 30,  # 歇多久（±40% 随机），模拟人离开一下
     'brush_retry': 1,          # 单个视频卡住/超时后原地重试的次数（0 = 不重试）
+    'brush_minimize': True,    # 开刷后把浏览器窗口最小化到任务栏（不挡屏幕，不影响播放）
 }
 
 # ================================================================ 日志
@@ -397,6 +398,11 @@ def launch(cfg, headless=None, offscreen=False, auto_download=True):
         '--disable-features=Translate,BackForwardCache',
         '--no-first-run',
         '--no-default-browser-check',
+        # 刷课时窗口会最小化到任务栏（brush_minimize，默认开）：这三个开关
+        # 保证最小化/被遮挡后计时器与播放不被 Chromium 后台节流，心跳照常
+        '--disable-background-timer-throttling',
+        '--disable-backgrounding-occluded-windows',
+        '--disable-renderer-backgrounding',
     ]
     if offscreen:
         args += ['--window-position=-32000,-32000', '--window-size=1440,900']
@@ -469,6 +475,23 @@ try {
     except Exception:
         pass
     raise RuntimeError('所有浏览器内核都无法启动：\n    ' + '\n    '.join(errors))
+
+
+def minimize_window(page):
+    """把浏览器窗口最小化到任务栏（CDP，只动工具自己的窗口）。
+
+    刷视频全程不需要窗口可见：播放器照常走心跳，进度照常记录，
+    只是别把用户屏幕挡住。无头模式没有窗口，会静默跳过。
+    """
+    try:
+        cdp = page.context.new_cdp_session(page)
+        wid = cdp.send('Browser.getWindowForTarget')['windowId']
+        cdp.send('Browser.setWindowBounds',
+                 {'windowId': wid, 'bounds': {'windowState': 'minimized'}})
+        return True
+    except Exception as e:
+        log('最小化浏览器窗口失败（不影响刷课）：%s' % e, 'warn')
+        return False
 
 
 def close_ctx(ctx):
@@ -3397,6 +3420,11 @@ def brush_videos(cfg, only, progress=None, control=None, headless=None) -> dict:
         progress('共 %d 门课要刷：%s' % (
             len(picked), '、'.join(cut(c['name'], 16) for c in picked)))
         banner('逐门课刷视频（共 %d 门，%sx 静音）' % (len(picked), g_rate(cfg)))
+        # 登录确认后再收窗口：登录/验证码阶段必须可见，刷课阶段不需要
+        if cfg.get('brush_minimize', True) and not (headless is True):
+            if minimize_window(page):
+                progress('浏览器已最小化到任务栏（后台刷课不影响进度，'
+                         '点任务栏图标可随时查看）。')
         for i, c in enumerate(picked, 1):
             if _wait_control(control, progress) == 'stop':
                 out['stopped'] = True
