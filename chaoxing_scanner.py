@@ -70,7 +70,7 @@ EXAM_LIST = ('https://mooc1.chaoxing.com/exam-ans/mooc2/exam/exam-list'
 LOGIN_URL = 'https://passport2.chaoxing.com/login?fid=12'
 
 # 版本号：界面侧栏、启动日志、使用说明都引它，别再各处手写一份
-VERSION = 'v3.5'
+VERSION = 'v3.6'
 
 # 平台自身算「已完成」的状态；除此之外都视为未完成
 DONE_STATES = ('已完成', '已互评', '待批阅', '已提交', '待互评', '已结束', '已过期')
@@ -2196,9 +2196,63 @@ def brush_pace_rest(done_total, cfg, progress, control, state=None):
 #   · 答案按题干哈希落本地缓存（runtime/answer_cache.json），同题不重复花钱
 ATYPES = {'0': '单选', '1': '多选', '3': '判断'}   # 客观题：直接选
 STYPES = {'2': '填空', '4': '简答'}                # 主观题：LLM 写文本
-# 「上传附件」型主观题（题干要求交实验报告/附件）LLM 替不了，单独跳过并说明
+# 「上传附件」型主观题（题干要求交实验报告/附件）LLM 替不了，单独跳过并说明。
+# ⚠ 这份规则与 JS_PARSE_TIMUS 里的 stemUpload 必须一致（两处一起改）：
+#   JS 那份管「一进来就认出附件题」，这份管「模型给了占位答案时兜底回头判」。
+#   规则放宽是有意的——漏判=乱填一个答案拿 0 分，误判=整份跳过让用户自己做。
+_ATTACH_STEM_RE = re.compile(
+    r'上传附件|提交附件|附件上传|附件提交|以附件|附件形式|拍照上传'
+    r'|上传.{0,8}(报告|文件|文档|图片|视频|音频|压缩包|作品|附件)'
+    r'|提交.{0,8}(报告|文件|文档|压缩包|作品|附件)'
+    r'|(报告|文件|作品|附件).{0,6}(上传|提交)')
 # 模型拒答特征（题干是反爬乱码时模型可能"猜懂"后拒绝作答，这种话不能进作业）
 _REFUSE_RE = None  # 延迟编译，见 llm_solve
+
+
+def _stem_missing(stem):
+    """题干压根没取到 / 明显不可用（作业卡结构变了、字体反爬的 PUA 痕迹）。
+
+    真机实测事故：某课作业卡的题干不在 .Zy_TItle 里，取到空题干 → 附件规则
+    无从匹配 → 模型只看到「1.【简答】」就瞎编一段「进入课程作业中的实验报告，
+    点击上传文件……提交即可」当答案，工具照填还交了卷，整题 0 分。
+    判据（任一命中）：
+      · 空或短得不像题干（< 4 字符）
+      · 含 Unicode 私用区（E000-F8FF）/ 替换字符（FFFD）——字体反爬的痕迹
+    ⚠ 这里**不能**用「无字母数字」判定：超星里纯中文题干很常见
+      （「下列哪项属于…」），那样会把大批正常客观题误判成不可读。
+      那条更强的判据只留给主观题（见 answer_one），语义见下。
+    """
+    s = (stem or '').strip()
+    if len(s) < 4:
+        return True
+    return bool(re.search(r'[\ue000-\uf8ff\ufffd]', s))
+
+
+def _split_fill(a, nblank):
+    """多空填空题：把一个答案串按空序切成 nblank 段。
+
+    模型对多空填空的给法有三种，都要认：
+      ① 按约定用 | 分隔（新提示词要求的写法）；
+      ② 用顿号/分号/换行分隔（模型的老习惯，如「桥接模式、NAT模式、仅主机模式」）；
+      ③ 不切——整段就是对每个空该填的同一个值（如「所有空都填 0」的题）。
+    返回长度恰为 nblank 的列表：
+      · 用了 | 却切不出 nblank 段 → None（模型没按约定来，判没把握，宁可不填）
+      · 其他分隔符切出 nblank 段 → 逐空；切不出 → 整段复制 nblank 份（保持旧行为）
+    顿号/逗号放最后试：答案内容本身可能含顿号（单空题答案就是「桥接模式、NAT模式」），
+    只有刚好切出 nblank 段才认，否则退回整段。
+    """
+    if nblank <= 1:
+        return [a]
+    for sep in ('|', '｜'):
+        if sep in a:
+            parts = [p.strip() for p in a.split(sep) if p.strip()]
+            return parts if len(parts) == nblank else None
+    for sep in ('\n', '；', ';', '、', '，', ','):
+        if sep in a:
+            parts = [p.strip() for p in a.split(sep) if p.strip()]
+            if len(parts) == nblank:
+                return parts
+    return [a] * nblank
 
 # 解析作业题。inputs 里带上隐藏的 answertype（题型码）与可点选项。
 JS_PARSE_TIMUS = r"""
@@ -2206,8 +2260,18 @@ JS_PARSE_TIMUS = r"""
   const out = [];
   document.querySelectorAll('.TiMu').forEach((li, idx) => {
     const at = li.querySelector('input[name^=answertype]');
-    const stem = ((li.querySelector('.Zy_TItle') || {}).textContent || '')
-      .replace(/\s+/g, ' ').trim();
+    // 题干提取三级兜底。真机实测踩过：某课作业卡的题干不在 .Zy_TItle 里
+    // （结构差异），取到空题干 → 附件规则无从匹配 → 模型只看到「1.【简答】」
+    // 就瞎编了一段「进入课程作业中的实验报告，点击上传文件……提交即可」当
+    // 答案，工具照填还交了卷，整题 0 分。宁可题干带点噪声，也不能空着。
+    let stem = ((li.querySelector('.Zy_TItle') || {}).textContent || '');
+    if (!stem.trim()) {
+      const cand = li.querySelector(
+        '.Zy_Questions_Con, .TiMu_Title, .quesDetail, .questionCon, p');
+      if (cand) stem = cand.textContent || '';
+    }
+    if (!stem.trim()) stem = li.textContent || '';
+    stem = stem.replace(/\s+/g, ' ').trim().slice(0, 500);
     const opts = [], fills = [];
     li.querySelectorAll('input[name^=answer]').forEach(x => {
       if (x.type === 'hidden') return;
@@ -2217,11 +2281,18 @@ JS_PARSE_TIMUS = r"""
                         .replace(/\s+/g, ' ').trim().slice(0, 150)});
     });
     li.querySelectorAll('textarea, input[type=text]').forEach(x => {
-      fills.push({name: x.name || ''});
+      fills.push({name: x.name || '', tag: x.tagName.toLowerCase()});
     });
-    // 「上传附件」型主观题：有文件选择控件或题干点名要上传/提交附件
-    const upload = !!li.querySelector('input[type=file]') ||
-      /上传附件|提交附件|上传.*报告|附件.*上传/.test(stem);
+    // 「上传附件」型主观题（LLM 替不了）：两条都查，任一命中即判为附件题。
+    // ① 题内有文件选择控件 / 上传类组件（题干可能被反爬加密或结构不同，
+    //    这时只能靠控件本身认）；
+    // ② 题干点名要上传/提交材料——表述千变万化（「请提交实验报告」「以附件
+    //    形式提交」「上传视频」…），动作词+对象词组合着扫，宁宽勿漏：
+    //    漏判的代价是乱填一个占位答案拿 0 分，误判只是整份跳过让用户自己做。
+    const hasUploader = !!li.querySelector(
+      'input[type=file], [class*=upload], [id*=upload], .edui-upload');
+    const stemUpload = /上传附件|提交附件|附件上传|附件提交|以附件|附件形式|拍照上传|上传.{0,8}(报告|文件|文档|图片|视频|音频|压缩包|作品|附件)|提交.{0,8}(报告|文件|文档|压缩包|作品|附件)|(报告|文件|作品|附件).{0,6}(上传|提交)/.test(stem);
+    const upload = hasUploader || stemUpload;
     out.push({no: idx + 1, stem: stem.slice(0, 500),
               atype: at ? at.value : '',
               opts, fills, upload});
@@ -2418,7 +2489,18 @@ def _parse_llm_answers(txt, n, types=None):
                 i = int(k)
             except (TypeError, ValueError):
                 continue
-            if not (1 <= i <= n) or not isinstance(v, str):
+            if not (1 <= i <= n):
+                continue
+            # 多空填空题模型可能直接给数组（["桥接模式","NAT模式","仅主机模式"]）：
+            # 用 | 连接后交给填空切分逐空填；纯数字答案（如判断题给了 1/0）转字符串。
+            # 以前这里只认 str，数组会被当解析失败整题丢掉——白花一次模型钱。
+            if isinstance(v, list):
+                v = '|'.join(str(x).strip() for x in v if str(x).strip())
+            elif isinstance(v, bool):
+                continue
+            elif isinstance(v, (int, float)):
+                v = str(v)
+            if not isinstance(v, str):
                 continue
             v = v.strip()
             t = (types or {}).get(i)
@@ -2482,7 +2564,11 @@ def llm_solve(cfg, timus, progress):
     本地答案缓存：按题干哈希查 runtime/answer_cache.json，命中直接复用
     （同题干=同一道题，不重复花模型的钱）；模型答上的新题写回缓存。
     """
-    todo = [t for t in timus if not t.get('upload')]
+    # 题干压根没取到的题不发给模型：模型看不到题干会瞎编一段「这题该怎么
+    # 操作」当答案（真机实测被填进卷子拿 0 分），白白花钱还误导。
+    # 留给 answer_one 判成「需人工」。
+    todo = [t for t in timus
+            if not t.get('upload') and not _stem_missing(t.get('stem'))]
     if not todo:
         return {}
     # ---- 先查本地缓存 ----
@@ -2507,7 +2593,15 @@ def llm_solve(cfg, timus, progress):
         if t['atype'] == '3':
             line += '（判断题：对/错）'
         elif t['atype'] == '2':
-            line += '（填空：只输出空里应填的内容本身）'
+            nb = len(t.get('fills') or [])
+            if nb > 1:
+                # 多空填空必须点明空数：不点明模型会把「A、B、C」当成一整个答案
+                # 返回，工具再把它灌进每个空 → 3 个空全错（真机实测踩过）。
+                line += ('（填空，共 %d 个空：按横线出现的先后顺序逐个给答案，'
+                         '空与空之间用 | 分隔，例如 桥接模式|NAT模式|仅主机模式）'
+                         % nb)
+            else:
+                line += '（填空：只输出空里应填的内容本身）'
         elif t['atype'] == '4':
             line += '（简答：150 字以内直接作答，不要客套话）'
         else:
@@ -2517,7 +2611,9 @@ def llm_solve(cfg, timus, progress):
     prompt = ('你是答题助手。请回答下面的题目。\n'
               '输出要求：只输出一个 JSON 对象，键为题号（字符串），值为答案。\n'
               '单选/多选输出大写字母（多选如 "AC"）；判断题输出 "对" 或 "错"；\n'
-              '填空只输出应填内容本身；简答输出答案文本（150 字内）。\n'
+              '填空只输出应填内容本身，多空题按空序用 "|" 分隔；'
+              '简答输出答案文本（150 字内）。\n'
+              '凡题干要求上传附件/文件/报告、或需要粘贴外部资料的题，输出 "?"。\n'
               '没有把握的题输出 "?"。不要输出 JSON 以外的任何文字。\n\n'
               + '\n\n'.join(lines))
     txt = llm_chat(cfg, prompt)
@@ -2532,7 +2628,13 @@ def llm_solve(cfg, timus, progress):
     refuse = _re.compile(
         r'(无法|不能|不会).{0,8}(代[替理]|提交|上传|完成)'
         r'|(请|需要).{0,8}(自行|亲自|本人).{0,4}(上传|提交|完成)'
-        r'|(语言模型|AI\s*助手|作为一个\s*AI)')
+        r'|(语言模型|AI\s*助手|作为一个\s*AI)'
+        # 元话语：模型在描述「这题该怎么操作」而不是给出答案内容。真机实测：
+        # 实验报告题被填了「进入课程作业中的实验报告，点击上传文件，在下拉
+        # 菜单中选择要提交的文件，确认后提交即可。」→ 0 分。这类话绝不能进作业。
+        r'|(点击|选择|打开|进入).{0,14}(上传|提交|附件)'
+        r'|(上传|提交)(文件|附件).{0,10}(即可|就行|然后|最后)'
+        r'|下拉菜单.{0,8}选择')
     for t in todo:
         a = ans.get(t['no'])
         if a and t['atype'] in STYPES and refuse.search(a):
@@ -2761,16 +2863,47 @@ def answer_one(page, c, cpi, kid, cfg, submit, progress, pre=None, detail=None):
         if not a or a == '?':
             # 题干没有字母/数字 → 大概率被平台字体反爬加密（此类历来是
             # 实验报告/附件题），归到「需人工」而不是「没把握」
+            # 主观题另有一条更强的判据「题干连一个字母数字都没有」：正常的
+            # 简答/填空题多少会带点英文或数字（专有名词、公式、代码），一个
+            # 都不带的多半是平台把字换了（字体反爬），而这类题历来是实验报告
+            # /附件题 → 归「需人工」。⚠ 这条只敢用在主观题上：客观题纯中文
+            # 题干太常见，用它会误伤一大片。
             stem = t.get('stem') or ''
-            if t['atype'] in STYPES and not re.search(r'[A-Za-z0-9]', stem):
-                log('    第 %d 题题干被平台字体加密无法读取（此类多为'
-                    '实验报告/附件题），需要你本人完成。' % t['no'], 'warn')
+            if t['atype'] in STYPES and (
+                    _stem_missing(stem)
+                    or not re.search(r'[A-Za-z0-9]', stem)):
+                log('    第 %d 题题干读不出来（平台字体反爬/作业卡结构变化，'
+                    '此类多为实验报告附件题），需要你本人完成，整份跳过。'
+                    % t['no'], 'warn')
                 return 'report'
             missing.append(t['no'])
             continue
+        # 语义兜底：题干点名要「提交/上传」报告·文件·作品，模型却只给了极短
+        # 占位答案（如 "1"）——这类题的答案区本就是给用户传附件的，填字必得
+        # 0 分（真机实测：实验报告题被填「1」整题 0 分）。宁可不碰。
+        if (t['atype'] in STYPES and len(str(a).strip()) <= 2
+                and _ATTACH_STEM_RE.search(t.get('stem') or '')):
+            log('    第 %d 题题干要求提交/上传材料，模型只给出占位答案「%s」，'
+                '判为附件题，整份跳过（保存会让任务点直接完成，'
+                '你就没法再传报告了）。' % (t['no'], str(a)[:12]), 'warn')
+            return 'report'
         if t['atype'] in STYPES:             # 主观题：文本 → textarea
             if not t['fills']:
                 missing.append(t['no'])
+                continue
+            if t['atype'] == '2' and len(t['fills']) > 1:
+                # 多空填空：按空序把答案切开逐空填。v3.6 前是每个空都灌整串，
+                # 真机实测「桥接模式、NAT模式、仅主机模式」题 3 个空全错。
+                parts = _split_fill(a, len(t['fills']))
+                if parts is None:
+                    log('    第 %d 题是多空填空（%d 个空），但模型没按空序给'
+                        '（%s），按没把握处理，这份不交。'
+                        % (t['no'], len(t['fills']), str(a)[:30]), 'warn')
+                    missing.append(t['no'])
+                    continue
+                for f, pv in zip(t['fills'], parts):
+                    if f['name']:
+                        fills.append({'name': f['name'], 'val': pv})
                 continue
             for f in t['fills']:
                 if f['name']:
