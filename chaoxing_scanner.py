@@ -70,7 +70,7 @@ EXAM_LIST = ('https://mooc1.chaoxing.com/exam-ans/mooc2/exam/exam-list'
 LOGIN_URL = 'https://passport2.chaoxing.com/login?fid=12'
 
 # 版本号：界面侧栏、启动日志、使用说明都引它，别再各处手写一份
-VERSION = 'v3.3'
+VERSION = 'v3.4'
 
 # 平台自身算「已完成」的状态；除此之外都视为未完成
 DONE_STATES = ('已完成', '已互评', '待批阅', '已提交', '待互评', '已结束', '已过期')
@@ -99,9 +99,11 @@ DEFAULT_CONFIG = {
     # 点选验证码默认留给用户手点：弹验证码本身就说明已被风控关注，
     # OCR 识别率有限，点错重试反而加重标记。确要自动识别才改 true。
     'auto_captcha': False,
-    # 刷课倍速默认 1.5x：静音 + 2x + 连续几小时是明显的统计特征；
-    # 心跳仍是真实播放产生的（不伪造），只是节奏更像人。
-    'brush_rate': 1.5,
+    # 刷课倍速：界面可选 1.0 / 1.25 / 1.5 / 2.0（默认 1.25）。
+    # 这四个都是播放器官方档位——v3.3 曾用 ±17% 的任意值（如 1.24/1.76），
+    # 平台会把非法档位拨回去、工具再拨回来，两边打架就表现为播放中频繁的
+    # 约 1 秒小暂停。实际播放会在所选档位和相邻官方档位之间随机取挡。
+    'brush_rate': 1.25,
     'brush_rest_every': 6,     # 每连刷 6 个视频歇一次（0 = 不歇）
     'brush_rest_seconds': 30,  # 歇多久（±40% 随机），模拟人离开一下
     'brush_retry': 1,          # 单个视频卡住/超时后原地重试的次数（0 = 不重试）
@@ -1977,14 +1979,18 @@ def brush_video_frame(vf, cfg, progress, control) -> str:
     学习通的心跳是播放器自己发的，我们只负责「让视频真的播完」——
     不伪造心跳请求，平台看到的就是一次真实的观看（静音、倍速）。
 
-    防检测细节（v3.3）：
-      · 倍速不取死值：围绕设定档随机取一档，部分视频中途再换一次挡
-        ——「几小时恒定同一倍速」是明显的统计特征；
+    防检测细节（v3.3，v3.4 修正档位来源）：
+      · 倍速不取死值：只在播放器官方档位（所选档位 ± 相邻档）之间随机取挡，
+        部分视频中途再换一次挡——「几小时恒定同一倍速」是明显的统计特征。
+        v3.3 曾用 ±17% 的任意倍速，平台会拨回非法档位造成频繁小暂停；
       · 播放期间每隔随机 25~70 秒在页面里注入一小段鼠标移动（CDP 注入，
         不动用户真实光标）——「零鼠标移动挂几小时」同样是特征。
     """
     base = g_rate(cfg)
-    tiers = sorted({round(base * f, 2) for f in (0.83, 1.0, 1.17)} | {base})
+    # 档位池 = 所选档位 + 相邻官方档位（1.0 没有更慢的邻档，2.0 没有更快的）。
+    # 只在官方档位之间取挡：非法档位会被平台拨回，来回打架就是频繁小暂停。
+    _i = BRUSH_RATES.index(base)
+    tiers = list(BRUSH_RATES[max(0, _i - 1): _i + 2])
     rate = random.choice(tiers)
     # 部分视频中途换一次挡（换到另一档，不再换回来）
     switch_pending = random.random() < 0.35
@@ -2109,8 +2115,20 @@ def brush_video_frame(vf, cfg, progress, control) -> str:
     return 'timeout'
 
 
+# 学习通播放器官方倍速档位。写入 video.playbackRate 的值必须来自这里：
+# 非官方档位（如 1.24 / 1.76）会被平台播放器拨回去，工具再拨回来，
+# 来回打架 = 播放中频繁出现约 1 秒的小暂停（v3.3 的教训，v3.4 修正）。
+BRUSH_RATES = (1.0, 1.25, 1.5, 2.0)
+
+
 def g_rate(cfg):
-    return min(max(float(cfg.get('brush_rate', 1.5) or 1.5), 1.0), 16.0)
+    """把配置里的 brush_rate 吸附到最近的官方档位（缺省 1.25）。"""
+    r = cfg.get('brush_rate', 1.25)
+    try:
+        r = float(r or 1.25)
+    except (TypeError, ValueError):
+        r = 1.25
+    return min(BRUSH_RATES, key=lambda x: abs(x - r))
 
 
 def brush_pace_rest(done_total, cfg, progress, control, state=None):
@@ -4027,7 +4045,8 @@ def main(argv=None):
                    help='课程名（支持部分匹配，可给多个）')
     p.add_argument('--headed', action='store_true', help='显示浏览器窗口')
     p.add_argument('--rate', type=float, default=None,
-                   help='播放倍速（默认取 config 的 brush_rate，再默认 1.5）')
+                   help='播放倍速（默认取 config 的 brush_rate，再默认 1.25；'
+                        '只在官方档位 1.0/1.25/1.5/2.0 之间生效，自动吸附最近档）')
 
     p = sub.add_parser('answer',
                        help='用大模型自动做章节任务点里的作业（先在 config 填 llm_url/llm_key/llm_model）')

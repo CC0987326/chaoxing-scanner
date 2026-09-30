@@ -380,6 +380,21 @@ def _worker(action, opts):
         cs.log('■ 任务结束')
 
 
+def _apply_rate(opts, cfg):
+    """把界面选的倍速写进 cfg（非法值由 cs.g_rate 吸附到最近官方档位兜底）。
+
+    返回 True 表示 cfg 被改过，调用方决定要不要 save_config 记住它。
+    """
+    r = opts.get('rate')
+    if r in (None, ''):
+        return False
+    try:
+        cfg['brush_rate'] = float(r)
+    except (TypeError, ValueError):
+        return False
+    return True
+
+
 def _brush_worker(opts):
     """「刷选中的课的视频」的后台线程。
 
@@ -396,6 +411,8 @@ def _brush_worker(opts):
         STATE['phase'] = 'brushing'
     try:
         cfg = cs.load_config()
+        if _apply_rate(opts, cfg):
+            cs.save_config(cfg)     # 记住这次选的倍速，下次打开还是它
         rate = cs.g_rate(cfg)
         cs.log('播放方式：%sx 倍速 + 静音，真实播放到片尾（不伪造心跳）。' % rate)
         cs.log('只刷视频任务点；测验 / 作业不会替你自动完成。')
@@ -623,6 +640,8 @@ def _combo_worker(opts):
             return 'run'
 
         # ---- 第一段：刷视频 ----
+        if _apply_rate(opts, cfg):
+            cs.save_config(cfg)     # 记住这次选的倍速，下次打开还是它
         rate = cs.g_rate(cfg)
         cs.log('【第 1 步】刷视频：%sx 倍速 + 静音，真实播放到片尾。' % rate)
         out = cs.brush_videos(cfg, only, progress=progress, control=control)
@@ -723,6 +742,10 @@ PAGE = r"""<!DOCTYPE html>
        border:1px solid var(--line);border-radius:6px;font-size:13px;
        font-family:inherit;outline:none;}
   input:focus{border-color:#2f5a5f;background:#0b1315;}
+  select{padding:4px 6px;background:#0d1517;color:var(--tx);
+         border:1px solid var(--line);border-radius:6px;font-size:12.5px;
+         font-family:inherit;outline:none;cursor:pointer;}
+  select:focus{border-color:#2f5a5f;}
   .pwdwrap{position:relative;}
   .pwdwrap input{padding-right:38px;}
   .eyebtn{position:absolute;right:5px;top:50%;transform:translateY(-50%);
@@ -1145,6 +1168,16 @@ function renderCourses(list){
 // 必须像折叠状态一样重绘前读出、渲染时回填，否则勾上几秒后自己弹开。
 var sdAfterOn = false;
 
+// 倍速选择：同样会被每 900ms 重绘重建，值用全局变量跨重绘保存。
+// 初始值等 /api/llm-config 返回后覆盖为本机上次的选择（默认 1.25x）。
+// 档位只有 1/1.25/1.5/2 四个——它们是播放器官方档位，别的值平台会拨回去。
+var brateVal = '1.25';
+function rateOpts(){
+  return ['1', '1.25', '1.5', '2'].map(v =>
+    '<option value="' + v + '"' + (String(brateVal) === v ? ' selected' : '')
+    + '>' + v + 'x</option>').join('');
+}
+
 function renderResult(r){
   if (!r) return;
   // 任务以异常收尾时结果里只有 error：把「查询中…」的占位换掉，
@@ -1158,6 +1191,8 @@ function renderResult(r){
   const hw = r.undone_hw || [], ex = r.undone_exam || [], pg = r.undone_prog || [];
   const sda = document.getElementById('sdafter');
   if (sda) sdAfterOn = sda.checked;
+  const bsl = document.getElementById('brate');
+  if (bsl) brateVal = bsl.value;
   // 结果区每 900ms 会被轮询整个重绘一次（innerHTML 覆盖），<details> 的展开状态会跟着
   // 一起丢掉——用户点开看一眼，一秒后自己又合上了。重绘前先记下哪些课是展开的，重绘时
   // 按原样补回去，展开与否就变成「用户的决定」而不是「上一次重绘的副作用」。
@@ -1230,6 +1265,10 @@ function renderResult(r){
        + '<button class="mini" style="background:#1a7f37;border-color:#1a7f37;color:#fff"'
        + ' onclick="startAnswer(event)">▶ 做作业并交卷（正式提交）</button>'
        + '<button class="mini" onclick="toggleAllBrush(event)">全选</button>'
+       + '<label class="chk" style="margin:0;white-space:nowrap;align-items:center" '
+       + 'title="播放倍速。只提供播放器官方档位：别的值平台会拨回去，来回打架反而频繁卡顿。'
+       + '实际播放会在这档和相邻档之间随机取挡，中途还会换一次挡">倍速 '
+       + '<select id="brate" onchange="brateVal=this.value">' + rateOpts() + '</select></label>'
        + '<button class="mini" onclick="screenOff(event)">💡 熄屏</button>'
        + '<label class="chk" style="margin:0;white-space:nowrap">'
        + '<input type="checkbox" id="sdafter"' + (sdAfterOn ? ' checked' : '')
@@ -1473,7 +1512,8 @@ function startBrush(ev){
     return;
   }
   fetch('/api/brush', {method:'POST', headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({only: keys, shutdown: !!($('sdafter') && $('sdafter').checked)})}).then(r => {
+    body: JSON.stringify({only: keys, shutdown: !!($('sdafter') && $('sdafter').checked),
+                          rate: brateVal})}).then(r => {
     if (r.status === 409){ toast('当前有任务在跑，等它结束再刷', 'warn'); return; }
     if (!r.ok){ toast('刷视频没能启动（HTTP ' + r.status + '）', 'err'); return; }
     since = 0; logEl.innerHTML = '';
@@ -1496,7 +1536,8 @@ function startCombo(ev){
     return;
   }
   fetch('/api/combo', {method:'POST', headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({only: keys, shutdown: !!($('sdafter') && $('sdafter').checked)})}).then(r => {
+    body: JSON.stringify({only: keys, shutdown: !!($('sdafter') && $('sdafter').checked),
+                          rate: brateVal})}).then(r => {
     if (r.status === 409){ toast('当前有任务在跑，等它结束再做', 'warn'); return; }
     if (!r.ok){ toast('任务没能启动（HTTP ' + r.status + '）', 'err'); return; }
     since = 0; logEl.innerHTML = '';
@@ -1660,6 +1701,13 @@ fetch('/api/llm-config').then(r => r.json()).then(c => {
   if ($('llm_url'))  $('llm_url').value  = c.llm_url  || '';
   if ($('llm_key'))  $('llm_key').value  = c.llm_key  || '';
   if ($('llm_model'))$('llm_model').value= c.llm_model|| '';
+  if (c.brush_rate !== undefined && c.brush_rate !== null && c.brush_rate !== ''){
+    brateVal = String(c.brush_rate);
+    // 结果区可能已经按默认值画出了一个下拉：不同步它，下一次 900ms 重绘
+    // 的「重绘前读值」会把旧选择读回去，回填就被冲掉了（测试抓到的竞态）。
+    const bs = document.getElementById('brate');
+    if (bs) bs.value = brateVal;
+  }
 }).catch(() => {});
 
 document.querySelectorAll('.tab').forEach(b => b.onclick = () => switchTab(b.dataset.t));
@@ -1823,9 +1871,10 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, json.dumps(payload, ensure_ascii=False).encode('utf-8'))
         if u.path == '/api/llm-config':
             cfg = cs.load_config()
-            return self._send(200, json.dumps(
-                {k: cfg.get(k, '') for k in ('llm_url', 'llm_key', 'llm_model')},
-                ensure_ascii=False).encode('utf-8'))
+            payload = {k: cfg.get(k, '') for k in ('llm_url', 'llm_key', 'llm_model')}
+            # 顺手把刷课倍速也带给前端（页面加载时回填下拉框的上次选择）
+            payload['brush_rate'] = cfg.get('brush_rate', 1.25)
+            return self._send(200, json.dumps(payload, ensure_ascii=False).encode('utf-8'))
         return self._send(404, b'{"error":"not found"}')
 
     # 解析请求体的 POST 接口：必须带 application/json 头。
@@ -1882,7 +1931,8 @@ class Handler(BaseHTTPRequestHandler):
                              lines=[], done=False, summary=None,
                              started=time.time(), login_fail=None)
             _spawn(_brush_worker, {'only': only,
-                                   'shutdown': bool(data.get('shutdown'))})
+                                   'shutdown': bool(data.get('shutdown')),
+                                   'rate': data.get('rate')})
             return self._send(200, b'{"ok":true}')
         if u.path == '/api/answer':
             # 「做勾选课程的章节作业并交卷」。only 必填，答完直接正式提交。
@@ -1919,7 +1969,8 @@ class Handler(BaseHTTPRequestHandler):
                              lines=[], done=False, summary=None,
                              started=time.time(), login_fail=None)
             _spawn(_combo_worker, {'only': only,
-                                   'shutdown': bool(data.get('shutdown'))})
+                                   'shutdown': bool(data.get('shutdown')),
+                                   'rate': data.get('rate')})
             return self._send(200, b'{"ok":true}')
         if u.path == '/api/answer-verify':
             # 「重新核实」：把未确认的作业逐份重开，翻案或继续等平台翻转。
