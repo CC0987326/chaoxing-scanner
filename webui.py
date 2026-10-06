@@ -122,6 +122,7 @@ TASK_NAME = {
     'answer': '做作业并交卷（大模型答题）',
     'combo': '刷课 + 刷题（先刷视频再做作业交卷）',
     'verify': '重新核实未确认的作业',
+    'answer_one': '刷题（单份作业，答完交卷）',
 }
 
 
@@ -538,6 +539,78 @@ def _answer_worker(opts):
         cs.log('■ 任务结束')
 
 
+def _answer_single_worker(opts):
+    """「刷题」：对未完成作业清单里点中的那一份，直接答题并交卷。
+
+    判别逻辑与「做作业并交卷（正式提交）」完全一致（共用 answer_urls →
+    answer_one）：附件题整份跳过、题干读不出跳过、多空填空按空序切分、
+    同题干复用上次答案、含不支持题型跳过。
+    """
+    cs.log('')
+    cs.log('▶ 任务开始：刷题（单份作业，答完直接交卷）')
+    PAUSE.clear()
+    CANCEL.clear()
+    with LOCK:
+        STATE['paused'] = False
+        STATE['phase'] = 'answering'
+    try:
+        cfg = cs.load_config()
+        if not (cfg.get('llm_url') and cfg.get('llm_key') and cfg.get('llm_model')):
+            cs.log('还没有配置大模型：请在左侧「大模型答题设置」里填接口地址、'
+                   'API Key 和模型名，保存后再试。', 'err')
+            with LOCK:
+                STATE['summary'] = {'提示': '先配置大模型接口'}
+            return
+        cs.log('模型：%s ｜ 只做这一份；要上传附件的题会整份跳过并提示。'
+               % cfg['llm_model'])
+
+        def progress(msg, *a):
+            cs.log(msg, a[0] if a else 'info')
+            with LOCK:
+                STATE['task'] = '刷题 · ' + (msg[:54] if msg else '')
+
+        def control():
+            if CANCEL.is_set():
+                return 'stop'
+            if PAUSE.is_set():
+                return 'pause'
+            return 'run'
+
+        out = cs.answer_urls(cfg, [{'url': opts.get('url'),
+                                    'course': opts.get('course'),
+                                    'title': opts.get('title')}],
+                             submit=True, progress=progress, control=control)
+        with LOCK:
+            STATE['summary'] = {'交卷': out.get('submitted', 0),
+                                '未确认': out.get('unverified', 0),
+                                '需人工': out.get('report', 0),
+                                '此前已交': out.get('already', 0),
+                                '这份没做': out.get('fail', 0)}
+            if out.get('stopped'):
+                STATE['summary']['状态'] = '已停止'
+    except cs.NotLoggedIn as e:
+        cs.log('%s' % e, 'err')
+        with LOCK:
+            STATE['summary'] = {'提示': '未登录，请先登录'}
+    except Exception as e:
+        cs.log('任务失败：%s' % e, 'err')
+        import traceback
+        cs.log(traceback.format_exc()[-900:], 'err')
+        # 结果区给一版错误卡片：不然「查询中…」占位永远挂着（rv 没变
+        # 前端不会重画），用户只看到无限转圈，失败原因却藏在日志页签
+        _set_result({'error': str(e)[:200] or type(e).__name__})
+    finally:
+        cs.set_control_hook(None)
+        PAUSE.clear()
+        CANCEL.clear()
+        with LOCK:
+            STATE['running'] = False
+            STATE['done'] = True
+            STATE['paused'] = False
+            STATE['phase'] = ''
+        cs.log('■ 任务结束')
+
+
 def _verify_worker(opts):
     """「重新核实」的后台线程：把未确认的作业逐份重开翻案。
 
@@ -764,6 +837,10 @@ PAGE = r"""<!DOCTYPE html>
   .dot.on{background:var(--ac);box-shadow:0 0 0 3px rgba(79,179,168,.16);
           animation:pulse 1.4s infinite;}
   @keyframes pulse{50%{opacity:.45;}}
+  /* 「本机会话是谁的」——放在状态行下面。换号时这条是用户唯一能一眼
+     看出「工具现在在用哪个账号」的地方，所以常驻、不折行不截断 */
+  .who{font-size:12px;color:var(--mut);margin:-8px 0 12px;line-height:1.5;
+       word-break:break-all;}
   .hr{border:0;border-top:1px solid var(--line);margin:16px 0 4px;}
   .cards{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:6px;}
   .card{background:#101a1c;border:1px solid var(--line);border-radius:7px;
@@ -905,6 +982,7 @@ PAGE = r"""<!DOCTYPE html>
 <div class="wrap">
   <div class="side">
     <div class="status"><span class="dot" id="dot"></span><span id="stxt">空闲</span></div>
+    <div class="who" id="who" style="display:none"></div>
 
     <div class="lbl">账号（手机号 / 超星号）</div>
     <input type="text" id="phone" placeholder="例 198xxxxxxxx" autocomplete="username">
@@ -985,6 +1063,11 @@ PAGE = r"""<!DOCTYPE html>
       首次使用请填账号密码点「一键查询」；若密码登录被平台拦下，
       会自动提示你改用「扫码 / 短信登录」。
       登录一次后会话会保存在本机，之后无需重复登录。
+      <br><br>
+      <b>换账号：</b>直接填新账号的密码点「一键查询」就行。本机若存着
+      别的账号的会话，会自动改登你填的这个（旧会话归档到
+      <code>runtime/profile_old</code>，不会丢），绝不会拿旧账号继续跑。
+      左侧「本机会话」那条随时显示工具当前在用哪个账号。
       <br><br>
       <b>只想查几门课：</b>先点「获取课程列表」（约 10 秒，只读名单），
       然后在下方勾选要查的课程，再点「一键查询」。
@@ -1178,6 +1261,10 @@ function rateOpts(){
     + '>' + v + 'x</option>').join('');
 }
 
+// 未完成作业清单。「刷题」按钮按索引取用——结果区每 900ms 整个重绘一次，
+// 索引比把对象塞进 onclick 更抗重绘（重绘时 lastHw 同步刷新为同一份数据）。
+let lastHw = [];
+
 function renderResult(r){
   if (!r) return;
   // 任务以异常收尾时结果里只有 error：把「查询中…」的占位换掉，
@@ -1231,13 +1318,20 @@ function renderResult(r){
            : ('共扫描 ' + (r.course_total||0) + ' 门课程'))) + '</div>';
 
   h += '<div class="sec"><h2>一、未完成作业 <span class="n">' + hw.length + '</span> 项</h2>';
+  lastHw = hw;
   if (hw.length){
     h += '<table><tr><th>课程</th><th>作业名称</th><th>状态</th><th>剩余</th><th></th></tr>';
-    for (const it of hw){
+    for (let i = 0; i < hw.length; i++){
+      const it = hw[i];
       h += '<tr><td>' + esc(it.course) + '</td><td>' + esc(it.title)
          + '</td><td class="bad">' + esc(it.state) + '</td><td class="sub">'
          + esc(it.left || '—') + '</td><td>'
          + (safeUrl(it.url) ? '<a href="' + safeUrl(it.url) + '" target="_blank" rel="noopener">去完成 ↗</a>' : '')
+         + (safeUrl(it.url)
+            ? '<button class="mini" onclick="answerThis(event,' + i + ')"'
+              + ' title="让大模型直接做这一份并交卷：与任务点的「做作业并交卷」同一套'
+              + '判别——要上传附件的题整份跳过、题干读不出跳过，不会乱填">刷题</button>'
+            : '')
          + '</td></tr>';
     }
     h += '</table>';
@@ -1351,6 +1445,10 @@ async function poll(){
       ? (paused ? '已暂停 · 点「继续」恢复'
                 : (finishing ? '收尾中 · 正在生成报告' : ('运行中 · ' + (j.task||''))))
       : (j.done ? '已完成' : '空闲'));
+    // 本机会话是谁的。没有会话（或读不到身份）就不显示，绝不编一个出来。
+    // setText 内部做了「值没变就不写 DOM」，每轮轮询不会造成无谓重排。
+    setText($('who'), j.login_who ? ('本机会话：' + j.login_who) : '');
+    $('who').style.display = j.login_who ? '' : 'none';
     ['bquery','blogin','blist'].forEach(i => $(i).disabled = j.running);
     $('bquery').title = j.running
       ? (finishing ? '正在收尾（生成报告），稍等几秒就能再次查询' : '任务进行中，请先暂停或停止')
@@ -1490,6 +1588,31 @@ function switchTab(t){
   document.querySelectorAll('.tab').forEach(b => b.classList.toggle('on', b.dataset.t === t));
   $('res').style.display = t === 'res' ? '' : 'none';
   $('logpane').style.display = t === 'log' ? '' : 'none';
+}
+
+// ---------- 未完成作业每行的「刷题」 ----------
+// 只做点中的那一份。判别 / 答题 / 交卷与任务点的「做作业并交卷」共用同一条
+// 链（answer_urls → answer_one），所以行为一致：附件题整份跳过、题干读不出
+// 跳过、多空填空按空序切分、同题干复用上次答案。
+function answerThis(ev, i){
+  if (ev) ev.stopPropagation();
+  const it = (lastHw || [])[i];
+  if (!it || !safeUrl(it.url)){ toast('这份作业没有可用的直达链接', 'warn'); return; }
+  if (!confirm('让大模型做这一份并交卷？\n\n' + it.title + '\n（' + it.course + '）'
+      + '\n\n答完直接正式提交、记录成绩。要求上传附件的题会整份跳过，不会乱填。')) return;
+  fetch('/api/answer-one', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({url: it.url, course: it.course, title: it.title})}).then(r => {
+    if (r.status === 409){ toast('当前有任务在跑，等它结束再做', 'warn'); return; }
+    if (!r.ok){ toast('刷题没能启动（HTTP ' + r.status + '）', 'err'); return; }
+    since = 0; logEl.innerHTML = '';
+    $('cards').style.display = 'none'; cardFp = '';
+    $('res').innerHTML = '<div class="empty">正在后台刷这一份：' + esc(it.title)
+      + '…（进度看「运行日志」，可以随时暂停 / 停止）</div>';
+    $('bartip').textContent = '刷题中…';
+    switchTab('log');
+    clearTimeout(timer);
+    poll();
+  }).catch(() => toast('连不上本地程序，请确认那个黑色命令行窗口还在运行', 'err'));
 }
 
 // ---------- 刷视频 / 做作业 / 刷课+刷题 ----------
@@ -1848,8 +1971,17 @@ class Handler(BaseHTTPRequestHandler):
                 # 畸形参数按缺省处理：不给响应会让 socketserver 往
                 # 黑色控制台刷 traceback，可被脚本刷屏
                 since, rv, av = 0, -1, -1
+            # 本机这份会话属于哪个账号。以前界面对此只字不提，用户很容易
+            # 「以为在查自己的号，其实查的是上一个登录过的号」（换号时最
+            # 容易踩）。每次轮询现读文件，保证显示的和实际用的一致——读不
+            # 到就当没有，不猜。
+            try:
+                who = cs.session_label() if cs.STATE_FILE.exists() else ''
+            except Exception:
+                who = ''
             with LOCK:
-                payload = {'lines': STATE['lines'][since:],
+                payload = {'login_who': who,
+                           'lines': STATE['lines'][since:],
                            'total': len(STATE['lines']),
                            'dropped': STATE['dropped'],
                            'running': STATE['running'], 'task': STATE['task'],
@@ -1951,6 +2083,27 @@ class Handler(BaseHTTPRequestHandler):
                              lines=[], done=False, summary=None,
                              started=time.time(), login_fail=None)
             _spawn(_answer_worker, {'only': only})
+            return self._send(200, b'{"ok":true}')
+        if u.path == '/api/answer-one':
+            # 「刷题」：对未完成作业清单里点中的那一份直接答题并交卷。
+            # 没有 http(s) 链接就无从定位这份作业，直接拒掉而不是猜。
+            try:
+                data = json.loads(raw.decode('utf-8') or '{}')
+            except Exception:
+                data = {}
+            url = str(data.get('url') or '').strip()
+            if not url.lower().startswith('http'):
+                return self._send(400, json.dumps(
+                    {'error': '这份作业没有可用的直达链接'}).encode('utf-8'))
+            with LOCK:
+                if STATE['running']:
+                    return self._send(409, b'{"error":"busy"}')
+                STATE.update(running=True, task=TASK_NAME['answer_one'],
+                             lines=[], done=False, summary=None,
+                             started=time.time(), login_fail=None)
+            _spawn(_answer_single_worker,
+                   {'url': url, 'course': str(data.get('course') or ''),
+                    'title': str(data.get('title') or '')})
             return self._send(200, b'{"ok":true}')
         if u.path == '/api/combo':
             # 「刷课+刷题」：先刷选中范围的视频，再对同一批范围做作业并交卷。

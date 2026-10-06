@@ -52,6 +52,12 @@ if str(HERE) not in sys.path:
 RUNTIME = HERE / 'runtime'
 PROFILE_DIR = RUNTIME / 'profile'
 STATE_FILE = RUNTIME / 'state.json'
+# 这份会话「属于哪个账号」的本地记录。和 profile / state.json 同生命周期：
+# 换号归档、回滚都要一起搬，否则记录会和真实会话对不上。
+# 存在的理由：以前工具只知道「有没有登录」，不知道「登录的是谁」——
+# 用户填了 A 账号的密码，只要本机还躺着 B 账号的有效会话就直接复用 B，
+# 于是「用 A 登录，进去是 B」。见 identity 相关函数。
+IDENTITY_FILE = RUNTIME / 'identity.json'
 # 大模型答案的本地缓存（按题干哈希复用，省重复问模型的钱）。
 # 放 runtime/ 里——打包流程本来就排除 runtime，天然不会带进分发包。
 ANSWER_CACHE_FILE = RUNTIME / 'answer_cache.json'
@@ -70,7 +76,7 @@ EXAM_LIST = ('https://mooc1.chaoxing.com/exam-ans/mooc2/exam/exam-list'
 LOGIN_URL = 'https://passport2.chaoxing.com/login?fid=12'
 
 # 版本号：界面侧栏、启动日志、使用说明都引它，别再各处手写一份
-VERSION = 'v3.6'
+VERSION = 'v3.7'
 
 # 平台自身算「已完成」的状态；除此之外都视为未完成
 DONE_STATES = ('已完成', '已互评', '待批阅', '已提交', '待互评', '已结束', '已过期')
@@ -509,6 +515,63 @@ def close_ctx(ctx):
             pass
 
 
+def mask_phone(p) -> str:
+    """手机号脱敏：138****8888。日志里不出现完整号码。"""
+    p = re.sub(r'\D', '', str(p or ''))
+    if len(p) < 7:
+        return p or '（未知）'
+    return p[:3] + '****' + p[-4:]
+
+
+def save_identity(phone='', via='unknown'):
+    """记下「当前这份会话是谁的」。
+
+    via: password（账号密码登录）/ qr（扫码或短信）/ unknown。
+    扫码登录拿不到账号名 → phone 存空串，代表「来源未知」。
+    未知不等于「就是你要的账号」，所以下次用户填密码时不会被误当成
+    同一个号复用（见 do_login_password）。
+    """
+    RUNTIME.mkdir(parents=True, exist_ok=True)
+    try:
+        IDENTITY_FILE.write_text(json.dumps({
+            'phone': re.sub(r'\D', '', str(phone or '')),
+            'via': via,
+            'at': time.strftime('%Y-%m-%d %H:%M:%S'),
+        }, ensure_ascii=False, indent=1), encoding='utf-8')
+    except Exception as e:
+        log('会话身份记录写入失败：%s' % e, 'warn')
+
+
+def load_identity() -> dict:
+    """读回「当前这份会话是谁的」。读不到/损坏都返回空 dict。"""
+    try:
+        if not IDENTITY_FILE.exists():
+            return {}
+        d = json.loads(IDENTITY_FILE.read_text(encoding='utf-8'))
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def drop_identity():
+    try:
+        if IDENTITY_FILE.exists():
+            IDENTITY_FILE.unlink()
+    except Exception:
+        pass
+
+
+def session_label() -> str:
+    """当前会话身份的展示文案，给日志和界面用。"""
+    d = load_identity()
+    ph, via = d.get('phone') or '', d.get('via') or ''
+    if ph:
+        return '账号 %s' % mask_phone(ph)
+    if via == 'qr':
+        return '扫码/短信登录的账号（本机没记下具体是哪个）'
+    return '来源未知的会话'
+
+
 def restore_state(ctx) -> bool:
     """把上次保存的 cookie 注入会话"""
     if not STATE_FILE.exists():
@@ -519,7 +582,11 @@ def restore_state(ctx) -> bool:
         if not ck:
             return False
         ctx.add_cookies(ck)
-        log('已载入上次保存的登录会话（%d 条 cookie）' % len(ck))
+        # 身份一并报出来。这里是一大批「静默复用会话」的必经之路，在此处
+        # 说清楚「这份会话是谁的」，用户才可能第一时间发现「用的不是我要
+        # 的账号」——而不是等报告出来、发现课程对不上才反应过来。
+        log('已载入上次保存的登录会话（%d 条 cookie）｜%s'
+            % (len(ck), session_label()))
         return True
     except Exception as e:
         log('会话恢复失败：%s' % e, 'warn')
@@ -560,6 +627,7 @@ def fresh_profile():
                 STATE_FILE.unlink()
         except Exception:
             pass
+        drop_identity()
         return True
     try:
         PROFILE_DIR.rename(old)
@@ -572,6 +640,11 @@ def fresh_profile():
     try:
         if STATE_FILE.exists():
             shutil.move(str(STATE_FILE), str(old / 'state.json'))
+    except Exception:
+        pass
+    try:
+        if IDENTITY_FILE.exists():
+            shutil.move(str(IDENTITY_FILE), str(old / 'identity.json'))
     except Exception:
         pass
     log('已归档旧账号的浏览器痕迹（runtime/profile_old），本次登录使用全新会话。')
@@ -602,6 +675,11 @@ def restore_profile():
     try:
         if (PROFILE_DIR / 'state.json').exists():
             shutil.move(str(PROFILE_DIR / 'state.json'), str(STATE_FILE))
+    except Exception:
+        pass
+    try:
+        if (PROFILE_DIR / 'identity.json').exists():
+            shutil.move(str(PROFILE_DIR / 'identity.json'), str(IDENTITY_FILE))
     except Exception:
         pass
     log('登录没有成功，已把上一个账号的浏览器痕迹与会话挪回原位。')
@@ -761,12 +839,18 @@ def check_login(page, navigate=True) -> bool:
 
 
 def ensure_login(cfg, ctx, page, interactive=True):
-    """确保处于登录态；未登录则按需拉起登录流程"""
+    """确保处于登录态；未登录则按需拉起登录流程。
+
+    这里只判断「有没有登录」，不判断「是哪个账号」——因为走到这里时
+    用户没有输入账号（填了账号密码的走 do_login_password）。但必须把
+    身份**显式报出来**：以前这里闷声复用本地会话，用户以为在查自己的
+    账号，实际查的是上一个登录过的账号（测试号 / 家人的号）。
+    """
     if check_login(page):
-        log('登录态有效 ✓')
+        log('登录态有效 ✓（%s）' % session_label())
         return
     if restore_state(ctx) and check_login(page):
-        log('已用本地会话自动登录 ✓')
+        log('已用本地会话自动登录 ✓（%s）' % session_label())
         return
     if not interactive:
         raise NotLoggedIn('未登录且无法自动恢复，请先运行 login')
@@ -809,6 +893,9 @@ def do_login(cfg, auto=False, phone='', fresh=False):
             if check_login(page, navigate=False):
                 save_state(ctx)
                 log('原有会话仍然有效，无需重新登录 ✓')
+                log('  这份会话是：%s' % session_label())
+                log('  （若这不是你要的账号，请用界面上的「扫码 / 短信登录」换号，'
+                    '或填该账号的密码后点「一键查询」）')
                 return True
 
         page.goto(LOGIN_URL, wait_until='domcontentloaded')
@@ -836,7 +923,14 @@ def do_login(cfg, auto=False, phone='', fresh=False):
                             " if(e && !e.checked) e.click(); }")
                     except Exception:
                         pass
+                    # 扫码/短信登录拿不到用户输入的账号，只能记成「来源未知」。
+                    # 绝不能沿用旧记录（那会让记录撒谎：明明换成了新号，
+                    # 记录还写着上一个号，下次密码登录就会误判为「同一个号」
+                    # 而复用错会话）。
+                    save_identity('', 'qr')
                     log('登录成功 ✓')
+                    log('  ⚠ 这次是扫码/短信登录，本工具不知道具体是哪个账号，'
+                        '只记「来源未知」。下次若填账号密码查询，会重新登录一次。')
                     return True
             except Exception:
                 pass
@@ -866,8 +960,19 @@ def _login_auto(cfg, phone=''):
     page = ctx.new_page()
     try:
         if restore_state(ctx) and check_login(page):
-            log('已有有效会话 ✓')
-            return True
+            have = (load_identity().get('phone') or '')
+            if have and have == phone:
+                log('本机已保存该账号（%s）的会话 ✓' % mask_phone(phone))
+                return True
+            # 本机躺着的是别的账号（或来源未知）→ 清掉再登，别把新号
+            # 登进装着旧号 cookie 的罐里（同上文 do_login_password 的道理）
+            log('本机会话不是 %s，先清掉旧会话再登录 …' % mask_phone(phone),
+                'warn')
+            try:
+                ctx.clear_cookies()
+                drop_identity()
+            except Exception:
+                pass
 
         page.goto(LOGIN_URL, wait_until='domcontentloaded')
         # 等登录表单渲染出来（上限仍是 3 秒）
@@ -962,13 +1067,15 @@ def _login_auto(cfg, phone=''):
 
         if check_login(page, navigate=False):
             save_state(ctx)
-            log('登录成功 ✓')
+            save_identity(phone, 'sms')
+            log('登录成功 ✓（%s）' % mask_phone(phone))
             return True
         page.goto(BASE_URL, wait_until='domcontentloaded')
         page.wait_for_timeout(4000)
         if check_login(page, navigate=False):
             save_state(ctx)
-            log('登录成功 ✓')
+            save_identity(phone, 'sms')
+            log('登录成功 ✓（%s）' % mask_phone(phone))
             return True
         log('自动登录未成功（验证码可能已过期）。建议改用手动登录：'
             'python chaoxing_scanner.py login', 'err')
@@ -1017,9 +1124,27 @@ def do_login_password(cfg, phone, password, headless=False) -> bool:
     try:
         # 原来这里先 goto 一次个人空间再等 2 秒，但那发生在注入 cookie **之前**，
         # 纯属白等；直接让下面的 check_login 带着 cookie 打开一次就够。
+        #
+        # 【必须同时看「登录的是谁」】v3.6 及以前这里是无条件复用的：只要本机
+        # 有一份还能用的会话就 return True，完全不管用户刚在界面上填的是哪个
+        # 账号。于是「填 A 的密码 → 本机躺着 B 的会话 → 静默以 B 的身份跑」，
+        # 用户看到的就是「登录的账号跟我输入的不是一个」。这比看上去严重：
+        # 之后的刷课、交卷全都会算到 B 头上，而且不可撤销。
         if restore_state(ctx) and check_login(page, navigate=True):
-            log('已有有效会话，无需重新登录 ✓')
-            return True
+            have = (load_identity().get('phone') or '')
+            if have and have == phone:
+                log('本机已保存该账号（%s）的登录会话，直接复用 ✓'
+                    % mask_phone(phone))
+                return True
+            if have:
+                log('本机保存的会话属于另一个账号（%s），'
+                    '改按你输入的 %s 重新登录 …'
+                    % (mask_phone(have), mask_phone(phone)), 'warn')
+            else:
+                log('本机会话没记下是哪个账号（多半是扫码登录留下的），'
+                    '不能确认它就是 %s → 按你输入的账号重新登录 …'
+                    % mask_phone(phone), 'warn')
+            log('（上一个账号的会话会归档到 runtime/profile_old，不会丢）')
 
         # 走到这说明 state.json 里没有可用会话 → 这是一次「真的要登录」。
         # 换号登录前先换罐：持久化 profile 里可能还躺着上一个账号的 cookie
@@ -1086,8 +1211,9 @@ def do_login_password(cfg, phone, password, headless=False) -> bool:
                 time.sleep(2)
                 if check_login(page, navigate=True):
                     save_state(ctx)
+                    save_identity(phone, 'password')
                     logged_in = True
-                    log('登录成功 ✓')
+                    log('登录成功 ✓（%s）' % mask_phone(phone))
                     return True
                 log('  登录还没真正建立，继续等 …', 'warn')
                 continue
@@ -2258,7 +2384,14 @@ def _split_fill(a, nblank):
 JS_PARSE_TIMUS = r"""
 () => {
   const out = [];
-  document.querySelectorAll('.TiMu').forEach((li, idx) => {
+  // 题目容器两版共用：新版答题页（mooc2/work/dowork）每题一个 .questionLi，
+  // 而它外层那个 .TiMu 是「整块答题区」（整页只有一个）；旧版（doHomeWorkNew）
+  // 反过来——.TiMu 才是每题容器。判据：有 .questionLi 且 .TiMu 不多于 1 个
+  // → 用 .questionLi；否则用 .TiMu。不这样判的话，新版会把 3 道题并成 1 条。
+  const _lis = [...document.querySelectorAll('.questionLi')];
+  const _tms = [...document.querySelectorAll('.TiMu')];
+  const _boxes = (_lis.length && _tms.length <= 1) ? _lis : _tms;
+  _boxes.forEach((li, idx) => {
     const at = li.querySelector('input[name^=answertype]');
     // 题干提取三级兜底。真机实测踩过：某课作业卡的题干不在 .Zy_TItle 里
     // （结构差异），取到空题干 → 附件规则无从匹配 → 模型只看到「1.【简答】」
@@ -2266,11 +2399,19 @@ JS_PARSE_TIMUS = r"""
     // 答案，工具照填还交了卷，整题 0 分。宁可题干带点噪声，也不能空着。
     let stem = ((li.querySelector('.Zy_TItle') || {}).textContent || '');
     if (!stem.trim()) {
+      // .mark_name 是新版每题容器里的题目信息行（题号 + 题型 + 分值）
       const cand = li.querySelector(
-        '.Zy_Questions_Con, .TiMu_Title, .quesDetail, .questionCon, p');
+        '.mark_name, .Zy_Questions_Con, .TiMu_Title, .quesDetail, .questionCon, p');
       if (cand) stem = cand.textContent || '';
     }
-    if (!stem.trim()) stem = li.textContent || '';
+    if (!stem.trim()) {
+      // 兜底取整题文本，但要先剔掉富文本编辑器与工具条：它们的占位
+      // 文字（「请输入…」）和按钮名会混进题干，把附件规则之类的匹配搅乱
+      const clone = li.cloneNode(true);
+      clone.querySelectorAll(
+        '.edui-default, .eidtDiv, textarea, script, input').forEach(x => x.remove());
+      stem = clone.textContent || '';
+    }
     stem = stem.replace(/\s+/g, ' ').trim().slice(0, 500);
     const opts = [], fills = [];
     li.querySelectorAll('input[name^=answer]').forEach(x => {
@@ -2370,6 +2511,23 @@ JS_FILL_TEXT = r"""
 # 提交/暂存前必须补的隐藏字段：#answerwqbid = 题目 ID 逗号清单。
 # 不补它服务端回「无效的参数：code-1」，保存直接被拒（实测）。
 # 权威来源是页面 toadd() 里硬编码的清单，取不到再从 answertype 隐藏域反推。
+JS_HAS_QUESTIONS = r"""
+() => {
+  const lis = document.querySelectorAll('.questionLi').length;
+  if (lis) return lis;                       // 新版：每题一个 .questionLi
+  const tms = document.querySelectorAll('.TiMu').length;
+  if (tms > 1) return tms;                   // 旧版：.TiMu 每题一个
+  if (tms === 1) {                           // 旧版单题 / 新版刚渲染出壳
+    const t = document.querySelector('.TiMu');
+    if (t && (t.querySelector('input[name^=answertype]')
+              || t.querySelector('textarea')
+              || t.querySelector('input[name^=answer]'))) return 1;
+  }
+  return 0;
+}
+"""
+
+
 JS_PREP_WQB = r"""
 () => {
   let ids = '';
@@ -2381,7 +2539,7 @@ JS_PREP_WQB = r"""
     ids = [...document.querySelectorAll('input[id^="answertype"]')]
       .map(x => x.id.replace(/^answertype/, '')).join(',') + ',';
   }
-  const el = document.querySelector('#answerwqbid');
+  const el = document.querySelector('#answerwqbid, input[name=answerwqbid]');
   if (el) el.value = ids;
   return ids;
 }
@@ -2740,6 +2898,52 @@ def _wait_hw_iframe(page, url, log):
     return None, 'norender'
 
 
+def _open_work_page(page, url, log):
+    """打开「作业列表」里的直达链接，等答题区就位。
+
+    与 _wait_hw_iframe 的区别：那是旧链路（cards 页 → 壳 → 中间层 → 内层
+    iframe 的 doHomeWorkNew）；这里是作业列表给的 mooc2/work/task 直链——
+    平台会 302 到 mooc2/work/dowork，**整页渲染、主 frame 就是答题页**，
+    题目容器是 .questionLi（真机只读探测确认）。少了两跳异步重定向，
+    所以不再需要「强制解析跳转链」那套兜底。
+
+    返回 (frame | None, note)：'' 就位 ｜ 'already' 已批阅 ｜
+    'norender' 两次都没渲染出来 ｜ 'failed' 打开失败。
+    """
+    for attempt in (1, 2):
+        try:
+            page.goto(url, wait_until='domcontentloaded')
+        except Exception as e:
+            log('    打开作业页失败：%s' % str(e)[:80], 'warn')
+            return None, 'failed'
+        deadline = time.time() + 25
+        while time.time() < deadline:
+            # 已交过的作业平台渲染的是批阅页而不是答题页——别让用户对着
+            # ✗失败 以为没交上（_looks_graded 注释里记着的老教训）
+            for f in page.frames:
+                try:
+                    if 'selectWorkQuestionYiPiYue' in (f.url or ''):
+                        return f, 'already'
+                except Exception:
+                    pass
+            try:
+                if _looks_graded(page.main_frame):
+                    return page.main_frame, 'already'
+            except Exception:
+                pass
+            for f in page.frames:
+                try:
+                    if f.evaluate(JS_HAS_QUESTIONS):
+                        return f, ''
+                except Exception:
+                    continue
+            time.sleep(0.5)
+        if attempt == 1:
+            log('    答题区还没渲染出来，隔 3 秒重开一次…', 'warn')
+            time.sleep(3)
+    return None, 'norender'
+
+
 def _same_stem(a, b):
     """两段题干是否指同一道题（去空白后比前 60 字）。
 
@@ -2765,7 +2969,8 @@ def _submit_ok(resp_seen):
     return False
 
 
-def answer_one(page, c, cpi, kid, cfg, submit, progress, pre=None, detail=None):
+def answer_one(page, c, cpi, kid, cfg, submit, progress, pre=None, detail=None,
+               url=None):
     """对单个章节节点：有作业卡就解析-作答-填表。
 
     submit 三态：
@@ -2779,6 +2984,9 @@ def answer_one(page, c, cpi, kid, cfg, submit, progress, pre=None, detail=None):
     pre: {'answers': {题号: 答案}, 'stems': {题号: 题干}} —— 交卷时复用
          预演阶段的答案，题干对不上的题重新问模型。
     detail: 传 dict 时收回 {answers, stems, total, miss}（dry 模式的产物）。
+    url: 作业直达链接（作业列表给的那种 mooc2/work/task 形态）。传了就直连
+         该页（新版整页渲染、主 frame 即答题页）；不传则按 kid 拼 cards 链接
+         走旧链。两条入口后面的解析 / 判别 / 填表 / 交卷是同一套逻辑。
 
     返回 'nohw'(没有作业卡) | 'ok'(已暂存) | 'submitted'(已交卷，已核实)
          | 'dry'(预演完成) | 'already'(平台显示已批阅，此前已交)
@@ -2787,8 +2995,11 @@ def answer_one(page, c, cpi, kid, cfg, submit, progress, pre=None, detail=None):
          | 'failed' | 'norender'。
     """
     from urllib.parse import urlencode  # noqa: F401  (仅说明用)
-    url = CARDS_URL.format(clsid=c['clsid'], cid=c['cid'], kid=kid, cpi=cpi)
-    hw, note = _wait_hw_iframe(page, url, log)
+    direct = bool(url)          # True = 作业列表直链（新版 dowork 页）
+    if not direct:
+        url = CARDS_URL.format(clsid=c['clsid'], cid=c['cid'], kid=kid, cpi=cpi)
+    hw, note = (_open_work_page(page, url, log) if direct
+                else _wait_hw_iframe(page, url, log))
     if note == 'already':
         log('    平台显示这份作业已批阅（此前已交过），无需再答再交。')
         return 'already'
@@ -3025,7 +3236,8 @@ def answer_one(page, c, cpi, kid, cfg, submit, progress, pre=None, detail=None):
             time.sleep(rgap)
         log('    没直接观察到受理响应，重开作业卡核实（第 %d/%d 次）…'
             % (attempt + 1, rtimes))
-        _, note2 = _wait_hw_iframe(page, url, log)
+        _, note2 = (_open_work_page(page, url, log) if direct
+                    else _wait_hw_iframe(page, url, log))
         if note2 == 'already':
             log('    ✓ 已交卷（平台显示已批阅）。')
             return 'submitted'
@@ -3037,6 +3249,84 @@ def answer_one(page, c, cpi, kid, cfg, submit, progress, pre=None, detail=None):
         log('    ⚠ 没观察到平台的提交请求，这份大概率没交上，'
             '请打开作业网址手动确认。', 'warn')
     return 'unverified'
+
+
+def answer_urls(cfg, targets, progress=None, control=None, headless=None,
+                submit=True) -> dict:
+    """对「未完成作业」清单里指定的作业逐份答题（界面每行的「刷题」按钮）。
+
+    targets: [{'url': 作业直达链接, 'course': 课程名, 'title': 作业名}]。
+             url 必填；课程名/作业名只用于日志，不影响定位。
+    submit:  True = 答完走正式交卷链（默认，与任务点那个按钮一致）；
+             'dry' = 只出答案不落库（预演）。
+
+    判别逻辑**不重复实现**，全部复用 answer_one：附件题整份跳过、题干读不出
+    跳过、多空填空按空序切分、同题干复用上次答案、含不支持题型跳过。
+    一个浏览器会话里逐份处理，中途可停。
+    """
+    progress = progress or (lambda m, *a: log(m, a[0] if a else 'info'))
+    control = control or (lambda: 'run')
+    tgt = [t for t in (targets or [])
+           if isinstance(t, dict) and t.get('url')]
+    out = {'total': len(tgt), 'submitted': 0, 'unverified': 0, 'report': 0,
+           'already': 0, 'skipped': 0, 'fail': 0, 'stopped': False, 'items': []}
+    if not tgt:
+        raise RuntimeError('没有可做的作业（这份清单里缺少作业链接）')
+    ctx = launch(cfg, headless=headless)
+    page = ctx.new_page()
+    try:
+        banner('检查登录状态')
+        if not check_login(page):
+            if restore_state(ctx) and check_login(page):
+                log('已用本地会话自动登录 ✓')
+            else:
+                log('本地没有可用登录态，请先登录。', 'err')
+                raise NotLoggedIn('未登录')
+        banner('逐份答题（共 %d 份，%s）'
+               % (len(tgt), {True: '答完交卷', 'dry': '预演不落库'}.get(
+                   submit, str(submit))))
+        for i, t in enumerate(tgt, 1):
+            if _wait_control(control, progress) == 'stop':
+                out['stopped'] = True
+                log('已停止。', 'warn')
+                break
+            progress('【%d/%d】%s ｜ %s'
+                     % (i, len(tgt), cut(t.get('course') or '（未知课程）', 18),
+                        cut(t.get('title') or '（未知作业）', 26)))
+            detail = {}
+            try:
+                r = answer_one(page, None, None, None, cfg, submit, progress,
+                               detail=(detail if submit == 'dry' else None),
+                               url=t['url'])
+            except Exception as e:
+                r = 'failed'
+                log('    这份出错了：%s' % str(e)[:120], 'warn')
+            if r == 'submitted':
+                out['submitted'] += 1
+            elif r == 'unverified':
+                out['unverified'] += 1
+            elif r in ('report', 'unsupported'):
+                out['report'] += 1
+            elif r == 'already':
+                out['already'] += 1
+            elif r in ('nohw', 'norender', 'dry'):
+                out['skipped'] += 1
+            else:                        # unsolved / failed
+                out['fail'] += 1
+            rec = {'course': t.get('course'), 'title': t.get('title'),
+                   'url': t['url'], 'status': r}
+            if submit == 'dry':
+                rec['answers'] = detail.get('answers') or {}
+                rec['stems'] = detail.get('stems') or {}
+                rec['total'] = detail.get('total')
+            out['items'].append(rec)
+    finally:
+        try:
+            save_state(ctx)
+        except Exception:
+            pass
+        close_ctx(ctx)
+    return out
 
 
 def answer_courses(cfg, only, submit=False, progress=None, control=None,

@@ -20,6 +20,12 @@ OUT = HERE.parent / (ZIP_NAME + '.zip')
 # 绝不能进分发包的目录：登录态 / 报告 / 缓存
 EXCLUDE = {'runtime', '输出', '__pycache__', '.pytest_cache'}
 
+# 绝不能进分发包的文件后缀：运行期日志。
+# 内置 Chrome 每次在本机跑都会往自己目录写 debug.log（Chromium 的 crashpad
+# 初始化错误），它不含账号信息，但属于「本机运行痕迹」，不该跟着 240MB 的
+# 分发包发给别人（实测第一次带内置 Chrome 出包时，就混进了一个 380B 的）。
+EXCLUDE_SUFFIX = {'.log'}
+
 # config.json 里跟「本机 + 本账号」绑定的字段，打包前必须清空
 # （llm_key 是用户的 API Key，随包发出去等于把付费接口送人）
 SENSITIVE_KEYS = ('cpi', 'chrome_path', 'llm_key')
@@ -170,6 +176,9 @@ def main():
                     skipped.append(rel.parts[0])
                 continue
             if p.is_file():
+                if p.suffix.lower() in EXCLUDE_SUFFIX:
+                    skipped.append(str(rel))
+                    continue
                 z.write(p, str(pathlib.Path(NAME) / rel))
                 n += 1
     print('已打包 %d 个文件，耗时 %.1f 秒' % (n, time.time() - t0))
