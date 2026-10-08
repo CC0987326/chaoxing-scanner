@@ -76,7 +76,7 @@ EXAM_LIST = ('https://mooc1.chaoxing.com/exam-ans/mooc2/exam/exam-list'
 LOGIN_URL = 'https://passport2.chaoxing.com/login?fid=12'
 
 # 版本号：界面侧栏、启动日志、使用说明都引它，别再各处手写一份
-VERSION = 'v3.7'
+VERSION = 'v3.8'
 
 # 平台自身算「已完成」的状态；除此之外都视为未完成
 DONE_STATES = ('已完成', '已互评', '待批阅', '已提交', '待互评', '已结束', '已过期')
@@ -99,8 +99,12 @@ DEFAULT_CONFIG = {
     'open_report': True,    # 生成后自动打开报告
     'cpi': '',              # 学习通个人参数，留空 = 自动获取
     'user_agent': '',       # 留空 = 自动按内核版本生成
-    'llm_url': '',          # 大模型接口地址（OpenAI 兼容，如 https://api.xx.com/v1）
-    'llm_key': '',          # 大模型 API Key（只存在本机 config.json）
+    'llm_platform': '',     # 模型平台（deepseek / openai / qwen / … / custom）
+    'llm_url': '',          # 大模型接口地址（OpenAI 兼容，填 base 或完整地址都行）
+    # v3.8 起 API Key 默认加密存放在 runtime/llm_key.dpapi（Windows DPAPI，
+    # 按当前用户托管，文件拷到别的机器/用户下解不开），这里只在加密不可用时
+    # （非 Windows / DPAPI 故障）才留明文兜底。
+    'llm_key': '',
     'llm_model': '',        # 模型名（如 gpt-4o-mini / deepseek-chat）
     # 点选验证码默认留给用户手点：弹验证码本身就说明已被风控关注，
     # OCR 识别率有限，点错重试反而加重标记。确要自动识别才改 true。
@@ -242,6 +246,29 @@ def save_config(cfg: dict):
     except Exception:
         pass
     raise last
+
+
+def patch_config(patch: dict) -> bool:
+    """把指定字段「合并」进磁盘上的配置，而不是整体覆盖。
+
+    为什么不能直接 `save_config(cfg)`：cfg 常常是调用方自己拼的 dict
+    （脚本、测试、界面某段只管一个字段的流程），键不全。整体落盘就等于
+    把用户其余设置全部抹掉。2026-10-08 真实踩过：scan() 为了缓存 cpi
+    把自己的 cfg 存盘，把 config.json 冲成 5 个键，用户的模型信息和
+    刷课参数全丢。
+
+    改完返回是否真的落盘（值没变就不写，省一次磁盘抖动）。
+    """
+    try:
+        cur = load_config()
+    except Exception:
+        cur = dict(DEFAULT_CONFIG)
+    changed = {k: v for k, v in (patch or {}).items() if cur.get(k) != v}
+    if not changed:
+        return False
+    cur.update(changed)
+    save_config(cur)
+    return True
 
 
 # ================================================================ 浏览器内核
@@ -1795,7 +1822,9 @@ def scan(cfg, limit=0, headless=None, open_report=None, deep=True, only=None) ->
         if cpi:
             cfg['cpi'] = cpi
             try:
-                save_config(cfg)
+                # 只把 cpi 合并进磁盘配置。以前是 save_config(cfg) —— 而 cfg
+                # 是调用方传进来的，可能只有几个键，一落盘就把用户设置冲掉。
+                patch_config({'cpi': cpi})
             except Exception as e:
                 # 存 cpi 只是缓存优化，落盘失败不该中止整场扫描
                 log('cpi 写回配置失败（不影响本次查询）：%s' % str(e)[:60],
@@ -2581,17 +2610,341 @@ JS_DO_SAVE = r"""
 """
 
 
-def llm_chat(cfg, prompt, timeout=120):
-    """OpenAI 兼容 /chat/completions。返回回复文本；失败抛 RuntimeError。"""
+# ================================================================ 大模型接入（v3.8 重做）
+# 参考 ToolKnit 的做法：平台预设 + 地址规范化 + 错误分类 + 密钥加密存放。
+# 预设表只有后端这一份真相源，界面的下拉直接用它渲染，避免前后端两份漂移。
+LLM_PLATFORMS = [
+    {'key': 'deepseek', 'label': 'DeepSeek',
+     'url': 'https://api.deepseek.com/v1', 'model': 'deepseek-chat'},
+    {'key': 'openai', 'label': 'OpenAI',
+     'url': 'https://api.openai.com/v1', 'model': 'gpt-4o-mini'},
+    {'key': 'qwen', 'label': '通义千问 Qwen',
+     'url': 'https://dashscope.aliyuncs.com/compatible-mode/v1',
+     'model': 'qwen-plus'},
+    {'key': 'moonshot', 'label': 'Moonshot Kimi',
+     'url': 'https://api.moonshot.cn/v1', 'model': 'moonshot-v1-8k'},
+    {'key': 'glm', 'label': '智谱 GLM',
+     'url': 'https://open.bigmodel.cn/api/paas/v4', 'model': 'glm-4-flash'},
+    {'key': 'custom', 'label': '自定义（任何 OpenAI 兼容接口）',
+     'url': '', 'model': ''},
+]
+
+LLM_KEY_FILE = RUNTIME / 'llm_key.dpapi'
+# 自定文件头（照 ToolKnit 的 TKDpapi1 路子）：魔数 + 版本号，后面才是 DPAPI 块。
+# 带上头是为了「一眼认出这不是普通文本」，也留出以后换算法/换范围的余地。
+LLM_KEY_MAGIC = b'CXLLM1'
+_LLM_KEY_HEADER = len(LLM_KEY_MAGIC) + 4      # 魔数 + 4 字节小版本号
+_LLM_KEY_CACHE = ''
+_LLM_KEY_TRIED = False
+
+
+def llm_platform(key: str) -> dict:
+    for p in LLM_PLATFORMS:
+        if p['key'] == key:
+            return p
+    return LLM_PLATFORMS[0]
+
+
+def guess_llm_platform(url: str) -> str:
+    u = (url or '').strip()
+    for p in LLM_PLATFORMS:
+        if p['url'] and u.startswith(p['url']):
+            return p['key']
+    return 'custom' if u else 'deepseek'
+
+
+# ---------------------------------------------------------------- 密钥加密存放
+def _dpapi(data: bytes, protect: bool) -> bytes:
+    """Windows DPAPI 加/解密（当前用户范围，CRYPTPROTECT_UI_FORBIDDEN 不弹窗）。
+
+    非 Windows 或调用失败都会抛异常，由调用方兜底成明文——「加密不可用」
+    不该让工具没法答题。注意必须给函数设 argtypes/restype：64 位下不设
+    指针参数会被截断成 32 位（本项目在 DefWindowProcW 上踩过同一个坑）。
+    """
+    import ctypes
+    from ctypes import wintypes
+
+    class BLOB(ctypes.Structure):
+        _fields_ = [('cbData', wintypes.DWORD),
+                    ('pbData', ctypes.POINTER(ctypes.c_ubyte))]
+
+    if not data:
+        raise ValueError('空数据')
+    src_buf = (ctypes.c_ubyte * len(data)).from_buffer_copy(data)
+    src = BLOB(len(data), src_buf)
+    dst = BLOB()
+    crypt32 = ctypes.WinDLL('crypt32', use_last_error=True)
+    fn = crypt32.CryptProtectData if protect else crypt32.CryptUnprotectData
+    fn.restype = wintypes.BOOL
+    fn.argtypes = [ctypes.POINTER(BLOB), ctypes.c_void_p, ctypes.POINTER(BLOB),
+                   ctypes.c_void_p, ctypes.c_void_p, wintypes.DWORD,
+                   ctypes.POINTER(BLOB)]
+    if not fn(ctypes.byref(src), None, None, None, None, 0x1, ctypes.byref(dst)):
+        raise OSError(ctypes.get_last_error() or -1, 'DPAPI 调用失败')
+    try:
+        return bytes(ctypes.string_at(dst.pbData, dst.cbData))
+    finally:
+        ctypes.windll.kernel32.LocalFree(dst.pbData)
+
+
+def save_llm_key(key: str) -> bool:
+    """把 Key 加密存到 runtime/llm_key.dpapi；返回是否真的加密存了。
+
+    返回 False = 加密不可用，调用方继续把 Key 留在 config.json（明文），
+    并且**不要**去清掉明文，否则用户会两头落空。
+    """
+    global _LLM_KEY_CACHE
+    key = (key or '').strip()
+    if not key:
+        return True
+    if os.name != 'nt':
+        return False
+    try:
+        blob = _dpapi(key.encode('utf-8'), protect=True)
+    except Exception as e:
+        log('API Key 加密失败（将明文存放在 config.json）：%s' % str(e)[:80], 'warn')
+        return False
+    try:
+        RUNTIME.mkdir(parents=True, exist_ok=True)
+        tmp = LLM_KEY_FILE.with_name('llm_key.dpapi.tmp')
+        tmp.write_bytes(LLM_KEY_MAGIC + b'\x01\x00\x00\x00' + blob)
+        os.replace(tmp, LLM_KEY_FILE)     # 原子替换：写一半崩掉不会留坏文件
+    except Exception as e:
+        log('API Key 写入失败（将明文存放在 config.json）：%s' % str(e)[:80], 'warn')
+        return False
+    _LLM_KEY_CACHE = key
+    return True
+
+
+def load_llm_key() -> str:
+    """读加密的 Key。文件不存在 / 头不对 / 解不开都返回 ''（不抛异常）。"""
+    try:
+        raw = LLM_KEY_FILE.read_bytes()
+    except Exception:
+        return ''
+    if not raw.startswith(LLM_KEY_MAGIC) or len(raw) <= _LLM_KEY_HEADER:
+        return ''
+    try:
+        return _dpapi(raw[_LLM_KEY_HEADER:], protect=False).decode('utf-8')
+    except Exception as e:
+        # 换 Windows 用户或换电脑后 DPAPI 解不开——这是设计使然，不是 bug，
+        # 提示用户重填一次即可（旧文件留着不管，下次保存会覆盖）。
+        log('已保存的 API Key 解不开（换了 Windows 用户或换了电脑）：%s；'
+            '请在「模型」里重新填一次' % str(e)[:60], 'warn')
+        return ''
+
+
+def clear_llm_key():
+    """清除加密文件与内存缓存。"""
+    global _LLM_KEY_CACHE
+    _LLM_KEY_CACHE = ''
+    try:
+        LLM_KEY_FILE.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
+def llm_key_of(cfg: dict) -> str:
+    """取当前可用的 API Key。
+
+    加密文件是唯一真相源；config.json 里的明文只在**加密不可用**时兜底。
+    老版本（v3.7 及以前）留下的明文在这里一次性迁移进加密文件并从配置里撤掉
+    ——否则明文会一直躺着，加密就成了摆设。
+    """
+    global _LLM_KEY_CACHE, _LLM_KEY_TRIED
+    if _LLM_KEY_CACHE:
+        return _LLM_KEY_CACHE
+    if not _LLM_KEY_TRIED:
+        _LLM_KEY_TRIED = True
+        stored = load_llm_key()
+        legacy = (cfg.get('llm_key') or '').strip()
+        if legacy:
+            if save_llm_key(legacy):
+                _drop_plain_key(cfg)
+                log('已把 API Key 改为加密存放（config.json 里不再留明文）')
+                return legacy
+            return legacy                # 加密不可用：明文继续用着，不折腾用户
+        if stored:
+            _LLM_KEY_CACHE = stored
+            return stored
+    return (cfg.get('llm_key') or '').strip()
+
+
+def _drop_plain_key(cfg: dict):
+    """把 config.json 里的明文 Key 撤掉（只在加密确实落盘之后调用）。
+
+    用 patch_config 只动 llm_key 一个字段：cfg 可能只是调用方拼的半个
+    dict（界面「测试连接」那条路径就是），整体 save_config 会顺手把
+    用户其余设置抹掉。
+    """
+    try:
+        patch_config({'llm_key': ''})
+        cfg['llm_key'] = ''
+    except Exception as e:
+        log('明文 Key 清理失败（不影响使用）：%s' % str(e)[:60], 'warn')
+
+
+def mask_key(key: str) -> str:
+    """脱敏展示：只露前缀和后四位，够用户认出是哪把 Key。"""
+    k = (key or '').strip()
+    if not k:
+        return ''
+    if len(k) <= 12:
+        return k[:3] + '…'
+    return k[:6] + '…' + k[-4:]
+
+
+def llm_ready(cfg: dict) -> bool:
+    """三项齐了才算配置完成——Key 存在加密文件里也要算数。"""
+    return bool((cfg.get('llm_url') or '').strip()
+                and (cfg.get('llm_model') or '').strip()
+                and llm_key_of(cfg))
+
+
+# ---------------------------------------------------------------- 地址规范化
+LLM_LOOPBACK = ('127.0.0.1', 'localhost', '::1', '[::1]')
+
+
+def _is_private_host(host: str) -> bool:
+    """本机 / 内网地址。本地跑 Ollama、LM Studio、vLLM 这类只有 http。"""
+    h = (host or '').lower()
+    if h in LLM_LOOPBACK:
+        return True
+    if h.startswith('192.168.') or h.startswith('10.'):
+        return True
+    if h.startswith('172.'):
+        try:
+            return 16 <= int(h.split('.')[1]) <= 31
+        except (IndexError, ValueError):
+            return False
+    return False
+
+
+def normalize_llm_url(raw: str):
+    """把用户填的地址变成可直接 POST 的 /chat/completions 地址。
+
+    三种写法都接受（返回 (url, '')）：
+      https://api.deepseek.com        → https://api.deepseek.com/v1/chat/completions
+      https://api.deepseek.com/v1     → https://api.deepseek.com/v1/chat/completions
+      …/v1/chat/completions（完整）    → 原样使用
+    出错返回 ('', 中文原因)。
+
+    v3.7 及以前只按「结尾不是 /v1 就补 /v1/chat/completions」猜，用户从
+    文档里粘一个完整地址就会拼成 …/chat/completions/v1/chat/completions，
+    然后拿到一句 404——地址栏怎么会错，用户根本无从判断。
+    """
+    from urllib.parse import urlsplit
+    u = (raw or '').strip().rstrip('/')
+    if not u:
+        return '', '请先填接口地址'
+    parts = urlsplit(u)
+    if parts.scheme not in ('http', 'https'):
+        return '', '地址要以 http:// 或 https:// 开头'
+    if not parts.netloc:
+        return '', '地址不完整，缺少域名'
+    # 从浏览器地址栏直接粘过来的地址常带 #/?：拼进请求地址只会得到一个 404，
+    # 而且用户看着自己粘的「对」地址完全不知道错在哪。在这里就拦掉并说清楚。
+    if parts.fragment:
+        return '', '地址里不要带 # 后面的内容（那是网页锚点，不是接口地址）'
+    if parts.query:
+        return '', '地址里不要带 ? 后面的参数'
+    if parts.scheme == 'http' and not _is_private_host(parts.hostname or ''):
+        return '', 'http:// 只允许本机或内网地址；公网服务请用 https://'
+    path = parts.path.rstrip('/')
+    if path.endswith('/chat/completions'):
+        return u, ''
+    if path.endswith('/v1') or path.endswith('/v4'):
+        return u + '/chat/completions', ''
+    return u + '/v1/chat/completions', ''
+
+
+# ---------------------------------------------------------------- 错误分类
+# 把 HTTP/网络异常翻成「用户照着能改」的中文。要不要重试也在这里定：
+# 4xx 是我们这边填错了（地址/密钥/模型名），重试只是白等，还可能把同一把
+# Key 反复撞进平台的失败计数；只有网络、超时、429、5xx 值得重试。
+LLM_ERR = {
+    400: '请求被拒（多半是模型名不对，或该模型不支持这种调用）',
+    401: 'API Key 无效或已失效',
+    403: 'API Key 没有权限（额度、白名单或未开通该模型）',
+    404: '地址不对：确认填到 /v1 为止（也可以直接粘完整地址）；也可能是模型名不存在',
+    408: '对方服务端超时',
+    413: '请求内容过大',
+    422: '参数不被接受（检查模型名）',
+    429: '触发限流，或账户余额/额度不足',
+    500: '对方服务端故障',
+    502: '对方网关错误',
+    503: '对方服务暂时不可用（可能过载）',
+    504: '对方网关超时',
+}
+
+
+def _llm_retryable(status) -> bool:
+    """status=None 表示网络层异常（超时、连不上）。"""
+    return status is None or status == 429 or status >= 500
+
+
+def _llm_err_text(status: int, body: str) -> str:
+    base = LLM_ERR.get(status)
+    if base is None:
+        base = ('对方服务端错误（HTTP %d）' % status if status >= 500
+                else '请求失败（HTTP %d）' % status)
+    detail = ''
+    try:
+        d = json.loads(body or '{}')
+        src = d.get('error') if isinstance(d, dict) else None
+        if isinstance(src, str):
+            detail = src
+        elif isinstance(src, dict):
+            detail = str(src.get('message') or src.get('msg') or '')
+        if not detail and isinstance(d, dict):
+            detail = str(d.get('message') or '')
+    except Exception:
+        t = (body or '').strip()
+        detail = '返回的是网页而不是接口数据' if t.startswith('<') else t[:120]
+    detail = re.sub(r'\s+', ' ', detail).strip()[:160]
+    return (base + '：' + detail) if detail else base
+
+
+def _llm_net_err_text(e: Exception) -> str:
+    s = '%s' % e
+    low = s.lower()
+    if 'timed out' in low or 'timeout' in low:
+        return '连接超时（网络不通，或对方长时间不响应）'
+    if ('getaddrinfo' in low or 'name or service' in low
+            or 'nodename nor servname' in low):
+        return '域名解析不了（地址拼写有误，或本机 DNS/代理有问题）'
+    if 'ssl' in low or 'certificate' in low:
+        return 'HTTPS 握手失败（对方证书异常，或本机有代理在中间拦）'
+    if 'refused' in low:
+        return '连接被拒绝（地址或端口不对；本地模型确认服务已启动）'
+    return s[:160]
+
+
+LLM_MAX_BYTES = 2 * 1024 * 1024     # 响应体上限，防对方回超大内容把内存吃满
+
+
+def llm_chat(cfg, prompt, timeout=120, key=None):
+    """OpenAI 兼容 /chat/completions。返回回复文本；失败抛 RuntimeError。
+
+    v3.8：先规范化地址（base 或完整地址都行）、错误分类成中文、
+    4xx 不重试、响应体限长、输出被长度限制截断时给明确提示。
+
+    key 显式传入时直接用它——「测试连接」要能测**刚填进界面、还没保存**
+    的 Key；否则 llm_key_of 会优先吐内存里缓存的那把旧 Key，用户改了 Key
+    点测试却测的是旧的，测通了再保存反而失败（最坏的一种误导）。
+    """
     import urllib.request
     import urllib.error
-    base = (cfg.get('llm_url') or '').rstrip('/')
-    key = cfg.get('llm_key') or ''
-    model = cfg.get('llm_model') or ''
-    if not (base and key and model):
-        raise RuntimeError('大模型没有配置好：请在设置里填「接口地址 / API Key / 模型名」'
-                           '（接口地址一般以 /v1 结尾）')
-    url = base + '/chat/completions' if base.endswith('/v1') else base + '/v1/chat/completions'
+    url, err = normalize_llm_url(cfg.get('llm_url'))
+    if err:
+        raise RuntimeError('接口地址有问题：' + err)
+    key = (key if key is not None else llm_key_of(cfg)) or ''
+    key = key.strip()
+    if not key:
+        raise RuntimeError('没有可用的 API Key：请在「模型」里填一次并保存')
+    model = (cfg.get('llm_model') or '').strip()
+    if not model:
+        raise RuntimeError('还没填模型名（如 deepseek-chat）')
     body = json.dumps({
         'model': model,
         'messages': [{'role': 'user', 'content': prompt}],
@@ -2599,25 +2952,57 @@ def llm_chat(cfg, prompt, timeout=120):
     }).encode('utf-8')
     last = ''
     for attempt in (1, 2, 3):
+        status = 0
         try:
             req = urllib.request.Request(url, data=body, method='POST',
                                          headers={'Content-Type': 'application/json',
                                                   'Authorization': 'Bearer ' + key})
             with urllib.request.urlopen(req, timeout=timeout) as r:
-                data = json.loads(r.read().decode('utf-8'))
-            msg = ((data.get('choices') or [{}])[0].get('message') or {})
-            # 推理模型（如 deepseek-flash/reasoner）可能把最终答案放
+                raw = r.read(LLM_MAX_BYTES + 1)
+            if len(raw) > LLM_MAX_BYTES:
+                # 放这么大一块多半是地址指错了（回了个下载页/日志页）。
+                # 别重试：同样会把 2MB 再拉两遍。
+                last = '对方返回的内容超过 2MB，已放弃解析'
+                break
+            try:
+                data = json.loads(raw.decode('utf-8', 'replace'))
+            except Exception:
+                # HTTP 200 但不是 JSON：典型是网关/代理的拦截页，或地址指到了网页。
+                # 这属于「填错了」不是「网络抖了」，重试三次只是白等。
+                last = '对方返回的不是接口数据（HTTP 200 却是网页或纯文本）：'\
+                       '确认地址填的是接口地址，中间没有代理拦截页'
+                break
+            choice = (data.get('choices') or [{}])[0] or {}
+            msg = choice.get('message') or {}
+            # 推理模型（如 deepseek-reasoner）可能把最终答案放
             # reasoning_content、content 为空——两者都试。
             txt = (msg.get('content') or '').strip()
             if not txt:
                 txt = (msg.get('reasoning_content') or '').strip()
             if txt:
                 return txt
-            last = '响应里没有回复内容'
+            fin = str(choice.get('finish_reason') or '')
+            last = ('对方返回了空内容' + ('（输出被长度上限截断：换个模型，'
+                                        '或把题干拆短再试）' if fin == 'length' else ''))
+            break                      # 200 但没内容：重试几乎没用，别白花钱
+        except urllib.error.HTTPError as e:
+            status = e.code
+            try:
+                raw = e.read(LLM_MAX_BYTES + 1)
+            except Exception:
+                raw = b''
+            last = _llm_err_text(status, raw.decode('utf-8', 'replace'))
+            if not _llm_retryable(status):
+                break
+        except RuntimeError:
+            raise
         except Exception as e:
-            last = str(e)[:160]
-        time.sleep(2 * attempt)
-    raise RuntimeError('大模型调用失败（3 次）：%s' % last)
+            status = 0
+            last = _llm_net_err_text(e)
+        if attempt < 3:
+            time.sleep(2 * attempt)
+    raise RuntimeError('大模型调用失败：%s' % last)
+
 
 
 def _parse_llm_answers(txt, n, types=None):

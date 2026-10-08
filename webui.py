@@ -150,7 +150,7 @@ _SCREEN_LOCK = threading.Lock()   # 窗口类名固定，并发熄屏会互抢�
 
 
 def _screen_off():
-    """「💡 熄屏」：立刻强制关闭显示器。
+    """「熄屏」：立刻强制关闭显示器。
 
     Chrome 播视频时会自带 Video Wake Lock（阻止屏幕自动关闭，
     powercfg /requests 里 DISPLAY 栏的 chrome.exe 就是它），关不掉；
@@ -303,7 +303,7 @@ def _worker(action, opts):
                 # 下次查询还得重登，反而更容易反复撞验证码。
                 cs.restore_profile()
             with LOCK:
-                STATE['summary'] = {'登录': '成功 ✓' if ok else '未完成'}
+                STATE['summary'] = {'登录': '成功' if ok else '未完成'}
             return
 
         # 「获取课程列表」和「查询」都要先登录，共用同一套逻辑
@@ -355,7 +355,7 @@ def _worker(action, opts):
             # 有页面没加载成功时多给一张卡，明示「结果不可信」；没有就不出现这张卡
             nf = len(rep.get('page_failed') or [])
             if nf:
-                STATE['summary']['⚠ 页面未加载'] = nf
+                STATE['summary']['页面未加载'] = nf
         _set_result(rep)
     except cs.NotLoggedIn as e:
         cs.log('%s' % e, 'err')
@@ -483,9 +483,9 @@ def _answer_worker(opts):
         STATE['phase'] = 'answering'
     try:
         cfg = cs.load_config()
-        if not (cfg.get('llm_url') and cfg.get('llm_key') and cfg.get('llm_model')):
-            cs.log('还没有配置大模型：请在左侧「大模型答题设置」里填接口地址、'
-                   'API Key 和模型名，保存后再试。', 'err')
+        if not cs.llm_ready(cfg):
+            cs.log('还没有配置大模型：请在左侧「模型」里选平台、填 API Key 并保存；'
+                   '可以点「测试连接」先确认通。', 'err')
             with LOCK:
                 STATE['summary'] = {'提示': '先配置大模型接口'}
             return
@@ -555,9 +555,9 @@ def _answer_single_worker(opts):
         STATE['phase'] = 'answering'
     try:
         cfg = cs.load_config()
-        if not (cfg.get('llm_url') and cfg.get('llm_key') and cfg.get('llm_model')):
-            cs.log('还没有配置大模型：请在左侧「大模型答题设置」里填接口地址、'
-                   'API Key 和模型名，保存后再试。', 'err')
+        if not cs.llm_ready(cfg):
+            cs.log('还没有配置大模型：请在左侧「模型」里选平台、填 API Key 并保存；'
+                   '可以点「测试连接」先确认通。', 'err')
             with LOCK:
                 STATE['summary'] = {'提示': '先配置大模型接口'}
             return
@@ -696,9 +696,9 @@ def _combo_worker(opts):
         STATE['phase'] = 'brushing'
     try:
         cfg = cs.load_config()
-        if not (cfg.get('llm_url') and cfg.get('llm_key') and cfg.get('llm_model')):
+        if not cs.llm_ready(cfg):
             cs.log('还没有配置大模型：刷视频不受影响，但刷题需要先在左侧'
-                   '「大模型答题设置」里填好接口。', 'err')
+                   '「模型」里填好平台与 API Key。', 'err')
 
         def progress(msg, *a):
             cs.log(msg, a[0] if a else 'info')
@@ -781,307 +781,739 @@ PAGE = r"""<!DOCTYPE html>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>学习通巡检工具</title>
 <style>
-  *{box-sizing:border-box;}
+  /* ==================================================================
+     设计基线（Operate 模式 / 深色为主 / 高密度台账）
+     · 单一字族 + 固定 rem 尺度，不用流体字号
+     · 色彩有分工：青绿=主操作与当前选中，琥珀=需要注意，红=失败，绿=完成
+     · 侧栏是第二中性层，主画布是最暗的地面
+     · 浏览器原生表面（选中色/光标/滚动条/焦点环/数字）全部按盘色主题化
+     · 图标一律自绘 SVG，同一笔画粗细；不用任何 emoji / Unicode 字形
+     ================================================================== */
+  *,*::before,*::after{box-sizing:border-box;}
+
   :root{
-    --bg:#0e1416; --panel:#141c1f; --panel2:#111a1c; --line:#22343a;
-    --tx:#d9e3e4; --mut:#7f9397; --ac:#4fb3a8; --ac2:#8fd6cd;
-    --warn:#d8a657; --err:#e0776f; --ok:#6fbf8f;
+    /* 原生控件（勾选框、下拉弹层、数字步进器）也跟着走深色。
+       不声明的话 Chrome 会把它们画成亮白底，在深色页面上格外刺眼。 */
+    color-scheme:dark;
+
+    /* 地面与层次 */
+    --bg:#0d1214;
+    --rail:#111a1c;
+    --raise:#162124;
+    --sunk:#090e10;
+    --line:#1d2a2e;
+    --line-2:#283a3f;
+
+    /* 墨色（对比度：正文 14.9:1，次级 9.0:1，弱化 5.9:1） */
+    --tx:#dce7e8;
+    --tx-2:#a6b9bb;
+    --mut:#7e9599;
+
+    /* 状态色 */
+    --ac:#3fb6a8;
+    --ac-hi:#4cc7b8;
+    --ac-soft:rgba(63,182,168,.14);
+    --warn:#d9a75a;
+    --err:#e8837a;
+    --ok:#6fc08d;
+
+    /* 尺度 */
+    --fs-xs:.6875rem;
+    --fs-sm:.75rem;
+    --fs-base:.8125rem;
+    --fs-md:.875rem;
+    --fs-lg:1rem;
+    --fs-xl:1.25rem;
+
+    --ease:cubic-bezier(.22,1,.36,1);
+    --t:160ms;
+    --rail-w:306px;
   }
+
+  html{font-size:100%;}            /* 固定 rem 尺度：不随视口缩放 */
   html,body{height:100%;}
-  body{margin:0;background:var(--bg);color:var(--tx);
-       font:14px/1.6 "Microsoft YaHei","Segoe UI",system-ui,sans-serif;
-       display:flex;flex-direction:column;}
-  header{padding:16px 26px 13px;border-bottom:1px solid var(--line);
-         background:linear-gradient(180deg,#131d20,#0e1416);}
-  h1{margin:0;font-size:17px;font-weight:600;letter-spacing:.5px;}
-  h1 small{color:var(--mut);font-weight:400;font-size:12px;margin-left:10px;}
+  body{
+    margin:0;background:var(--bg);color:var(--tx);
+    font-family:"Microsoft YaHei UI","Microsoft YaHei","PingFang SC",
+                "Hiragino Sans GB","Segoe UI",system-ui,-apple-system,sans-serif;
+    font-size:var(--fs-md);line-height:1.55;
+    display:flex;flex-direction:column;
+    overflow:hidden;
+    -webkit-font-smoothing:antialiased;
+  }
+
+  /* ---------- 浏览器原生表面：最便宜、也最容易被忽略的「被建造」信号 ---------- */
+  ::selection{background:rgba(63,182,168,.30);color:#f2fbfa;}
+  input,select,textarea{caret-color:var(--ac);}
+  :focus{outline:none;}
+  :focus-visible{outline:2px solid var(--ac);outline-offset:2px;border-radius:2px;}
+  *{scrollbar-width:thin;scrollbar-color:#2a3d42 transparent;}
+  ::-webkit-scrollbar{width:11px;height:11px;}
+  ::-webkit-scrollbar-track{background:transparent;}
+  ::-webkit-scrollbar-thumb{
+    background:#25353a;border:3px solid transparent;background-clip:content-box;
+    border-radius:999px;}
+  ::-webkit-scrollbar-thumb:hover{background:#33494f;background-clip:content-box;}
+  ::-webkit-scrollbar-corner{background:transparent;}
+  a{text-underline-offset:2px;}
+
+  /* ================================ 顶栏 ================================ */
+  header{
+    flex:none;display:flex;align-items:center;gap:14px;
+    padding:0 20px;height:52px;
+    background:var(--rail);border-bottom:1px solid var(--line);
+  }
+  .brand{display:flex;align-items:baseline;gap:10px;min-width:0;}
+  .brand h1{margin:0;font-size:var(--fs-lg);font-weight:600;letter-spacing:.01em;}
+  .ver{
+    font-size:var(--fs-xs);color:var(--ac);font-weight:600;
+    padding:1px 6px;border:1px solid rgba(63,182,168,.35);
+    border-radius:3px;font-variant-numeric:tabular-nums;
+  }
+  .hspace{flex:1;}
+  .hstat{display:flex;align-items:center;gap:8px;min-width:0;}
+  .pill{
+    display:inline-flex;align-items:center;gap:7px;white-space:nowrap;
+    font-size:var(--fs-base);color:var(--tx-2);
+    background:var(--raise);border:1px solid var(--line);
+    padding:4px 11px;border-radius:999px;
+  }
+  .dot{
+    width:7px;height:7px;flex:none;border-radius:50%;
+    background:#4a5c60;transition:background var(--t) var(--ease);
+  }
+  .dot.on{
+    background:var(--ac);
+    box-shadow:0 0 0 3px var(--ac-soft);
+    animation:pulse 1.5s var(--ease) infinite;
+  }
+  @keyframes pulse{50%{opacity:.4;}}
+  /* 「本机会话是谁的」——换号时唯一能一眼看出「工具现在用哪个账号」的地方，
+     常驻顶栏，不折行不截断 */
+  .who{
+    display:inline-flex;align-items:center;gap:6px;
+    font-size:var(--fs-base);color:var(--mut);
+    padding-left:12px;margin-left:2px;border-left:1px solid var(--line);
+    white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+  }
+  .who .ic{color:var(--mut);}
+
+  /* ================================ 骨架 ================================ */
   .wrap{flex:1;display:flex;min-height:0;}
-  .side{width:316px;flex:0 0 316px;border-right:1px solid var(--line);
-        padding:16px;overflow:auto;background:var(--panel2);}
-  .main{flex:1;display:flex;flex-direction:column;min-width:0;}
-  .btn{display:block;width:100%;padding:11px 14px;margin-bottom:8px;
-       background:#1b2629;color:var(--tx);border:1px solid var(--line);
-       border-radius:7px;font-size:14px;cursor:pointer;text-align:left;
-       transition:.16s;font-family:inherit;}
-  .btn:hover:not(:disabled){background:#22323a;border-color:#2f4a52;}
-  .btn:disabled{opacity:.4;cursor:not-allowed;}
-  .btn.primary{background:linear-gradient(180deg,#1f5a55,#17443f);
-               border-color:#2b6f68;color:#e6f5f3;font-weight:600;}
-  .btn.primary:hover:not(:disabled){background:linear-gradient(180deg,#246964,#1a4f49);}
-  .btn i{font-style:normal;margin-right:8px;opacity:.85;}
-  .lbl{font-size:12px;color:var(--mut);margin:14px 0 6px;letter-spacing:.4px;}
-  input[type=text],input[type=password],input[type=number]{
-       width:100%;padding:9px 11px;background:#0d1517;color:var(--tx);
-       border:1px solid var(--line);border-radius:6px;font-size:13px;
-       font-family:inherit;outline:none;}
-  input:focus{border-color:#2f5a5f;background:#0b1315;}
-  select{padding:4px 6px;background:#0d1517;color:var(--tx);
-         border:1px solid var(--line);border-radius:6px;font-size:12.5px;
-         font-family:inherit;outline:none;cursor:pointer;}
-  select:focus{border-color:#2f5a5f;}
-  .pwdwrap{position:relative;}
-  .pwdwrap input{padding-right:38px;}
-  .eyebtn{position:absolute;right:5px;top:50%;transform:translateY(-50%);
-          width:28px;height:28px;border:none;background:transparent;
-          color:var(--mut);font-size:15px;cursor:pointer;border-radius:5px;
-          display:flex;align-items:center;justify-content:center;
-          filter:grayscale(1) opacity(.75);}
-  .eyebtn:hover{background:#152226;color:var(--tx);filter:none;}
-  .eyebtn.on{filter:none;}
-  .chk{display:flex;align-items:flex-start;gap:8px;font-size:12.5px;
-       color:#9fb0b3;margin:10px 0 4px;cursor:pointer;line-height:1.5;}
-  .chk input{margin-top:3px;accent-color:#4fb3a8;}
-  .status{display:flex;align-items:center;gap:8px;font-size:12.5px;
-          color:var(--mut);margin-bottom:14px;}
-  .dot{width:8px;height:8px;border-radius:50%;background:#4a5c60;flex:0 0 8px;}
-  .dot.on{background:var(--ac);box-shadow:0 0 0 3px rgba(79,179,168,.16);
-          animation:pulse 1.4s infinite;}
-  @keyframes pulse{50%{opacity:.45;}}
-  /* 「本机会话是谁的」——放在状态行下面。换号时这条是用户唯一能一眼
-     看出「工具现在在用哪个账号」的地方，所以常驻、不折行不截断 */
-  .who{font-size:12px;color:var(--mut);margin:-8px 0 12px;line-height:1.5;
-       word-break:break-all;}
-  .hr{border:0;border-top:1px solid var(--line);margin:16px 0 4px;}
-  .cards{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:6px;}
-  .card{background:#101a1c;border:1px solid var(--line);border-radius:7px;
-        padding:9px 11px;}
-  .card b{display:block;font-size:19px;font-weight:600;color:var(--ac2);}
-  .card span{font-size:11.5px;color:var(--mut);}
-  .tabs{display:flex;gap:2px;padding:0 20px;border-bottom:1px solid var(--line);
-        background:var(--panel);}
-  .tab{padding:11px 16px;font-size:13px;color:var(--mut);cursor:pointer;
-       border:0;background:none;border-bottom:2px solid transparent;
-       font-family:inherit;}
-  .tab.on{color:var(--ac2);border-bottom-color:var(--ac);}
+  .side{
+    width:var(--rail-w);flex:0 0 var(--rail-w);
+    background:var(--rail);border-right:1px solid var(--line);
+    overflow-y:auto;overflow-x:hidden;
+    padding:14px 14px 32px;
+  }
+  .main{flex:1;display:flex;flex-direction:column;min-width:0;background:var(--bg);}
+
+  /* ============================ 侧栏分组 ============================ */
+  .blk{margin:0 0 20px;}
+  .blk:last-child{margin-bottom:0;}
+  /* 组标题：上方留白大于下方（spacing：紧邻的下属贴住，组与组之间松开） */
+  .blk-t{
+    margin:0 0 9px;font-size:var(--fs-xs);font-weight:600;
+    color:var(--mut);letter-spacing:.04em;
+  }
+  .note{font-size:var(--fs-sm);color:var(--mut);line-height:1.65;margin:8px 0 0;}
+  .note b{color:var(--tx-2);font-weight:600;}
+  .note code{
+    font-family:"Cascadia Mono",Consolas,ui-monospace,monospace;
+    font-size:.95em;color:var(--tx-2);background:var(--sunk);
+    padding:1px 4px;border-radius:3px;
+  }
+
+  /* ================================ 控件 ================================ */
+  .ic{display:inline-flex;align-items:center;justify-content:center;
+      width:16px;height:16px;flex:none;}
+  .ic svg{width:100%;height:100%;display:block;}
+
+  .btn{
+    display:flex;align-items:center;width:100%;gap:9px;
+    padding:9px 12px;margin-bottom:7px;
+    background:var(--raise);color:var(--tx);
+    border:1px solid var(--line);border-radius:6px;
+    font:inherit;font-size:var(--fs-base);text-align:left;
+    cursor:pointer;white-space:nowrap;
+    transition:background var(--t) var(--ease),border-color var(--t) var(--ease),
+               color var(--t) var(--ease);
+  }
+  .btn .ic{color:var(--tx-2);transition:color var(--t) var(--ease);}
+  .btn:hover:not(:disabled){background:#1c2b2e;border-color:var(--line-2);}
+  .btn:hover:not(:disabled) .ic{color:var(--tx);}
+  .btn:active:not(:disabled){transform:translateY(.5px);}
+  .btn:disabled{opacity:.38;cursor:not-allowed;}
+  .btn.pri{
+    background:var(--ac);border-color:var(--ac);color:#08110f;font-weight:600;
+  }
+  .btn.pri .ic{color:#08110f;}
+  .btn.pri:hover:not(:disabled){background:var(--ac-hi);border-color:var(--ac-hi);}
+  .btn.dgr{color:var(--err);border-color:rgba(232,131,122,.34);}
+  .btn.dgr .ic{color:var(--err);}
+  .btn.dgr:hover:not(:disabled){background:rgba(232,131,122,.10);
+    border-color:rgba(232,131,122,.55);}
+  .btn.sm{padding:6px 10px;font-size:var(--fs-sm);gap:6px;}
+  .btn.sm .ic{width:14px;height:14px;}
+
+  /* 并排的按钮必须放弃 width:100%，否则三个一起被挤成竖排的窄条
+     （中文会在任意字符处折行，看起来就像按钮坏了） */
+  .row{display:flex;gap:7px;align-items:center;}
+  .row > *{margin-bottom:0;}
+  .row > .btn{width:auto;flex:0 0 auto;}
+  .row > .btn.grow{flex:1 1 auto;min-width:0;}
+  .grow{flex:1;min-width:0;}
+
+  input[type=text],input[type=password],input[type=number],select{
+    width:100%;padding:8px 10px;
+    background:var(--sunk);color:var(--tx);
+    border:1px solid var(--line);border-radius:6px;
+    font:inherit;font-size:var(--fs-base);
+    transition:border-color var(--t) var(--ease),background var(--t) var(--ease);
+  }
+  input::placeholder{color:var(--mut);}
+  input:hover,select:hover{border-color:var(--line-2);}
+  input:focus,select:focus{border-color:var(--ac);background:#0b1113;}
+  select{
+    cursor:pointer;appearance:none;-webkit-appearance:none;
+    padding-right:28px;
+    background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='%237e9599' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M4 6.5 8 10.5l4-4'/%3E%3C/svg%3E");
+    background-repeat:no-repeat;background-position:right 8px center;
+    background-size:14px 14px;
+  }
+  .field{margin-bottom:7px;position:relative;}
+  .field .ic-in{
+    position:absolute;right:6px;top:50%;transform:translateY(-50%);
+    width:26px;height:26px;display:flex;align-items:center;justify-content:center;
+    background:none;border:0;border-radius:5px;cursor:pointer;
+    color:var(--mut);transition:color var(--t) var(--ease),background var(--t) var(--ease);
+  }
+  .field .ic-in:hover{color:var(--tx);background:#16252a;}
+  .field .ic-in[aria-pressed=true]{color:var(--ac);}
+  .field.has-in input{padding-right:36px;}
+
+  .chk{
+    display:flex;align-items:flex-start;gap:8px;
+    font-size:var(--fs-base);color:var(--tx-2);
+    margin:9px 0 0;cursor:pointer;line-height:1.5;
+  }
+  .chk input{
+    flex:none;width:15px;height:15px;margin:2px 0 0;
+    accent-color:var(--ac);cursor:pointer;
+  }
+  .chk.inline{margin:0;white-space:nowrap;align-items:center;}
+  .chk.inline input{margin:0;}
+
+  /* ========================= 模型接入卡片 ========================= */
+  .modelcard{
+    background:var(--raise);border:1px solid var(--line);border-radius:8px;
+    padding:11px 11px 12px;
+  }
+  .modelcard .field:last-of-type{margin-bottom:9px;}
+  .mstat{
+    display:flex;align-items:center;gap:7px;
+    font-size:var(--fs-sm);line-height:1.5;
+    padding:6px 8px;margin:0 0 9px;border-radius:5px;
+    background:var(--sunk);border:1px solid var(--line);color:var(--mut);
+  }
+  .mstat.ok{color:var(--ok);border-color:rgba(111,192,141,.30);}
+  .mstat.warn{color:var(--warn);border-color:rgba(217,167,90,.30);}
+  .mstat.err{color:var(--err);border-color:rgba(232,131,122,.30);}
+  .mstat .ic{width:14px;height:14px;flex:none;}
+  .mstat span{min-width:0;overflow-wrap:anywhere;}
+
+  /* ============================== 课程选择 ============================== */
+  .pickhead{
+    display:flex;align-items:center;gap:6px;margin:9px 0 0;
+    font-size:var(--fs-sm);color:var(--mut);
+  }
+  .pickhead .sp{flex:1;}
+  .pick{
+    border:1px solid var(--line);border-radius:6px;background:var(--sunk);
+    max-height:212px;overflow:auto;margin-top:7px;
+  }
+  .pick label{
+    display:flex;gap:8px;align-items:flex-start;padding:6px 10px;
+    font-size:var(--fs-base);color:var(--tx-2);cursor:pointer;line-height:1.45;
+    border-bottom:1px solid #131c1f;
+    transition:background var(--t) var(--ease),color var(--t) var(--ease);
+  }
+  .pick label:last-child{border-bottom:0;}
+  .pick label:hover{background:#121b1e;color:var(--tx);}
+  .pick input{
+    flex:none;width:15px;height:15px;margin:2px 0 0;
+    accent-color:var(--ac);cursor:pointer;
+  }
+  .pick span{flex:1;word-break:break-word;}
+  /* 未勾选的课压暗，让「这次要查哪几门」一眼看得出来。
+     别压太狠：实测 opacity .4 + 灰字在深色底上几乎读不出字。 */
+  .pick label.dim{opacity:.62;}
+  .pick label.dim:hover{opacity:.9;}
+  .pick .sep{
+    padding:5px 10px;font-size:var(--fs-xs);color:var(--mut);
+    background:#0f1719;border-bottom:1px solid #131c1f;
+  }
+  .cok{font-size:var(--fs-sm);color:var(--mut);}
+  .cok.ok{color:var(--ok);}
+  .cok.warn{color:var(--warn);}
+
+  /* ============================== 主区 ============================== */
+  .tabs{
+    flex:none;display:flex;gap:2px;padding:0 18px;
+    border-bottom:1px solid var(--line);background:var(--rail);
+  }
+  .tab{
+    position:relative;padding:10px 15px;
+    font:inherit;font-size:var(--fs-md);color:var(--mut);
+    background:none;border:0;cursor:pointer;
+    transition:color var(--t) var(--ease);
+  }
+  .tab::after{
+    content:'';position:absolute;left:11px;right:11px;bottom:-1px;height:2px;
+    background:var(--ac);transform:scaleX(0);
+    transition:transform 220ms var(--ease);
+  }
+  .tab:hover{color:var(--tx-2);}
+  .tab.on{color:var(--tx);font-weight:600;}
+  .tab.on::after{transform:scaleX(1);}
+
+  .bar{
+    flex:none;display:flex;align-items:center;gap:9px;
+    padding:8px 18px;border-bottom:1px solid var(--line);background:var(--bg);
+  }
+  .bar .ttl{font-size:var(--fs-base);color:var(--mut);}
+  .bar .sp{flex:1;}
+
+  .mini{
+    display:inline-flex;align-items:center;gap:6px;
+    padding:5px 10px;font:inherit;font-size:var(--fs-sm);
+    background:var(--raise);color:var(--tx-2);
+    border:1px solid var(--line);border-radius:5px;cursor:pointer;
+    white-space:nowrap;
+    transition:background var(--t) var(--ease),border-color var(--t) var(--ease),
+               color var(--t) var(--ease);
+  }
+  .mini .ic{width:13px;height:13px;}
+  .mini:hover:not(:disabled){background:#1c2b2e;border-color:var(--line-2);color:var(--tx);}
+  .mini:disabled{opacity:.38;cursor:not-allowed;}
+  .mini.pri{background:var(--ac);border-color:var(--ac);color:#08110f;font-weight:600;}
+  .mini.pri .ic{color:#08110f;}
+  .mini.pri:hover:not(:disabled){background:var(--ac-hi);border-color:var(--ac-hi);}
+  .mini.attn{animation:attn 1s var(--ease) 2;}
+  @keyframes attn{50%{box-shadow:0 0 0 3px var(--ac-soft);}}
+
   .pane{flex:1;overflow:auto;min-height:0;}
-  #log{padding:14px 22px 40px;margin:0;
-       font:12.5px/1.75 "Cascadia Mono",Consolas,"Courier New",monospace;
-       white-space:pre-wrap;word-break:break-all;}
-  #log div{color:#b9c7c9;}
+  #log{
+    margin:0;padding:14px 20px 44px;
+    font-family:"Cascadia Mono",Consolas,ui-monospace,monospace;
+    font-size:var(--fs-sm);line-height:1.72;
+    font-variant-numeric:tabular-nums;
+    white-space:pre-wrap;word-break:break-all;color:var(--tx-2);
+  }
   #log div.warn{color:var(--warn);}
   #log div.err{color:var(--err);}
   #log div.ok{color:var(--ok);}
-  .bar{display:flex;align-items:center;gap:10px;padding:9px 20px;
-       border-bottom:1px solid var(--line);background:var(--panel);}
-  .bar .ttl{font-size:13px;color:var(--mut);}
-  .bar .sp{flex:1;}
-  .mini{padding:5px 11px;font-size:12px;background:#1b2629;color:var(--tx);
-        border:1px solid var(--line);border-radius:6px;cursor:pointer;
-        font-family:inherit;}
-  .mini:hover{background:#22323a;}
-  #res{padding:18px 22px 40px;}
-  #res h2{font-size:15px;margin:0 0 4px;font-weight:600;}
-  #res h2 .n{color:var(--ac2);}
-  #res .sec{margin-bottom:26px;}
-  #res table{width:100%;border-collapse:collapse;font-size:13px;margin-top:8px;}
-  #res th{text-align:left;font-weight:500;color:var(--mut);font-size:12px;
-          padding:7px 9px;border-bottom:1px solid var(--line);}
-  #res td{padding:8px 9px;border-bottom:1px solid #1a2528;vertical-align:top;}
-  #res tr:hover td{background:#121b1e;}
-  #res a{color:var(--ac2);text-decoration:none;white-space:nowrap;}
+
+  /* ====================== 结果区：巡检台账 ====================== */
+  /* 上下不留内边距：表头 sticky 时若顶部还空着 16px，滚动的内容会从
+     表头上方那道缝里钻出来。留白改由首个元素自己的 margin 提供。 */
+  #res{padding:0 20px 52px;}
+  #res > *:first-child{margin-top:16px;}
+  #res .sec{margin-bottom:30px;}
+  #res .sec > h2{
+    margin:0 0 10px;font-size:var(--fs-lg);font-weight:600;
+    letter-spacing:.01em;
+  }
+  /* 计数用方章而不是胶囊：台账的记号 */
+  #res .sec > h2 .n{
+    display:inline-block;vertical-align:1px;
+    font-size:var(--fs-base);font-weight:600;color:var(--ac);
+    font-variant-numeric:tabular-nums;
+    padding:1px 7px;border:1px solid rgba(63,182,168,.35);border-radius:2px;
+  }
+  #res .sec > h2 .n.warn{
+    color:var(--warn);border-color:rgba(217,167,90,.35);
+  }
+  #res .brushbar{
+    display:flex;align-items:center;gap:8px;flex-wrap:wrap;
+    margin:0 0 12px;padding:10px 12px;
+    background:var(--rail);border:1px solid var(--line);border-radius:8px;
+  }
+  #res .brushbar .note{flex:1 1 260px;min-width:200px;margin:0;}
+  /* 工具条里的下拉不该占满整行（它是这个小工具条的一个部件，不是表单主字段） */
+  #res .brushbar select{
+    width:auto;min-width:86px;padding:3px 24px 3px 8px;
+    background-size:12px 12px;background-position:right 6px center;
+  }
+
+  /* 台账本体：表头吸顶、行间只留发丝线、数字右对齐等宽。
+     必须用 border-collapse:separate —— collapse 下 Chrome 不给 th 做 sticky
+     （表格框会跟着内容一起滚走），这是踩过的坑，不要再改回 collapse。 */
+  #res table{
+    width:100%;border-collapse:separate;border-spacing:0;
+    font-size:var(--fs-base);line-height:1.45;
+  }
+  #res thead th{
+    position:sticky;top:0;z-index:2;
+    text-align:left;font-weight:600;font-size:var(--fs-sm);color:var(--mut);
+    padding:8px 10px;background:var(--rail);
+    border-bottom:1px solid var(--line-2);white-space:nowrap;
+  }
+  #res tbody td{
+    padding:7px 10px;border-bottom:1px solid var(--line);vertical-align:top;
+    overflow-wrap:anywhere;
+  }
+  #res tbody tr:hover td{background:var(--rail);}
+  #res tbody tr:last-child td{border-bottom-color:transparent;}
+  #res .num{font-variant-numeric:tabular-nums;white-space:nowrap;}
+  #res .col-act{width:1%;white-space:nowrap;}
+  /* 行内按钮压紧：它的高度撑着整行，高密度台账不该被按钮撑成 44px */
+  #res tbody .mini{padding:3px 8px;font-size:var(--fs-xs);gap:4px;}
+  #res a{color:var(--ac);text-decoration:none;}
   #res a:hover{text-decoration:underline;}
-  #res .bad{color:var(--err);font-weight:600;}
-  #res .sub{font-size:12px;color:var(--mut);}
-  #res .chap{margin:6px 0 0 2px;font-size:12.5px;}
-  #res .chap div{padding:3px 0;border-bottom:1px dashed #1c272a;color:#b9c7c9;}
-  #res .chap b{color:#e2c88a;font-weight:600;}
-  #res .empty{color:var(--mut);font-size:13px;padding:6px 0;}
-  /* 账号密码错误：结果区的红字提示（跟底部 toast 一起出现） */
-  #res .errbox{border:1px solid var(--err);border-radius:8px;padding:11px 13px;
-               background:rgba(224,119,111,.08);}
-  #res .errbox b{display:block;color:var(--err);font-size:13.5px;margin-bottom:4px;}
-  #res .errbox span{color:var(--mut);font-size:12.5px;line-height:1.7;}
-  /* 未完成任务点：一门课的章节明细能拉出十几行，所以按「每门课一个折叠」收起明细，
-     课程名与进度始终可见——要缩短的是长度，不是把整节藏起来。 */
-  #res details.cbox{border:1px solid var(--line);border-radius:8px;
-                    padding:10px 13px;margin-top:9px;background:#101a1c;}
-  #res details.cbox > summary{display:flex;align-items:center;gap:7px;cursor:pointer;
-                              user-select:none;list-style:none;}
+  #res .sub{font-size:var(--fs-sm);color:var(--mut);}
+  #res .empty{font-size:var(--fs-base);color:var(--mut);padding:7px 0;}
+
+  /* 状态记号：小方章 + 文字，颜色本身承载含义 */
+  #res .st{
+    display:inline-flex;align-items:center;gap:6px;
+    white-space:nowrap;font-weight:600;
+  }
+  #res .st::before{
+    content:'';flex:none;width:6px;height:6px;background:currentColor;
+  }
+  #res .st.err{color:var(--err);}
+  #res .st.warn{color:var(--warn);}
+  #res .st.ok{color:var(--ok);}
+  #res .st.mut{color:var(--mut);font-weight:400;}
+
+  /* 提示条（中止扫描 / 范围受限 / 页面未加载） */
+  #res .banner{
+    display:flex;gap:9px;align-items:flex-start;
+    font-size:var(--fs-base);line-height:1.6;
+    padding:9px 12px;margin:0 0 12px;border-radius:6px;
+    background:rgba(217,167,90,.07);border:1px solid rgba(217,167,90,.30);
+    color:var(--warn);
+  }
+  #res .banner.err{
+    background:rgba(232,131,122,.07);border-color:rgba(232,131,122,.32);
+    color:var(--err);
+  }
+  #res .banner .ic{width:15px;height:15px;margin-top:2px;flex:none;}
+  #res .banner span{min-width:0;}
+
+  #res .meta{
+    font-size:var(--fs-sm);color:var(--mut);
+    padding-bottom:12px;margin-bottom:16px;border-bottom:1px solid var(--line);
+  }
+
+  /* 账号密码错误的说明卡 */
+  #res .errbox{
+    border:1px solid rgba(232,131,122,.34);border-radius:8px;
+    padding:13px 15px;background:rgba(232,131,122,.06);
+  }
+  #res .errbox b{display:block;color:var(--err);font-size:var(--fs-md);margin-bottom:5px;}
+  #res .errbox span{color:var(--tx-2);font-size:var(--fs-base);line-height:1.7;}
+
+  /* 每门课一个折叠：课程名 + 完成度常驻，只收起章节明细 */
+  #res details.cbox{
+    border:1px solid var(--line);border-radius:7px;
+    margin-bottom:6px;background:var(--rail);
+    transition:border-color var(--t) var(--ease);
+  }
+  #res details.cbox:hover{border-color:var(--line-2);}
+  #res details.cbox[open]{border-color:var(--line-2);}
+  #res details.cbox > summary{
+    display:flex;align-items:center;gap:10px;
+    padding:9px 12px;cursor:pointer;user-select:none;list-style:none;
+    transition:background var(--t) var(--ease);
+  }
   #res details.cbox > summary::-webkit-details-marker{display:none;}
-  #res details.cbox > summary::before{content:'▸';color:var(--mut);font-size:11px;
-                                      transition:transform .15s;}
-  #res details.cbox[open] > summary::before{transform:rotate(90deg);}
-  #res details.cbox > summary .hd{flex:1;min-width:0;font-size:13.5px;}
-  #res details.cbox > summary:hover .hd b{color:var(--ac2);}
-  #res details.cbox .foldhint{flex:none;color:var(--mut);font-size:12px;}
-  #res details.cbox .foldhint .t-open{display:none;}
-  #res details.cbox[open] .foldhint .t-closed{display:none;}
-  #res details.cbox[open] .foldhint .t-open{display:inline;}
-  #res .tip{font-size:12px;color:var(--mut);line-height:1.75;}
-  /* 刷视频入口：节标题下的一条工具栏 + 每门课折叠条右侧的勾选 */
-  #res .brushbar{display:flex;align-items:center;gap:8px;margin:10px 0 2px;flex-wrap:wrap;}
-  #res .brushbar .sub{flex:1;min-width:180px;}
-  #res details.cbox summary .bkwrap{flex:none;display:flex;align-items:center;gap:5px;
-                                    font-size:12px;color:#9fb0b3;cursor:pointer;
-                                    padding:3px 8px;border:1px solid var(--line);
-                                    border-radius:6px;background:#0d1517;}
-  #res details.cbox summary .bkwrap:hover{border-color:var(--ac);color:var(--ac2);}
-  #res details.cbox summary .bkwrap input{accent-color:var(--ac);margin:0;cursor:pointer;}
-  /* 章节级勾选（课程折叠里每个章节行左侧的小勾） */
-  #res .ckw{display:inline-flex;align-items:center;margin-right:6px;cursor:pointer;
-            padding:1px 6px;border:1px solid var(--line);border-radius:5px;
-            background:#0d1517;vertical-align:middle;}
-  #res .ckw:hover{border-color:var(--ac);}
-  #res .ckw input{accent-color:var(--ac);margin:0;cursor:pointer;}
-  /* 课程勾选面板 */
-  .pickhead{display:flex;align-items:center;gap:6px;margin:7px 0 0;
-            font-size:11.5px;color:var(--mut);}
-  .pickhead .sp{flex:1;}
-  .pickrow{display:flex;align-items:center;gap:8px;margin-top:6px;}
-  .mini.primary{background:linear-gradient(180deg,#1f5a55,#17443f);
-                border-color:#2b6f68;color:#e6f5f3;font-weight:600;}
-  .mini.primary:hover{background:linear-gradient(180deg,#246964,#1a4f49);}
-  .mini.attn{animation:attn 1s ease-in-out 2;}
-  @keyframes attn{50%{box-shadow:0 0 0 3px rgba(79,179,168,.4);}}
-  #cok{font-size:12px;line-height:1.4;color:var(--mut);}
-  #cok.ok{color:var(--ok);}
-  #cok.warn{color:var(--warn);}
-  .pick{border:1px solid var(--line);border-radius:7px;background:#0d1517;
-        max-height:210px;overflow:auto;margin-top:6px;}
-  .pick label{display:flex;gap:8px;align-items:flex-start;padding:7px 10px;
-              font-size:12.5px;color:#b9c7c9;cursor:pointer;line-height:1.45;
-              border-bottom:1px solid #162124;}
-  .pick label:last-child{border-bottom:0;}
-  .pick label:hover{background:#121b1e;}
-  .pick input{appearance:none;-webkit-appearance:none;flex:0 0 16px;
-              width:16px;height:16px;margin:1px 0 0;border:1px solid #3a5257;
-              border-radius:4px;background:#0a1113;cursor:pointer;
-              position:relative;transition:background .14s,border-color .14s;}
-  .pick input:hover{border-color:var(--ac);}
-  .pick input:checked{background:var(--ac);border-color:var(--ac);}
-  .pick input:checked::after{content:'';position:absolute;left:4.5px;top:1px;
-              width:4px;height:9px;border:solid #0e1416;border-width:0 2px 2px 0;
-              transform:rotate(45deg);}
-  .pick input:focus-visible{outline:2px solid var(--ac2);outline-offset:1px;}
-  .pick span{flex:1;word-break:break-word;}
-  /* 未勾选的课程压暗，让「这次要查哪几门」一眼看得出来。
-     但别压太狠：实测 opacity .4 + #6b7b7e 在深色底上几乎读不出字，
-     用户反馈「看不清」。改成温和压暗，区分度靠勾选框本身也够了。 */
-  .pick label.dim{opacity:.7;}
-  .pick label.dim span{color:#96a6a9;}
-  .pick label.dim:hover{opacity:.92;}
-  /* 点「置顶已选的课」后把已勾选的排到最前，用分隔线标明下面是不查的 */
-  .pick .sep{padding:5px 10px;font-size:11px;color:#5e7074;letter-spacing:.4px;
-             background:#101a1c;border-bottom:1px solid #162124;}
-  /* 页面内提示条：比 alert 可靠，不会被浏览器「阻止更多对话框」静默吞掉 */
-  .toast{position:fixed;left:50%;bottom:26px;transform:translateX(-50%) translateY(14px);
-         background:#1d2b2f;border:1px solid var(--line);color:var(--tx);
-         padding:10px 18px;border-radius:8px;font-size:13px;max-width:72vw;
-         opacity:0;pointer-events:none;transition:opacity .2s,transform .2s;
-         z-index:99;box-shadow:0 6px 22px rgba(0,0,0,.45);}
-  .toast.show{opacity:1;transform:translateX(-50%) translateY(0);}
-  .toast.warn{border-color:var(--warn);color:var(--warn);}
-  .toast.err{border-color:var(--err);color:var(--err);}
-  .toast.ok{border-color:var(--ok);color:var(--ok);}
+  #res details.cbox > summary .chev{
+    width:14px;height:14px;flex:none;color:var(--mut);
+    transition:transform var(--t) var(--ease),color var(--t) var(--ease);
+  }
+  #res details.cbox[open] > summary .chev{transform:rotate(90deg);color:var(--ac);}
+  #res details.cbox > summary:hover{background:var(--raise);}
+  #res details.cbox > summary .hd{
+    flex:1;min-width:0;display:flex;align-items:center;gap:12px;
+    font-size:var(--fs-md);
+  }
+  #res details.cbox > summary .hd b{
+    flex:1;min-width:0;font-weight:600;overflow-wrap:anywhere;
+  }
+  #res details.cbox > summary:hover .hd b{color:var(--ac);}
+  #res details.cbox > summary .foldhint{
+    flex:none;color:var(--mut);font-size:var(--fs-sm);
+  }
+  #res details.cbox .t-open{display:none;}
+  #res details.cbox[open] .t-closed{display:none;}
+  #res details.cbox[open] .t-open{display:inline;}
+  /* 完成度刻度：按比例填充的量尺，方头、无阴影——它是度量不是装饰。
+     新一版台账出现时它自己长出来一次：整页只安排这一个动作，不逐块都演一遍。 */
+  .meter{
+    display:inline-block;width:84px;height:5px;flex:none;
+    background:#243338;overflow:hidden;
+  }
+  .meter > span{
+    display:block;height:100%;background:var(--ac);
+    transform-origin:left center;
+    animation:meter 520ms var(--ease) both;
+  }
+  @keyframes meter{from{transform:scaleX(0);}}
+
+  #res .chap{padding:2px 12px 10px 36px;}
+  #res .chap > div{
+    display:flex;align-items:center;gap:8px;
+    padding:5px 0;font-size:var(--fs-base);color:var(--tx-2);
+    border-bottom:1px solid #162124;
+  }
+  #res .chap > div:last-child{border-bottom:0;}
+  #res .chap .ckw{display:inline-flex;align-items:center;flex:none;}
+  #res .chap .ckw input{
+    width:14px;height:14px;margin:0;accent-color:var(--ac);cursor:pointer;
+  }
+  #res .chap .cnm{flex:1;min-width:0;overflow-wrap:anywhere;}
+  #res .chap .cnt{
+    flex:none;font-size:var(--fs-sm);color:var(--warn);font-weight:600;
+    font-variant-numeric:tabular-nums;
+  }
+  #res details.cbox summary .bkwrap{
+    flex:none;display:inline-flex;align-items:center;gap:6px;
+    font-size:var(--fs-sm);color:var(--tx-2);cursor:pointer;
+    padding:3px 9px;border:1px solid var(--line);border-radius:5px;
+    background:var(--sunk);white-space:nowrap;
+    transition:border-color var(--t) var(--ease),color var(--t) var(--ease);
+  }
+  #res details.cbox summary .bkwrap:hover{border-color:var(--ac);color:var(--ac);}
+  #res details.cbox summary .bkwrap input{
+    width:14px;height:14px;margin:0;accent-color:var(--ac);cursor:pointer;
+  }
+
+  /* 侧栏统计：紧凑的台账条，不是「大数字+小标签」的模板 */
+  .cards{
+    border:1px solid var(--line);border-radius:7px;overflow:hidden;
+    background:var(--sunk);
+  }
+  .card{
+    display:flex;align-items:baseline;gap:10px;
+    padding:7px 11px;border-bottom:1px solid var(--line);
+    font-size:var(--fs-base);
+  }
+  .card:last-child{border-bottom:0;}
+  .card span{flex:1;color:var(--mut);min-width:0;}
+  .card b{
+    font-weight:600;color:var(--tx);font-variant-numeric:tabular-nums;
+    white-space:nowrap;
+  }
+
+  /* 说明区：默认收起，需要时再展开（不占常驻视线） */
+  details.notes{margin-top:2px;}
+  details.notes > summary{
+    display:flex;align-items:center;gap:7px;cursor:pointer;list-style:none;
+    font-size:var(--fs-xs);font-weight:600;color:var(--mut);
+    padding:4px 0;
+  }
+  details.notes > summary::-webkit-details-marker{display:none;}
+  details.notes > summary:hover{color:var(--tx-2);}
+  details.notes > summary .chev{
+    width:13px;height:13px;flex:none;transition:transform var(--t) var(--ease);
+  }
+  details.notes[open] > summary .chev{transform:rotate(90deg);}
+  details.notes .note{margin-top:8px;}
+  details.notes a{color:var(--ac);text-decoration:none;overflow-wrap:anywhere;}
+  details.notes a:hover{text-decoration:underline;}
+
+  /* 页脚：联系方式与下载地址。常驻可见（不折进说明区），
+     但用小字号弱化，不抢操作区的注意力。 */
+  .foot{
+    margin-top:11px;padding-top:9px;border-top:1px solid var(--line);
+    font-size:var(--fs-xs);color:var(--mut);line-height:1.7;
+    overflow-wrap:anywhere;
+  }
+  .foot a{color:var(--ac);text-decoration:none;}
+  .foot a:hover{text-decoration:underline;}
+
+  /* ============================== 提示条 ============================== */
+  .toast{
+    position:fixed;left:50%;bottom:26px;z-index:99;
+    transform:translate(-50%,14px);
+    display:flex;align-items:flex-start;gap:9px;
+    background:#1b2729;border:1px solid var(--line-2);color:var(--tx);
+    padding:11px 16px;border-radius:8px;font-size:var(--fs-base);
+    max-width:min(72vw,560px);line-height:1.55;
+    box-shadow:0 8px 26px rgba(0,0,0,.5),0 1px 0 rgba(255,255,255,.03) inset;
+    opacity:0;pointer-events:none;
+    transition:opacity 200ms var(--ease),transform 220ms var(--ease);
+  }
+  .toast.show{opacity:1;transform:translate(-50%,0);}
+  .toast .ic{width:15px;height:15px;margin-top:2px;flex:none;}
+  .toast.warn{border-color:rgba(217,167,90,.5);color:var(--warn);}
+  .toast.err{border-color:rgba(232,131,122,.5);color:var(--err);}
+  .toast.ok{border-color:rgba(111,192,141,.5);color:var(--ok);}
+
+  @media (prefers-reduced-motion:reduce){
+    *,*::before,*::after{animation-duration:.01ms !important;
+                         animation-iteration-count:1 !important;
+                         transition-duration:.01ms !important;}
+  }
+  @media (max-width:1080px){
+    :root{--rail-w:272px;}
+  }
 </style>
 </head>
 <body>
 <header>
-  <h1>学习通巡检工具<small>__VERSION__ · 查询只读 · 刷课/答题需手动触发 · 数据只在本机</small></h1>
+  <div class="brand">
+    <h1>学习通巡检工具</h1>
+    <span class="ver">__VERSION__</span>
+  </div>
+  <span class="hspace"></span>
+  <div class="hstat">
+    <span class="pill"><i class="dot" id="dot"></i><span id="stxt">空闲</span></span>
+    <span class="who" id="who" style="display:none"><span class="ic"
+      data-i="user"></span><span id="whotxt"></span></span>
+  </div>
 </header>
+
 <div class="wrap">
   <div class="side">
-    <div class="status"><span class="dot" id="dot"></span><span id="stxt">空闲</span></div>
-    <div class="who" id="who" style="display:none"></div>
 
-    <div class="lbl">账号（手机号 / 超星号）</div>
-    <input type="text" id="phone" placeholder="例 198xxxxxxxx" autocomplete="username">
-    <div class="lbl">密码</div>
-    <div class="pwdwrap">
-      <input type="password" id="pwd" placeholder="学习通登录密码" autocomplete="current-password">
-      <button type="button" class="eyebtn" id="beye" title="显示 / 隐藏密码"
-              aria-label="显示或隐藏密码">👁</button>
-    </div>
-    <label class="chk"><input type="checkbox" id="remember"> 记住账号（只记手机号，不记密码）</label>
-    <div class="lbl">&nbsp;</div>
-    <button class="btn primary" id="bquery"><i>▶</i>一键查询未完成事项</button>
-    <label class="chk"><input type="checkbox" id="deep" checked> 下钻到章节，列出未完成任务点</label>
-
-    <hr class="hr">
-    <button class="btn" id="blogin"><i>◐</i>扫码 / 短信登录</button>
-
-    <hr class="hr">
-    <div class="lbl">只查最近 N 门课（留空 = 全部）</div>
-    <input type="number" id="recentTop" min="1" placeholder="例如 5">
-    <div class="tip" style="margin-top:6px">
-      若在下面勾选了具体课程（勾上即生效），则以勾选为准，这里填的数会被忽略。
-    </div>
-
-    <div class="lbl">要查哪些课？（勾上就生效；一门都不勾 = 全部）</div>
-    <button class="btn" id="blist"><i>☰</i>获取课程列表</button>
-    <div id="cwrap" style="display:none">
-      <div class="pickhead">
-        <span id="cnum">尚未选择</span>
-        <span class="sp"></span>
-        <button class="mini" id="call" title="勾选当前显示出来的课程">全选</button>
-        <button class="mini" id="cnone" title="取消当前显示出来的勾选">清空</button>
+    <section class="blk">
+      <h2 class="blk-t">账号</h2>
+      <div class="field"><input type="text" id="phone" placeholder="手机号 / 超星号"
+             autocomplete="username"></div>
+      <div class="field has-in">
+        <input type="password" id="pwd" placeholder="学习通密码"
+               autocomplete="current-password">
+        <button type="button" class="ic-in" id="beye" data-for="pwd"
+                aria-pressed="false" title="显示 / 隐藏密码"
+                aria-label="显示或隐藏密码"></button>
       </div>
-      <input type="text" id="cfilter" placeholder="筛选课程名…" style="margin-top:6px">
-      <div class="pickrow">
-        <button class="mini primary" id="cpin"
-                title="把已勾选的课程排到列表最上面，方便核对">置顶已选的课</button>
-        <span id="cok"></span>
+      <label class="chk"><input type="checkbox" id="remember">
+        记住账号（只记手机号，不记密码）</label>
+      <label class="chk"><input type="checkbox" id="deep" checked>
+        下钻到章节，列出未完成任务点</label>
+      <button class="btn pri" id="bquery"><span class="ic" data-i="search"></span>
+        一键查询未完成事项</button>
+      <button class="btn" id="blogin"><span class="ic" data-i="qr"></span>
+        扫码 / 短信登录</button>
+      <p class="note">首次使用填账号密码即可；密码登录被平台拦下时会提示改用扫码。</p>
+    </section>
+
+    <section class="blk">
+      <h2 class="blk-t">查询范围</h2>
+      <div class="field"><input type="number" id="recentTop" min="1"
+             placeholder="只查最近 N 门课（留空 = 全部）"></div>
+      <button class="btn" id="blist"><span class="ic" data-i="list"></span>
+        获取课程列表</button>
+      <div id="cwrap" style="display:none">
+        <div class="pickhead">
+          <span id="cnum">尚未选择</span>
+          <span class="sp"></span>
+          <button class="mini" id="call" title="勾选当前显示出来的课程">全选</button>
+          <button class="mini" id="cnone" title="取消当前显示出来的勾选">清空</button>
+        </div>
+        <div class="field" style="margin-top:7px">
+          <input type="text" id="cfilter" placeholder="筛选课程名…">
+        </div>
+        <div class="pickhead" style="margin-top:0">
+          <button class="mini pri" id="cpin"
+                  title="把已勾选的课程排到列表最上面，方便核对">置顶已选的课</button>
+          <span class="cok" id="cok"></span>
+        </div>
+        <div class="pick" id="clist"></div>
       </div>
-      <div class="pick" id="clist"></div>
-    </div>
-    <hr class="hr">
-    <div class="lbl">运行中控制（随时可用）</div>
-    <button class="btn" id="bpause" disabled><i>⏸</i>暂停</button>
-    <button class="btn" id="bstop" disabled style="border-color:#a33;color:#e88"><i>■</i>停止本次查询</button>
-    <div class="tip" style="margin-top:6px">
-      暂停和停止都在这门课抓完后生效（一般几秒内）。
-      停止不会丢结果：已扫完的课程照常出报告，只是标注为「中止扫描」。
-      <br>停止后会有几秒在生成报告（状态显示「收尾中」），之后即可再次查询。
-    </div>
+      <p class="note">勾选优先于上面填的数：勾了课就只查这几门，一门不勾 = 查全部。</p>
+    </section>
 
-    <div class="lbl">输出</div>
-    <button class="btn" id="bopen"><i>▤</i>打开最新报告</button>
-    <button class="btn" id="bdir"><i>▣</i>打开输出文件夹</button>
+    <section class="blk">
+      <h2 class="blk-t">运行中</h2>
+      <div class="row">
+        <button class="btn sm grow" id="bpause" disabled>
+          <span class="ic" data-i="pause"></span>暂停</button>
+        <button class="btn sm grow dgr" id="bstop" disabled>
+          <span class="ic" data-i="stop"></span>停止本次查询</button>
+      </div>
+      <p class="note">暂停 / 停止都在当前这门课抓完后生效（一般几秒内）。
+        停止不丢结果：已扫完的照常出报告，只是标注为「中止扫描」。</p>
+    </section>
 
-    <hr class="hr">
-    <div class="lbl">大模型答题设置</div>
-    <input class="inp" id="llm_url" placeholder="接口地址，如 https://api.xx.com/v1" style="margin-bottom:6px">
-    <input class="inp" id="llm_key" placeholder="API Key" style="margin-bottom:6px">
-    <input class="inp" id="llm_model" placeholder="模型名，如 deepseek-chat" style="margin-bottom:6px">
-    <button class="btn" id="bllm"><i>✓</i>保存大模型设置</button>
-    <button class="btn" id="bllmremember" style="margin-top:6px"><i>💾</i>记住模型信息（下次打开免填写）</button>
-    <button class="btn" id="bllmtest" style="margin-top:6px"><i>⚡</i>验证连通</button>
-    <div class="tip" style="margin-top:6px">
-      任何 OpenAI 兼容接口都能用（填到 /v1 为止）。Key 只保存在本机 config.json。
-      「做作业」用你自己的 Key 按量计费，一份选择题作业通常只花几分钱。
-      填完先「验证连通」，通过后「记住模型信息」，以后打开不用再填。
-    </div>
+    <section class="blk">
+      <h2 class="blk-t">模型</h2>
+      <div class="modelcard">
+        <div class="mstat" id="llmstate">
+          <span class="ic" data-i="plug"></span><span>读取中…</span>
+        </div>
+        <div class="field">
+          <select id="llm_platform"></select>
+        </div>
+        <div class="field">
+          <input type="text" id="llm_url" placeholder="接口地址（填到 /v1 即可）">
+        </div>
+        <div class="field">
+          <input type="text" id="llm_model" placeholder="模型名，如 deepseek-chat">
+        </div>
+        <div class="field has-in">
+          <input type="password" id="llm_key" placeholder="API Key">
+          <button type="button" class="ic-in" id="bkeyeye" data-for="llm_key"
+                  aria-pressed="false" title="显示 / 隐藏 API Key"
+                  aria-label="显示或隐藏 API Key"></button>
+        </div>
+        <div class="row" style="margin-bottom:8px">
+          <button class="btn sm pri grow" id="bllm">
+            <span class="ic" data-i="check"></span>保存</button>
+          <button class="btn sm grow" id="bllmtest">
+            <span class="ic" data-i="bolt"></span>测试连接</button>
+          <button class="btn sm dgr" id="bllmclear" title="清除本机保存的 API Key">
+            <span class="ic" data-i="trash"></span></button>
+        </div>
+        <p class="note">任何 OpenAI 兼容接口都能用。Key 加密保存在本机
+          （Windows 用户级加密，换电脑或换 Windows 用户后需重填），
+          不回显在页面上。做作业用你自己的 Key 按量计费，一份选择题通常几分钱。</p>
+      </div>
+    </section>
 
-    <hr class="hr">
-    <div class="lbl">退出</div>
-    <button class="btn" id="bquit" style="border-color:#a33;color:#e88"><i>⏻</i>退出程序（释放端口）</button>
+    <section class="blk">
+      <h2 class="blk-t">输出与退出</h2>
+      <button class="btn" id="bopen" disabled>
+        <span class="ic" data-i="file"></span>打开最新报告</button>
+      <button class="btn" id="bdir"><span class="ic" data-i="folder"></span>
+        打开输出文件夹</button>
+      <button class="btn dgr" id="bquit"><span class="ic" data-i="power"></span>
+        退出程序（释放端口）</button>
+    </section>
 
-    <div id="cards" class="cards" style="display:none"></div>
+    <section class="blk" id="cardsblk" style="display:none">
+      <h2 class="blk-t">本次统计</h2>
+      <div id="cards" class="cards"></div>
+    </section>
 
-    <div class="lbl">说明</div>
-    <div class="tip">
-      首次使用请填账号密码点「一键查询」；若密码登录被平台拦下，
-      会自动提示你改用「扫码 / 短信登录」。
-      登录一次后会话会保存在本机，之后无需重复登录。
-      <br><br>
-      <b>换账号：</b>直接填新账号的密码点「一键查询」就行。本机若存着
-      别的账号的会话，会自动改登你填的这个（旧会话归档到
-      <code>runtime/profile_old</code>，不会丢），绝不会拿旧账号继续跑。
-      左侧「本机会话」那条随时显示工具当前在用哪个账号。
-      <br><br>
-      <b>只想查几门课：</b>先点「获取课程列表」（约 10 秒，只读名单），
-      然后在下方勾选要查的课程，再点「一键查询」。
-      一门都不勾 = 照旧查全部。
-      <br><br>
-      <b>用完怎么退出：</b>点上面的「退出程序」，或者直接关掉那个黑色命令行窗口。
-      只关浏览器页面是不会退出的，后台程序还在跑、端口还占着。
-      <br><br>
-      如果有问题或者建议，可联系 QQ：3547502147<br>
+    <details class="notes">
+      <summary><span class="chev" data-i="chev"></span>使用说明与边界规则</summary>
+      <p class="note">
+        查询是只读的；刷课与答题必须你手动点按钮才会跑。所有数据只留在本机。
+        <br><br>
+        <b>换账号：</b>直接填新账号的密码点「一键查询」就行。本机若存着别的账号的
+        会话，会自动改登你填的这个（旧会话归档到 <code>runtime/profile_old</code>，
+        不会丢），绝不会拿旧账号继续跑。顶栏「本机会话」随时显示当前在用哪个账号。
+        <br><br>
+        <b>用完怎么退出：</b>点「退出程序」，或直接关掉那个黑色命令行窗口。
+        只关浏览器页面不会退出，后台程序还在跑、端口还占着。
+        <br><br>
+        <b>熄屏后唤不醒：</b>按 Win+Ctrl+Shift+B 重置显卡驱动即可恢复。
+      </p>
+    </details>
+
+    <!-- 联系方式与下载地址放在折叠区外面：v2.5 就定下的「侧栏底部能看到」
+         不该被这版重设计顺手藏起来。链接文字写完整网址（含 https://），
+         方便用户直接抄下来手打——只写域名会让人不确定前缀是什么。 -->
+    <p class="foot">
+      有问题或建议请联系 QQ：3547502147<br>
       最新版下载地址：<a href="https://github.com/CC0987326/chaoxing-scanner"
-        target="_blank" rel="noopener"
-        style="color:var(--ac2);text-decoration:none;overflow-wrap:anywhere;"
-        >https://github.com/CC0987326/chaoxing-scanner</a>
-    </div>
+         target="_blank" rel="noopener">https://github.com/CC0987326/chaoxing-scanner</a>
+    </p>
+
   </div>
 
   <div class="main">
@@ -1092,8 +1524,8 @@ PAGE = r"""<!DOCTYPE html>
     <div class="bar">
       <span class="ttl" id="bartip">尚未查询</span>
       <span class="sp"></span>
-      <button class="mini" id="boff">💡 熄屏</button>
-      <button class="mini" id="bclear">清空日志</button>
+      <button class="mini" id="boff"><span class="ic" data-i="monitor"></span>熄屏</button>
+      <button class="mini" id="bclear"><span class="ic" data-i="trash"></span>清空日志</button>
     </div>
     <div class="pane" id="res"><div class="empty">还没有结果。填好账号密码后点左侧「一键查询未完成事项」。</div></div>
     <div class="pane" id="logpane" style="display:none"><pre id="log"></pre></div>
@@ -1113,6 +1545,66 @@ let cardFp = '';        // 左侧统计卡片的指纹：内容没变就不重�
 const $ = id => document.getElementById(id);
 const logEl = $('log');
 
+// ---------------------------------------------------------------- 图标
+// 全部自绘 SVG，同一套笔画（1.6 / 圆头圆角 / 16 格）。不用 emoji 或 Unicode
+// 字形当图标：那些在不同系统上字形不一、粗细不齐，是「拼装」最明显的信号。
+// 尺寸由容器决定（width/height 100%），所以只有一处定义。
+const ICON_PATHS = {
+  search:'<circle cx="7" cy="7" r="4.2"/><path d="M10.2 10.2 13.6 13.6"/>',
+  qr:'<rect x="2.6" y="2.6" width="4.4" height="4.4" rx="1"/>'
+    +'<rect x="9" y="2.6" width="4.4" height="4.4" rx="1"/>'
+    +'<rect x="2.6" y="9" width="4.4" height="4.4" rx="1"/>'
+    +'<path d="M9.2 9.2h1.6M12.6 9.2h.6M9.2 11.6h.6M11.6 11.6v2M13.2 10.8v2.8"/>',
+  list:'<path d="M5.6 4h8M5.6 8h8M5.6 12h8"/><path d="M2.7 4h.01M2.7 8h.01M2.7 12h.01"/>',
+  play:'<path d="M5.6 3.7 12 8l-6.4 4.3z"/>',
+  pause:'<path d="M6.2 3.6v8.8M9.8 3.6v8.8"/>',
+  stop:'<rect x="4" y="4" width="8" height="8" rx="1.4"/>',
+  chev:'<path d="M6 3.6 10.4 8 6 12.4"/>',
+  check:'<path d="M3 8.5 6.2 11.7 13 4.9"/>',
+  bolt:'<path d="M8.9 1.9 3.7 9h3.2l-.7 5.1L11.4 7H8.2z"/>',
+  trash:'<path d="M2.9 4.5h10.2M6.4 4.5V3.1h3.2v1.4"/>'
+    +'<path d="M4.3 4.5l.6 8.4h6.2l.6-8.4"/>',
+  file:'<path d="M8.9 1.9H4.5a1 1 0 0 0-1 1v10.2a1 1 0 0 0 1 1h7a1 1 0 0 0 1-1V5.6z"/>'
+    +'<path d="M8.9 1.9v3.7h3.6"/><path d="M5.9 8.6h4.2M5.9 10.9h2.9"/>',
+  folder:'<path d="M1.9 4.3a1 1 0 0 1 1-1h2.8l1.3 1.6h6.1a1 1 0 0 1 1 1v6.2'
+    +'a1 1 0 0 1-1 1H2.9a1 1 0 0 1-1-1z"/>',
+  power:'<path d="M8 2.3v5.2"/><path d="M11.7 4.6a5.2 5.2 0 1 1-7.4 0"/>',
+  monitor:'<rect x="1.9" y="2.9" width="12.2" height="8.4" rx="1.1"/>'
+    +'<path d="M5.7 13.9h4.6"/><path d="M3.1 8.3 12.9 4.8"/>',
+  plug:'<path d="M6.1 1.9v2.9M9.9 1.9v2.9"/>'
+    +'<path d="M4.2 4.8h7.6v2.4a3.8 3.8 0 0 1-7.6 0z"/><path d="M8 11v3"/>',
+  eye:'<path d="M1.7 8S4.2 3.9 8 3.9 14.3 8 14.3 8 11.8 12.1 8 12.1 1.7 8 1.7 8z"/>'
+    +'<circle cx="8" cy="8" r="1.9"/>',
+  eyeoff:'<path d="M6.4 4.3A6.7 6.7 0 0 1 8 4.1c3.8 0 6.3 3.9 6.3 3.9a12 12 0 0 1-2.1 2.5"/>'
+    +'<path d="M4.2 5.7A12 12 0 0 0 1.7 8s2.5 3.9 6.3 3.9c1 0 1.9-.3 2.7-.7"/>'
+    +'<path d="M2.5 2.5 13.5 13.5"/>',
+  alert:'<path d="M8 2.7 14.1 12.9H1.9z"/><path d="M8 6.5v3M8 11.3h.01"/>',
+  info:'<circle cx="8" cy="8" r="6"/><path d="M8 7.4v3.4M8 5.5h.01"/>',
+  user:'<circle cx="8" cy="5.7" r="2.6"/><path d="M3 13.5a5.2 5.2 0 0 1 10 0"/>',
+  refresh:'<path d="M13.4 8A5.4 5.4 0 1 1 11.8 4.2"/><path d="M13.6 2.7v3.1h-3.1"/>',
+  external:'<path d="M9.5 6.5 13.6 2.4"/><path d="M10.7 2.4h2.9v2.9"/>'
+    +'<path d="M12.1 9.6v3.4a1 1 0 0 1-1 1H3.6a1 1 0 0 1-1-1V5.5a1 1 0 0 1 1-1h3.3"/>',
+};
+function icon(name){
+  return '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" '
+    + 'stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" '
+    + 'aria-hidden="true" style="width:100%;height:100%;display:block">'
+    + (ICON_PATHS[name] || '') + '</svg>';
+}
+// 静态 HTML 里只写 <span class="ic" data-i="名字"></span>，加载时统一填一次。
+// （:empty 保证不会重复填，也不会覆盖已有的动态内容）
+function paintIcons(root){
+  (root || document).querySelectorAll('[data-i]:empty').forEach(el => {
+    el.innerHTML = icon(el.dataset.i);
+  });
+}
+
+// 统计条连小标题一起收放：只藏内容会把空标题留在侧栏里。
+function setCardsShown(on){
+  const blk = $('cardsblk');
+  if (blk) blk.style.display = on ? '' : 'none';
+}
+
 // 只在文字真的变了才写 DOM：轮询每几百毫秒来一次，无脑赋值会白白触发重排
 function setText(el, v){
   const s = String(v == null ? '' : v);
@@ -1121,7 +1613,8 @@ function setText(el, v){
 
 function toast(msg, kind){
   const t = $('toast');
-  t.textContent = msg;
+  const ic = kind === 'ok' ? 'check' : (kind ? 'alert' : 'info');
+  t.innerHTML = '<span class="ic">' + icon(ic) + '</span><span>' + esc(msg) + '</span>';
   t.className = 'toast show' + (kind ? ' ' + kind : '');
   clearTimeout(t._h);
   t._h = setTimeout(() => { t.className = 'toast'; }, kind === 'err' ? 7000 : 4500);
@@ -1166,7 +1659,7 @@ function picked(){ return checkedKeys(); }        // 提交给后端的课程范
 function setCok(text, kind){
   const el = $('cok');
   el.textContent = text || '';
-  el.className = kind || '';
+  el.className = 'cok' + (kind ? ' ' + kind : '');
 }
 function removeSeps(){
   document.querySelectorAll('#clist .sep').forEach(s => s.remove());
@@ -1187,7 +1680,7 @@ function refreshSel(){
   // 勾了的保持原色，没勾的压暗；一门没勾时不压暗（全都暗等于没提示）
   all.forEach(b => b.parentElement.classList.toggle('dim', n > 0 && !b.checked));
 
-  setCok(n ? ('✓ 已选中 ' + n + ' 门课')
+  setCok(n ? ('已选中 ' + n + ' 门课')
            : ('未勾选任何课，将查询全部 ' + all.length + ' 门'),
          n ? 'ok' : '');
 }
@@ -1265,6 +1758,14 @@ function rateOpts(){
 // 索引比把对象塞进 onclick 更抗重绘（重绘时 lastHw 同步刷新为同一份数据）。
 let lastHw = [];
 
+// 提示条：中止扫描 / 范围受限 / 页面没加载成功。都是「这份报告你不能全信」
+// 的边界说明，所以放在台账最上面，用状态色而不是装饰色。
+function bannerBox(kind, html){
+  return '<div class="banner' + (kind === 'err' ? ' err' : '') + '">'
+    + '<span class="ic">' + icon(kind === 'err' ? 'alert' : 'info') + '</span>'
+    + '<span>' + html + '</span></div>';
+}
+
 function renderResult(r){
   if (!r) return;
   // 任务以异常收尾时结果里只有 error：把「查询中…」的占位换掉，
@@ -1276,121 +1777,129 @@ function renderResult(r){
     return;
   }
   const hw = r.undone_hw || [], ex = r.undone_exam || [], pg = r.undone_prog || [];
+
+  // 结果区被整个重绘（innerHTML 覆盖）时，交互状态会跟着一起丢：<details> 的
+  // 展开、倍速下拉、自动关机勾选都必须在重绘前读出、渲染时按原样补回，
+  // 否则用户点开看一眼、一秒后自己又合上了，勾上的选择也会自己弹开。
+  // 折叠用索引当 key：课程名会重复，不能当 key。
   const sda = document.getElementById('sdafter');
   if (sda) sdAfterOn = sda.checked;
   const bsl = document.getElementById('brate');
   if (bsl) brateVal = bsl.value;
-  // 结果区每 900ms 会被轮询整个重绘一次（innerHTML 覆盖），<details> 的展开状态会跟着
-  // 一起丢掉——用户点开看一眼，一秒后自己又合上了。重绘前先记下哪些课是展开的，重绘时
-  // 按原样补回去，展开与否就变成「用户的决定」而不是「上一次重绘的副作用」。
-  // 用索引当 key：课程名会重复，不能当 key。
   const openIdx = new Set();
   document.querySelectorAll('#res details.cbox').forEach(d => {
     if (d.open) openIdx.add(d.getAttribute('data-idx'));
   });
+
   let h = '';
   if (r.partial){
-    h += '<div class="sub" style="color:#d8a657;margin-bottom:10px">'
-       + '⚠️ 本次是中止扫描：只检查了 ' + (r.scanned||0) + '/' + (r.course_total||0)
-       + ' 门课程，未列出的课程是「没查」而不是「已完成」。</div>';
+    h += bannerBox('warn', '本次是中止扫描：只检查了 ' + (r.scanned||0) + '/'
+      + (r.course_total||0) + ' 门课程，未列出的课程是「没查」而不是「已完成」。');
   } else if (r.selected_only){
     const isRecent = r.scope_kind === 'recent';
-    h += '<div class="sub" style="color:#d8a657;margin-bottom:10px">'
-       + '⚠️ 本次只检查了' + (isRecent ? '最近学习的 ' : '你勾选的 ')
-       + (r.course_total||0) + ' 门课程'
-       + '（账号共 ' + (r.account_total||0) + ' 门）。'
-       + (isRecent ? '更早的课程没查' : '未勾选的课没查') + '，不在下表范围内。</div>';
+    h += bannerBox('warn', '本次只检查了' + (isRecent ? '最近学习的 ' : '你勾选的 ')
+      + (r.course_total||0) + ' 门课程（账号共 ' + (r.account_total||0) + ' 门）。'
+      + (isRecent ? '更早的课程没查' : '未勾选的课没查') + '，不在下表范围内。');
   }
   // 页面没加载成功的课必须显式警告——v2.5 的教训是把它们静默报成
   // 「无作业模块」，用户拿着假报告以为没作业。没失败时这块完全不出现。
   if (r.page_failed && r.page_failed.length){
-    h += '<div class="sub" style="color:#e06c60;margin-bottom:10px">'
-       + '⚠️ 有 ' + r.page_failed.length + ' 门课的页面没有加载成功（'
-       + esc(r.page_failed.map(function(x){ return x.course; }).join('、'))
-       + '），这些课的作业/考试是「没查到」而不是「没有」，建议稍后重新查询。</div>';
+    h += bannerBox('err', '有 ' + r.page_failed.length + ' 门课的页面没有加载成功（'
+      + esc(r.page_failed.map(function(x){ return x.course; }).join('、'))
+      + '），这些课的作业 / 考试是「没查到」而不是「没有」，建议稍后重新查询。');
   }
-  h += '<div class="sub" style="margin-bottom:16px">生成时间 ' + esc(r.time)
-     + '　·　' + (r.partial
-        ? ('已扫描 ' + (r.scanned||0) + ' / ' + (r.course_total||0) + ' 门课程')
-        : (r.selected_only
-           ? ((r.scope_kind === 'recent' ? '已查最近 ' : '已勾选 ')
-              + (r.course_total||0) + ' 门（账号共 ' + (r.account_total||0) + ' 门）')
-           : ('共扫描 ' + (r.course_total||0) + ' 门课程'))) + '</div>';
+  h += '<div class="meta">生成时间 ' + esc(r.time) + '　·　' + (r.partial
+       ? ('已扫描 ' + (r.scanned||0) + ' / ' + (r.course_total||0) + ' 门课程')
+       : (r.selected_only
+          ? ((r.scope_kind === 'recent' ? '已查最近 ' : '已勾选 ')
+             + (r.course_total||0) + ' 门（账号共 ' + (r.account_total||0) + ' 门）')
+          : ('共扫描 ' + (r.course_total||0) + ' 门课程'))) + '</div>';
 
-  h += '<div class="sec"><h2>一、未完成作业 <span class="n">' + hw.length + '</span> 项</h2>';
+  h += '<div class="sec"><h2>未完成作业 <span class="n">' + hw.length
+     + '</span> 项</h2>';
   lastHw = hw;
   if (hw.length){
-    h += '<table><tr><th>课程</th><th>作业名称</th><th>状态</th><th>剩余</th><th></th></tr>';
+    h += '<table><thead><tr><th>课程</th><th>作业名称</th><th>状态</th>'
+       + '<th>剩余</th><th class="col-act"></th></tr></thead><tbody>';
     for (let i = 0; i < hw.length; i++){
-      const it = hw[i];
+      const it = hw[i], u = safeUrl(it.url);
       h += '<tr><td>' + esc(it.course) + '</td><td>' + esc(it.title)
-         + '</td><td class="bad">' + esc(it.state) + '</td><td class="sub">'
-         + esc(it.left || '—') + '</td><td>'
-         + (safeUrl(it.url) ? '<a href="' + safeUrl(it.url) + '" target="_blank" rel="noopener">去完成 ↗</a>' : '')
-         + (safeUrl(it.url)
-            ? '<button class="mini" onclick="answerThis(event,' + i + ')"'
+         + '</td><td><span class="st err">' + esc(it.state) + '</span></td>'
+         + '<td class="num sub">' + esc(it.left || '—') + '</td>'
+         + '<td class="col-act">'
+         + (u ? '<a href="' + u + '" target="_blank" rel="noopener">去完成</a>' : '')
+         + (u ? ' <button class="mini" onclick="answerThis(event,' + i + ')"'
               + ' title="让大模型直接做这一份并交卷：与任务点的「做作业并交卷」同一套'
               + '判别——要上传附件的题整份跳过、题干读不出跳过，不会乱填">刷题</button>'
-            : '')
+              : '')
          + '</td></tr>';
     }
-    h += '</table>';
+    h += '</tbody></table>';
   } else { h += '<div class="empty">没有未完成的作业。</div>'; }
   h += '</div>';
 
-  h += '<div class="sec"><h2>二、未完成考试 <span class="n">' + ex.length + '</span> 项</h2>';
+  h += '<div class="sec"><h2>未完成考试 <span class="n">' + ex.length
+     + '</span> 项</h2>';
   if (ex.length){
-    h += '<table><tr><th>课程</th><th>考试名称</th><th>状态</th></tr>';
+    h += '<table><thead><tr><th>课程</th><th>考试名称</th><th>状态</th>'
+       + '</tr></thead><tbody>';
     for (const it of ex){
       h += '<tr><td>' + esc(it.course) + '</td><td>' + esc(it.title)
-         + '</td><td class="bad">' + esc(it.state) + '</td></tr>';
+         + '</td><td><span class="st err">' + esc(it.state) + '</span></td></tr>';
     }
-    h += '</table>';
+    h += '</tbody></table>';
   } else { h += '<div class="empty">没有待完成的考试。</div>'; }
   h += '</div>';
 
-  h += '<div class="sec"><h2>三、未完成任务点 <span class="n">' + pg.length + '</span> 门课</h2>';
+  h += '<div class="sec"><h2>未完成任务点 <span class="n">' + pg.length
+     + '</span> 门课</h2>';
   if (pg.length){
-    // 任务入口：勾哪门/哪节做哪节。课程勾选框 = 该课全部待完成章节，
+    // 任务入口：勾哪门 / 哪节做哪节。课程勾选框 = 该课全部待完成章节，
     // 章节勾选框 = 只做那一节；两种可以混勾，按钮决定做什么。
-    h += '<div class="brushbar"><button class="mini primary" id="bbrush"'
-       + ' onclick="startBrush(event)">▶ 刷选中的课的视频</button>'
-       + '<button class="mini" onclick="startCombo(event)">▶ 刷课+刷题</button>'
-       + '<button class="mini" style="background:#1a7f37;border-color:#1a7f37;color:#fff"'
-       + ' onclick="startAnswer(event)">▶ 做作业并交卷（正式提交）</button>'
+    h += '<div class="brushbar">'
+       + '<button class="mini pri" id="bbrush" onclick="startBrush(event)">'
+       + '<span class="ic">' + icon('play') + '</span>刷选中的课的视频</button>'
+       + '<button class="mini" onclick="startCombo(event)">'
+       + '<span class="ic">' + icon('play') + '</span>刷课+刷题</button>'
+       + '<button class="mini pri" onclick="startAnswer(event)">做作业并交卷（正式提交）</button>'
        + '<button class="mini" onclick="toggleAllBrush(event)">全选</button>'
-       + '<label class="chk" style="margin:0;white-space:nowrap;align-items:center" '
-       + 'title="播放倍速。只提供播放器官方档位：别的值平台会拨回去，来回打架反而频繁卡顿。'
-       + '实际播放会在这档和相邻档之间随机取挡，中途还会换一次挡">倍速 '
+       + '<label class="chk inline" title="播放倍速。只提供播放器官方档位：别的值平台会拨回去，'
+       + '来回打架反而频繁卡顿。实际播放会在这档和相邻档之间随机取挡，中途还会换一次挡">倍速 '
        + '<select id="brate" onchange="brateVal=this.value">' + rateOpts() + '</select></label>'
-       + '<button class="mini" onclick="screenOff(event)">💡 熄屏</button>'
-       + '<label class="chk" style="margin:0;white-space:nowrap">'
-       + '<input type="checkbox" id="sdafter"' + (sdAfterOn ? ' checked' : '')
-       + '> 刷完自动关机</label>'
-       + '<span class="sub">勾课程=全部章节；展开后可只勾某些章节。'
-       + '刷视频=倍速静音真实播放；做作业=大模型答题后直接交卷，'
-       + '同题干自动复用上次答案不重复花钱；附件/报告题会跳过并提示。'
-       + '勾了自动关机：只有正常刷完才关（手动停止 / 出错不关），'
-       + '关机前留 60 秒缓冲（cmd 运行 shutdown /a 可取消）。'
-       + '熄屏：播放中浏览器会阻止屏幕自动关闭（Video Wake Lock），'
-       + '点「熄屏」可立即强制关屏，任务照常在后台跑，动下鼠标就亮。</span></div>';
-    // 每门课一个折叠：课程名 + 进度始终露出，只把章节明细收起来（一门课能拉出十几行）。
+       + '<button class="mini" onclick="screenOff(event)">'
+       + '<span class="ic">' + icon('monitor') + '</span>熄屏</button>'
+       + '<label class="chk inline"><input type="checkbox" id="sdafter"'
+       + (sdAfterOn ? ' checked' : '') + '> 刷完自动关机</label>'
+       + '<span class="note">勾课程 = 全部章节；展开后可只勾某些章节。'
+       + '刷视频 = 倍速静音真实播放；做作业 = 大模型答题后直接交卷，'
+       + '同题干复用上次答案；附件 / 报告题会跳过并提示。'
+       + '自动关机只在正常刷完时触发，关机前留 60 秒缓冲'
+       + '（cmd 运行 shutdown /a 可取消）。熄屏后任务照常在后台跑，动下鼠标就亮。</span>'
+       + '</div>';
+    // 每门课一个折叠：课程名 + 完成度常驻可见，只把章节明细收起来
+    // （一门课能拉出十几行，要缩短的是长度，不是把整节藏起来）。
     for (let i = 0; i < pg.length; i++){
       const it = pg[i], chs = it.chapters || [], idx = String(i);
       const bkey = (it.cid && it.clsid) ? (it.cid + ':' + it.clsid) : '';
+      const rate = Math.max(0, Math.min(100, Number(it.rate) || 0));
       h += '<details class="cbox"' + (openIdx.has(idx) ? ' open' : '')
          + ' data-idx="' + idx + '"><summary>'
-         + '<span class="hd"><b>' + esc(it.course) + '</b>　'
-         + '<span class="sub">已完成 ' + it.done + '/' + it.total + '（'
-         + it.rate.toFixed(1) + '%）</span></span>'
+         + '<span class="chev">' + icon('chev') + '</span>'
+         + '<span class="hd"><b>' + esc(it.course) + '</b>'
+         + '<span class="meter"><span style="width:' + rate + '%"></span></span>'
+         + '<span class="sub">已完成 ' + it.done + '/' + it.total
+         + '（' + rate.toFixed(1) + '%）</span></span>'
          + '<span class="foldhint">'
          + '<span class="t-closed">'
          + (chs.length ? chs.length + ' 个章节待完成 · 点这里展开' : '点这里展开')
          + '</span><span class="t-open">点这里收起</span></span>'
-         // 没有 cid/clsid 的课（旧缓存结果）压根不渲染勾选框——没有定位参数就不能假装能刷
+         // 没有 cid/clsid 的课（旧缓存结果）压根不渲染勾选框——没有定位参数
+         // 就不能假装能刷
          + (bkey
-            ? '<label class="bkwrap" onclick="event.stopPropagation()" title="勾上后点上面的按钮：刷视频 / 做作业 / 刷课+刷题">'
-              + '<input type="checkbox" class="bk" value="' + esc(bkey) + '"> 选中</label>'
+            ? '<label class="bkwrap" onclick="event.stopPropagation()"'
+              + ' title="勾上后点上面的按钮：刷视频 / 做作业 / 刷课+刷题">'
+              + '<input type="checkbox" class="bk" value="' + esc(bkey)
+              + '"> 选中</label>'
             : '')
          + '</summary>';
       if (chs.length){
@@ -1399,13 +1908,16 @@ function renderResult(r){
           const ckb = (bkey && c.kid)
             ? '<label class="ckw" onclick="event.stopPropagation()"'
               + ' title="只勾这一节：上面的按钮就只处理这一节">'
-              + '<input type="checkbox" class="ck" value="' + esc(bkey + '|' + c.kid) + '"></label>'
+              + '<input type="checkbox" class="ck" value="'
+              + esc(bkey + '|' + c.kid) + '"></label>'
             : '';
-          h += '<div>' + ckb + esc(c.name) + '　<b>待完成 ' + (c.count||1) + '</b></div>';
+          h += '<div>' + ckb + '<span class="cnm">' + esc(c.name) + '</span>'
+             + '<span class="cnt">待完成 ' + (c.count||1) + '</span></div>';
         }
         h += '</div>';
       } else {
-        h += '<div class="sub" style="margin-top:6px">（未取到章节明细）</div>';
+        h += '<div class="sub" style="padding:2px 12px 10px 36px">'
+           + '（未取到章节明细）</div>';
       }
       h += '</details>';
     }
@@ -1447,7 +1959,7 @@ async function poll(){
       : (j.done ? '已完成' : '空闲'));
     // 本机会话是谁的。没有会话（或读不到身份）就不显示，绝不编一个出来。
     // setText 内部做了「值没变就不写 DOM」，每轮轮询不会造成无谓重排。
-    setText($('who'), j.login_who ? ('本机会话：' + j.login_who) : '');
+    setText($('whotxt'), j.login_who ? ('本机会话：' + j.login_who) : '');
     $('who').style.display = j.login_who ? '' : 'none';
     ['bquery','blogin','blist'].forEach(i => $(i).disabled = j.running);
     $('bquery').title = j.running
@@ -1461,16 +1973,22 @@ async function poll(){
     const wasPaused = $('bpause').dataset.paused === '1';
     $('bpause').dataset.paused = paused ? '1' : '0';
     // 按钮文字只在暂停状态真的翻转时才改，省掉每轮一次 innerHTML 重写
-    if (wasPaused !== paused) $('bpause').innerHTML = paused ? '<i>▶</i>继续' : '<i>⏸</i>暂停';
+    if (wasPaused !== paused) $('bpause').innerHTML = '<span class="ic">'
+      + icon(paused ? 'play' : 'pause') + '</span>' + (paused ? '继续' : '暂停');
     if (j.summary){
       const fp = JSON.stringify(j.summary);
       if (fp !== cardFp){
         cardFp = fp;
-        const c = $('cards'); c.style.display = 'grid'; c.innerHTML = '';
+        const c = $('cards'); c.innerHTML = '';
+        setCardsShown(true);
         for (const k in j.summary){
           const e = document.createElement('div');
           e.className = 'card';
-          e.innerHTML = '<b>' + esc(j.summary[k]) + '</b><span>' + esc(k) + '</span>';
+          const lb = document.createElement('span');
+          lb.textContent = k;
+          const vl = document.createElement('b');
+          vl.textContent = j.summary[k];
+          e.appendChild(lb); e.appendChild(vl);
           c.appendChild(e);
         }
       }
@@ -1562,7 +2080,7 @@ async function run(action){
     return;
   }
   since = 0; logEl.innerHTML = '';
-  $('cards').style.display = 'none';
+  setCardsShown(false);
   cardFp = '';   // 卡片已隐藏，指纹一并清掉，否则同样的统计出来时不会重新展开
   if (action === 'query') {
     const n = picked().length;
@@ -1605,7 +2123,7 @@ function answerThis(ev, i){
     if (r.status === 409){ toast('当前有任务在跑，等它结束再做', 'warn'); return; }
     if (!r.ok){ toast('刷题没能启动（HTTP ' + r.status + '）', 'err'); return; }
     since = 0; logEl.innerHTML = '';
-    $('cards').style.display = 'none'; cardFp = '';
+    setCardsShown(false); cardFp = '';
     $('res').innerHTML = '<div class="empty">正在后台刷这一份：' + esc(it.title)
       + '…（进度看「运行日志」，可以随时暂停 / 停止）</div>';
     $('bartip').textContent = '刷题中…';
@@ -1640,7 +2158,7 @@ function startBrush(ev){
     if (r.status === 409){ toast('当前有任务在跑，等它结束再刷', 'warn'); return; }
     if (!r.ok){ toast('刷视频没能启动（HTTP ' + r.status + '）', 'err'); return; }
     since = 0; logEl.innerHTML = '';
-    $('cards').style.display = 'none'; cardFp = '';
+    setCardsShown(false); cardFp = '';
     $('res').innerHTML = '<div class="empty">正在后台刷视频…（倍速静音真实播放，'
       + '进度看「运行日志」；可以随时暂停/停止）</div>';
     $('bartip').textContent = '刷视频中…';
@@ -1664,7 +2182,7 @@ function startCombo(ev){
     if (r.status === 409){ toast('当前有任务在跑，等它结束再做', 'warn'); return; }
     if (!r.ok){ toast('任务没能启动（HTTP ' + r.status + '）', 'err'); return; }
     since = 0; logEl.innerHTML = '';
-    $('cards').style.display = 'none'; cardFp = '';
+    setCardsShown(false); cardFp = '';
     $('res').innerHTML = '<div class="empty">正在后台「刷课+刷题」…（先刷视频，'
       + '再做作业并交卷；进度看「运行日志」，可以随时暂停/停止）</div>';
     $('bartip').textContent = '刷课+刷题中…';
@@ -1681,7 +2199,7 @@ function toggleAllBrush(ev){
   bks.forEach(b => b.checked = !allOn);
 }
 
-// 💡 熄屏：强制关显示器（Chrome 播视频的 Video Wake Lock 挡不住
+// 熄屏：强制关显示器（Chrome 播视频的 Video Wake Lock 挡不住
 // 显式的 SC_MONITORPOWER），任务照常在后台跑；动下鼠标屏幕就亮。
 // 万一黑屏唤不醒：按 Win+Ctrl+Shift+B 重置显卡驱动即可恢复。
 function screenOff(ev){
@@ -1706,7 +2224,7 @@ function startAnswer(ev){
     if (r.status === 409){ toast('当前有任务在跑，等它结束再做', 'warn'); return; }
     if (!r.ok){ toast('答题没能启动（HTTP ' + r.status + '）', 'err'); return; }
     since = 0; logEl.innerHTML = '';
-    $('cards').style.display = 'none'; cardFp = '';
+    setCardsShown(false); cardFp = '';
     $('res').innerHTML = '<div class="empty">正在后台做作业并交卷…（进度看'
       + '「运行日志」；可以随时暂停/停止）</div>';
     $('bartip').textContent = '答题并交卷中…';
@@ -1721,16 +2239,17 @@ function startAnswer(ev){
 // 「待平台确认」= 提交请求已发出但当场没核实到受理（平台批阅状态
 // 可能延迟几分钟到十几分钟才翻转，实测多次）——点「重新核实」
 // 逐份重开作业卡，渲染出「已批阅」页即翻案为已交卷。
+// 状态 → [文案, 记号类]。颜色交给盘色变量，不在这里写死色值。
 const AST = {
-  done:       ['✓ 已交卷', '#6fbf8f'],
-  already:    ['✓ 已交卷（此前已交）', '#6fbf8f'],
-  fail:       ['交卷失败', '#e0776f'],
-  unverified: ['⚠ 已发出 · 待平台确认', '#d8a657'],
-  still:      ['⚠ 仍未确认', '#d8a657'],
-  report:     ['需人工 · 要传附件', '#d8a657'],
-  unsupported:['需人工 · 题型不支持', '#d8a657'],
-  unsolved:   ['需人工 · 模型没把握', '#d8a657'],
-  skip:       ['已跳过', '#7f9397'],
+  done:       ['已交卷', 'ok'],
+  already:    ['已交卷（此前已交）', 'ok'],
+  fail:       ['交卷失败', 'err'],
+  unverified: ['已发出 · 待平台确认', 'warn'],
+  still:      ['仍未确认', 'warn'],
+  report:     ['需人工 · 要传附件', 'warn'],
+  unsupported:['需人工 · 题型不支持', 'warn'],
+  unsolved:   ['需人工 · 模型没把握', 'warn'],
+  skip:       ['已跳过', 'mut'],
 };
 
 function renderAnswerResult(a){
@@ -1738,29 +2257,35 @@ function renderAnswerResult(a){
   aitems = a.items;
   const uv = aitems.filter(it => it.status === 'unverified' || it.status === 'still');
   const need = aitems.filter(it => ['report','unsupported','unsolved'].includes(it.status));
-  let h = '<div class="sec"><h2>交卷结果 <span class="n">' + aitems.length + '</span> 份'
-       + (uv.length ? '　·　<span style="color:#d8a657">' + uv.length + ' 份待核实</span>' : '')
-       + (need.length ? '　·　<span style="color:#d8a657">' + need.length + ' 份需人工</span>' : '')
+  const tags = [[aitems.length, '', '份']];
+  if (uv.length) tags.push([uv.length, 'warn', '份待核实']);
+  if (need.length) tags.push([need.length, 'warn', '份需人工']);
+  let h = '<div class="sec"><h2>交卷结果'
+       + tags.map(t => ' <span class="n' + (t[1] ? ' ' + t[1] : '') + '">'
+                       + t[0] + '</span> ' + t[2]).join('')
        + '</h2>'
-       + '<div class="sub" style="margin-bottom:12px">生成时间 ' + esc(a.time)
+       + '<div class="meta">生成时间 ' + esc(a.time)
        + '　·　「待平台确认」= 提交已发出、平台还没翻转状态（可能延迟几分钟到十几分钟），'
        + '点「重新核实」自动翻案；也可以点开作业网址自己确认。</div>';
   if (uv.length){
-    h += '<div class="brushbar"><button class="mini" style="background:#8a6d1a;'
-       + 'border-color:#8a6d1a;color:#fff;font-weight:600"'
-       + ' onclick="verifyAnswer(event)">↻ 重新核实未确认的（' + uv.length + ' 份）</button>'
-       + '<span class="sub">逐份重开作业卡查「已批阅」，隔一分钟一轮，最多三轮，可随时停止。</span></div>';
+    h += '<div class="brushbar"><button class="mini pri"'
+       + ' onclick="verifyAnswer(event)"><span class="ic">' + icon('refresh')
+       + '</span>重新核实未确认的（' + uv.length + ' 份）</button>'
+       + '<span class="note">逐份重开作业卡查「已批阅」，隔一分钟一轮，'
+       + '最多三轮，可随时停止。</span></div>';
   }
-  h += '<table><tr><th>课程</th><th>作业（章节）</th><th>状态</th><th>操作</th></tr>';
+  h += '<table><thead><tr><th>课程</th><th>作业（章节）</th><th>状态</th>'
+     + '<th class="col-act">操作</th></tr></thead><tbody>';
   aitems.forEach((it) => {
-    const st = AST[it.status] || [it.status, '#7f9397'];
+    const st = AST[it.status] || [it.status, 'mut'];
     h += '<tr><td>' + esc(it.course) + '</td><td>' + esc(it.node)
-       + '</td><td style="color:' + st[1] + ';font-weight:600">' + esc(st[0])
-       + '</td><td style="white-space:nowrap">'
-       + (safeUrl(it.url) ? '<a href="' + safeUrl(it.url) + '" target="_blank" rel="noopener">打开作业 ↗</a>' : '')
+       + '</td><td><span class="st ' + st[1] + '">' + esc(st[0]) + '</span></td>'
+       + '<td class="col-act">'
+       + (safeUrl(it.url) ? '<a href="' + safeUrl(it.url)
+                            + '" target="_blank" rel="noopener">打开作业</a>' : '')
        + '</td></tr>';
   });
-  h += '</table></div>';
+  h += '</tbody></table></div>';
   $('res').innerHTML = h;
 }
 
@@ -1785,55 +2310,160 @@ async function verifyAnswer(ev){
   }
 }
 
-function llmForm(){ return {llm_url: $('llm_url').value.trim(),
-                             llm_key: $('llm_key').value.trim(),
-                             llm_model: $('llm_model').value.trim()}; }
-// 保存与「记住」走同一个端点：本机 config.json 本来就是持久保存，
-// 区别只在提示语义——「保存」= 本次生效；「记住」= 明确写进本机，
-// 下次打开页面自动回填（页面加载时的 /api/llm-config 回填一直都在）。
-// 后端保存后会回读校验，写盘失败会返回 5xx，toast 如实报错。
-function saveLlm(remember){
-  fetch('/api/llm-config', {method:'POST', headers:{'Content-Type':'application/json'},
-    body: JSON.stringify(llmForm())}).then(r => {
-    if (!r.ok){ toast('保存失败：写入本机配置没成功，请重试（HTTP ' + r.status + '）', 'err'); return; }
-    toast(remember ? '已记住：以后在这台电脑打开不用再填' : '大模型设置已保存', 'ok');
-  }).catch(() => toast('连不上本地程序', 'err'));
+// ---------- 模型接入 ----------
+// 平台预设表由后端 /api/llm-config 下发（LLM_PLATFORMS 是唯一真相源），
+// 这里不复制一份，免得前后端两份漂移。
+// 状态行的取值：ready / 未配全 / 正在测 / 测失败，四种都写明「下一步做什么」。
+let llmPlatforms = [], llmKeySet = false, llmStateMask = '';
+
+function llmForm(){
+  // llm_key 留空 = 不动已保存的那把（后端也是这样理解的）
+  return {llm_platform: $('llm_platform').value,
+          url: $('llm_url').value.trim(),
+          model: $('llm_model').value.trim(),
+          llm_key: $('llm_key').value.trim()};
 }
-$('bllm').onclick = () => saveLlm(false);
-$('bllmremember').onclick = () => {
-  if (!$('llm_url').value.trim() || !$('llm_key').value.trim()
-      || !$('llm_model').value.trim()){
-    toast('三样都填上再记住：接口地址 / API Key / 模型名', 'warn'); return;
+
+function llmSetState(kind, text){
+  const el = $('llmstate');
+  el.className = 'mstat' + (kind ? ' ' + kind : '');
+  el.innerHTML = '<span class="ic">' + icon(kind === 'err' ? 'alert'
+                : kind === 'ok' ? 'check' : kind === 'warn' ? 'alert' : 'plug')
+                + '</span><span>' + esc(text) + '</span>';
+}
+
+function llmPlatformOf(key){
+  return llmPlatforms.find(p => p.key === key) || llmPlatforms[0] || null;
+}
+
+function llmRefreshState(){
+  const url = $('llm_url').value.trim(), model = $('llm_model').value.trim();
+  const typed = $('llm_key').value.trim();
+  const hasKey = !!typed || llmKeySet;
+  if (url && model && hasKey){
+    const p = llmPlatformOf($('llm_platform').value);
+    llmSetState('ok', '已配置 · ' + (p ? p.label : '自定义') + ' · ' + model
+      + (typed ? '（Key 待保存）' : ''));
+  } else {
+    const miss = [];
+    if (!url) miss.push('接口地址');
+    if (!model) miss.push('模型名');
+    if (!hasKey) miss.push('API Key');
+    llmSetState('warn', '还没配全：还差' + miss.join('、')
+      + '。填好后点「保存」，可以先点「测试连接」确认通。');
   }
-  saveLlm(true);
+  $('llm_key').placeholder = llmKeySet
+    ? ('已保存 ' + (llmStateMask || '') + '　留空表示不改动')
+    : 'API Key（sk- 开头的那串）';
+}
+
+// 选平台 → 带出该平台的地址与常用模型名（自定义平台留给用户自己填）
+$('llm_platform').onchange = () => {
+  const p = llmPlatformOf($('llm_platform').value);
+  if (p && p.url){
+    $('llm_url').value = p.url;
+    $('llm_model').value = p.model || '';
+  }
+  llmRefreshState();
 };
-$('bllmtest').onclick = () => {
-  const b = $('bllmtest'), old = b.innerHTML;
-  b.disabled = true; b.innerHTML = '<i>⏳</i>验证中…（最长约 30 秒）';
-  fetch('/api/llm-test', {method:'POST', headers:{'Content-Type':'application/json'},
+$('llm_url').oninput = llmRefreshState;
+$('llm_model').oninput = llmRefreshState;
+$('llm_key').oninput = llmRefreshState;
+
+// 「保存」：合并了原来的「保存」与「记住模型信息」——本机 config.json 本来就是
+// 持久保存，两个按钮只差一句提示语，纯属让人多按一次。
+$('bllm').onclick = () => {
+  const b = $('bllm'), old = b.innerHTML;
+  b.disabled = true;
+  b.innerHTML = '<span class="ic">' + icon('check') + '</span>保存中…';
+  fetch('/api/llm-config', {method:'POST', headers:{'Content-Type':'application/json'},
     body: JSON.stringify(llmForm())}).then(async r => {
     const j = await r.json().catch(() => ({}));
-    if (r.ok) toast('连通正常（' + $('llm_model').value.trim() + '）', 'ok');
-    else toast('连通失败：' + (j.error || ('HTTP ' + r.status)), 'err');
-  }).catch(() => toast('连不上本地程序', 'err')).finally(() => {
+    if (!r.ok){
+      llmSetState('err', '保存失败：' + (j.error || ('HTTP ' + r.status)));
+      toast('保存失败：' + (j.error || ('HTTP ' + r.status)), 'err');
+      return;
+    }
+    llmKeySet = !!j.key_set;
+    llmStateMask = j.key_mask || '';
+    $('llm_key').value = '';                 // 存好了就把明文从输入框里撤掉
+    llmRefreshState();
+    llmSetState('ok', '已保存到本机：' + ($('llm_model').value.trim() || '')
+      + '　·　以后打开这台电脑不用再填');
+    toast('模型设置已保存', 'ok');
+  }).catch(() => {
+    llmSetState('err', '连不上本地程序，请确认那个黑色命令行窗口还在运行');
+    toast('连不上本地程序', 'err');
+  }).finally(() => {
     b.disabled = false; b.innerHTML = old;
   });
 };
-// 打开页面就把已有配置带出来（key 是本机文件里的，回显无妨）
+
+$('bllmtest').onclick = () => {
+  const b = $('bllmtest'), old = b.innerHTML;
+  b.disabled = true;
+  b.innerHTML = '<span class="ic">' + icon('bolt') + '</span>连接中…';
+  llmSetState('', '正在连接…（最长约 30 秒）');
+  fetch('/api/llm-test', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify(llmForm())}).then(async r => {
+    const j = await r.json().catch(() => ({}));
+    if (r.ok){
+      llmSetState('ok', '连接正常，模型回了：' + (j.reply || '（空）'));
+      toast('连接正常（' + ($('llm_model').value.trim() || '') + '）', 'ok');
+    } else {
+      // 后端的中文错误分类直接透出来：哪一步错了、怎么改，都在这句话里
+      llmSetState('err', j.error || ('连接失败（HTTP ' + r.status + '）'));
+      toast('连接失败：' + (j.error || ('HTTP ' + r.status)), 'err');
+    }
+  }).catch(() => {
+    llmSetState('err', '连不上本地程序，请确认那个黑色命令行窗口还在运行');
+    toast('连不上本地程序', 'err');
+  }).finally(() => {
+    b.disabled = false; b.innerHTML = old;
+  });
+};
+
+$('bllmclear').onclick = () => {
+  if (!llmKeySet && !$('llm_key').value.trim()){ toast('本来就没有保存过 Key', 'warn'); return; }
+  fetch('/api/llm-config', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({clear_key: true})}).then(async r => {
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok){ toast('清除失败（HTTP ' + r.status + '）', 'err'); return; }
+    llmKeySet = !!j.key_set;
+    llmStateMask = j.key_mask || '';
+    $('llm_key').value = '';
+    llmRefreshState();
+    toast('已清除本机保存的 API Key', 'ok');
+  }).catch(() => toast('连不上本地程序', 'err'));
+};
+
+// 打开页面就把已有配置带出来。**Key 不回显**：后端只给「有没有存」和脱敏串，
+// 页面上拿不到完整 Key（少一条泄露路径：截图求助、浏览器扩展抓 DOM 都拿不到）。
 fetch('/api/llm-config').then(r => r.json()).then(c => {
-  if ($('llm_url'))  $('llm_url').value  = c.llm_url  || '';
-  if ($('llm_key'))  $('llm_key').value  = c.llm_key  || '';
-  if ($('llm_model'))$('llm_model').value= c.llm_model|| '';
+  llmPlatforms = c.platforms || [];
+  const sel = $('llm_platform');
+  sel.innerHTML = llmPlatforms.map(p =>
+    '<option value="' + esc(p.key) + '"'
+    + (p.key === c.llm_platform ? ' selected' : '') + '>' + esc(p.label)
+    + '</option>').join('');
+  $('llm_url').value = c.llm_url || '';
+  $('llm_model').value = c.llm_model || '';
+  llmKeySet = !!c.key_set;
+  llmStateMask = c.key_mask || '';
+  llmRefreshState();
   if (c.brush_rate !== undefined && c.brush_rate !== null && c.brush_rate !== ''){
     brateVal = String(c.brush_rate);
-    // 结果区可能已经按默认值画出了一个下拉：不同步它，下一次 900ms 重绘
-    // 的「重绘前读值」会把旧选择读回去，回填就被冲掉了（测试抓到的竞态）。
+    // 结果区可能已经按默认值画出了一个下拉：不同步它，下一次重绘的
+    // 「重绘前读值」会把旧选择读回去，回填就被冲掉了（测试抓到的竞态）。
     const bs = document.getElementById('brate');
     if (bs) bs.value = brateVal;
   }
-}).catch(() => {});
+}).catch(() => llmSetState('err', '读不到本机配置（后台程序可能已经退出）'));
 
 document.querySelectorAll('.tab').forEach(b => b.onclick = () => switchTab(b.dataset.t));
+
+// 静态 HTML 里的图标占位（左侧按钮、状态记号等）统一在启动时填一次。
+paintIcons();
 
 $('bquery').onclick = () => {
   const ph = $('phone').value.trim(), pw = $('pwd').value;
@@ -1875,7 +2505,7 @@ $('cpin').onclick = pinPicked;
 $('recentTop').oninput = updateCount;
 $('recentTop').onkeydown = e => { if (e.key === 'Enter') $('bquery').click(); };
 $('bclear').onclick = () => { logEl.innerHTML = ''; };
-// 💡 熄屏：顶栏常驻，任务跑着随时能点（Chrome 的 Video Wake Lock 挡不住
+// 熄屏：常驻在任务工具条上，任务跑着随时能点（Chrome 的 Video Wake Lock 挡不住
 // 显式 SC_MONITORPOWER），动下鼠标屏幕就亮，再点一下即可。
 // 万一黑屏唤不醒：按 Win+Ctrl+Shift+B 重置显卡驱动即可恢复，不必强制关机。
 $('boff').onclick = () => {
@@ -1883,14 +2513,20 @@ $('boff').onclick = () => {
     .then(r => { if (!r.ok) toast('熄屏请求失败（HTTP ' + r.status + '）', 'err'); })
     .catch(() => toast('连不上本地程序', 'err'));
 };
-// 密码框小眼睛：点一下明文核对，再点一下隐藏（不改变输入内容）
-$('beye').onclick = () => {
-  const pwd = $('pwd'), show = pwd.type === 'password';
-  pwd.type = show ? 'text' : 'password';
-  $('beye').classList.toggle('on', show);
-  $('beye').textContent = show ? '🙈' : '👁';
-  pwd.focus();
-};
+// 密码 / API Key 的小眼睛：点一下明文核对，再点一下隐藏（不改变输入内容）。
+// 用 data-for 指定目标输入框，同一个处理函数给两个按钮用。
+document.querySelectorAll('.ic-in[data-for]').forEach(btn => {
+  btn.innerHTML = icon('eye');
+  btn.onclick = () => {
+    const inp = $(btn.dataset.for);
+    if (!inp) return;
+    const show = inp.type === 'password';
+    inp.type = show ? 'text' : 'password';
+    btn.setAttribute('aria-pressed', show ? 'true' : 'false');
+    btn.innerHTML = icon(show ? 'eyeoff' : 'eye');
+    inp.focus();
+  };
+});
 $('bopen').onclick  = () => fetch('/api/open-report', {method:'POST'});
 $('bdir').onclick   = () => fetch('/api/open-dir', {method:'POST'});
 $('bpause').onclick = () => {
@@ -2003,7 +2639,20 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, json.dumps(payload, ensure_ascii=False).encode('utf-8'))
         if u.path == '/api/llm-config':
             cfg = cs.load_config()
-            payload = {k: cfg.get(k, '') for k in ('llm_url', 'llm_key', 'llm_model')}
+            key = cs.llm_key_of(cfg)
+            payload = {
+                'llm_platform': (cfg.get('llm_platform')
+                                 or cs.guess_llm_platform(cfg.get('llm_url'))),
+                'llm_url': cfg.get('llm_url') or '',
+                'llm_model': cfg.get('llm_model') or '',
+                # 完整 Key 不回传给页面：页面只拿到「有没有存」+ 脱敏串。
+                # 少一条泄露路径（截图求助、浏览器扩展抓 DOM 都拿不到），
+                # 要换 Key 就填新的，留空表示不动。
+                'key_set': bool(key),
+                'key_mask': cs.mask_key(key),
+                'ready': cs.llm_ready(cfg),
+                'platforms': cs.LLM_PLATFORMS,
+            }
             # 顺手把刷课倍速也带给前端（页面加载时回填下拉框的上次选择）
             payload['brush_rate'] = cfg.get('brush_rate', 1.25)
             return self._send(200, json.dumps(payload, ensure_ascii=False).encode('utf-8'))
@@ -2041,7 +2690,7 @@ class Handler(BaseHTTPRequestHandler):
             _spawn(_worker, action, data)
             return self._send(200, b'{"ok":true}')
         if u.path == '/api/screen-off':
-            # 💡 熄屏：强制关显示器，不影响任务（Chrome 的 Video Wake Lock
+            # 熄屏：强制关显示器，不影响任务（Chrome 的 Video Wake Lock
             # 挡不住显式的 SC_MONITORPOWER 广播）。同步执行，毫秒级返回。
             threading.Thread(target=_screen_off, daemon=True).start()
             return self._send(200, b'{"ok":true}')
@@ -2150,45 +2799,93 @@ class Handler(BaseHTTPRequestHandler):
             except Exception:
                 data = {}
             cfg = cs.load_config()
-            for k in ('llm_url', 'llm_key', 'llm_model'):
-                if k in data:
-                    cfg[k] = str(data.get(k) or '').strip()
+            # 平台：预设平台只接受用户改过的那几项（地址默认用预设的）；
+            # 自定义平台则地址与模型都听用户的。
+            plat = str(data.get('llm_platform') or '').strip()
+            if plat:
+                cfg['llm_platform'] = plat
+            if 'url' in data:
+                cfg['llm_url'] = str(data.get('url') or '').strip()
+            if 'model' in data:
+                cfg['llm_model'] = str(data.get('model') or '').strip()
+            newkey = str(data.get('llm_key') or '').strip()
+            # 地址当场规范化校验：填 base 或完整地址都行，错在这里就退回，
+            # 别等答题跑到一半才发现地址拼错了（那时已经花掉时间和模型钱）
+            if cfg.get('llm_url'):
+                _norm, _err = cs.normalize_llm_url(cfg['llm_url'])
+                if _err:
+                    return self._send(400, json.dumps(
+                        {'error': '接口地址有问题：' + _err},
+                        ensure_ascii=False).encode('utf-8'))
+            if data.get('clear_key'):
+                cs.clear_llm_key()
+                cfg['llm_key'] = ''
+            elif newkey:
+                # 加密存成功 → 明文就不再落 config.json；加密不可用则留在原处兜底
+                if cs.save_llm_key(newkey):
+                    cfg['llm_key'] = ''
+                else:
+                    cfg['llm_key'] = newkey
             cs.save_config(cfg)
             # 写完必须回读确认。以前只写不查，「保存成功」的 toast 是
             # 假的：一旦写盘有竞态/权限问题，查询线程读不到 llm 键，
-            # 刷作业就会提示「先配置大模型」（用户实测踩过）
+            # 刷作业就会提示「先配置大模型」（用户实测踩过）。
+            # 只校验这次真提交过的那几项，避免「先填一半」时被误判失败。
             back = cs.load_config()
-            ok = all(back.get(k) for k in ('llm_url', 'llm_key', 'llm_model')
-                     if str(data.get(k) or '').strip())
-            if not ok:
+            checks = []
+            if str(data.get('url') or '').strip():
+                checks.append(bool(back.get('llm_url')))
+            if str(data.get('model') or '').strip():
+                checks.append(bool(back.get('llm_model')))
+            if newkey:
+                checks.append(cs.llm_key_of(back) == newkey)
+            if not all(checks):
                 cs.log('⚠ 模型信息写入后回读校验未通过，请重试保存。', 'err')
                 return self._send(500, b'{"error":"save-verify-failed"}')
-            cs.log('大模型设置已保存（模型：%s）' % (cfg.get('llm_model') or '未填'))
-            return self._send(200, b'{"ok":true}')
+            key_now = cs.llm_key_of(back)
+            cs.log('模型设置已保存：%s ｜ %s ｜ Key %s'
+                   % (cs.llm_platform(back.get('llm_platform') or 'deepseek')['label'],
+                      back.get('llm_model') or '未填',
+                      ('已保存 ' + cs.mask_key(key_now)) if key_now else '未填'))
+            return self._send(200, json.dumps(
+                {'ok': True, 'url': back.get('llm_url') or '',
+                 'key_set': bool(key_now), 'key_mask': cs.mask_key(key_now),
+                 'ready': cs.llm_ready(back)},
+                ensure_ascii=False).encode('utf-8'))
         if u.path == '/api/llm-test':
-            # 「验证连通」：拿界面当前填的模型信息真调一次 LLM（短问答）。
+            # 「测试连接」：拿界面**当前填的**模型信息真调一次 LLM（短问答）。
             # ThreadingHTTPServer 每请求一线程，这里同步等待不阻塞页面轮询。
             try:
                 data = json.loads(raw.decode('utf-8') or '{}')
             except Exception:
                 data = {}
             tcfg = dict(cs.load_config())
-            for k in ('llm_url', 'llm_key', 'llm_model'):
+            for k in ('llm_url', 'llm_model'):
                 v = str(data.get(k) or '').strip()
                 if v:
                     tcfg[k] = v
-            miss = [k for k in ('llm_url', 'llm_key', 'llm_model')
-                    if not tcfg.get(k)]
+            # Key 的取值顺序：界面刚填的 → 已保存的（加密文件里那把）。
+            # 这一路不写回 url/model，也不落盘：测试通过与否都不该改用户
+            # 已存的模型设置。唯一例外是 llm_key_of 发现 config 里还留着
+            # 老版本的明文 Key——那会顺手迁成加密存放（这是好事）。
+            typed = str(data.get('llm_key') or '').strip()
+            tkey = typed or cs.llm_key_of(tcfg)
+            miss = []
+            if not (tcfg.get('llm_url') or '').strip():
+                miss.append('接口地址')
+            if not tkey:
+                miss.append('API Key')
+            if not (tcfg.get('llm_model') or '').strip():
+                miss.append('模型名')
             if miss:
                 return self._send(400, json.dumps(
-                    {'error': '还没填完：%s' % '、'.join(
-                        {'llm_url': '接口地址', 'llm_key': 'API Key',
-                         'llm_model': '模型名'}[k] for k in miss)},
+                    {'error': '还没填完：%s' % '、'.join(miss)},
                     ensure_ascii=False).encode('utf-8'))
             try:
                 # timeout 给短值：连通测试只发「回复两个字」，12 秒足够，
                 # 也避免网络不通时用户对着按钮等太久（llm_chat 内部最多重试 3 次）
-                reply = cs.llm_chat(tcfg, '请只回复两个字：连通', timeout=12)
+                reply = cs.llm_chat(tcfg, '请只回复两个字：连通', timeout=12,
+                                    key=tkey)
                 cs.log('大模型连通验证通过（%s）：%s'
                        % (tcfg['llm_model'], (reply or '')[:40]))
                 return self._send(200, json.dumps(
