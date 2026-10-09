@@ -120,10 +120,10 @@ TASK_NAME = {
     'doctor': '环境自检',
     'selftest': '学习通兼容性检测',
     'brush': '自动刷视频（倍速静音）',
-    'answer': '做作业并交卷（大模型答题）',
+    'answer': '做作业（大模型答题）',
     'combo': '刷课 + 刷题（先刷视频再做作业交卷）',
     'verify': '重新核实未确认的作业',
-    'answer_one': '刷题（单份作业，答完交卷）',
+    'answer_one': '刷题（单份作业）',
 }
 
 
@@ -528,12 +528,14 @@ def _answer_worker(opts):
     答完直接走平台完整交卷链（正式提交，记录成绩）；每份作业的结果
     （已交卷/未确认/需人工…）放进「交卷结果」面板，未确认的可以在
     面板里「重新核实」（平台批阅状态可能延迟几分钟才翻转，实测多次）。
-    （原来的「暂存预演」已按需求移除：平台没有「只存答案不记完成」的
-    暂存，预演清单反而多一道手续——现在一步到位直接交卷。）
+    （v3.9.5 起另有 draft 暂存模式：答完只调平台「暂存保存」不交卷，
+    由用户人工审查后再提交——正式交卷仍是默认。）
     """
     only = [str(k) for k in (opts.get('only') or []) if k]
+    draft = bool(opts.get('draft'))
     cs.log('')
-    cs.log('▶ 任务开始：做作业并交卷（答完直接提交）')
+    cs.log('▶ 任务开始：做作业（%s）'
+           % ('答完暂存不交卷' if draft else '答完直接交卷'))
     PAUSE.clear()
     CANCEL.clear()
     with LOCK:
@@ -562,12 +564,13 @@ def _answer_worker(opts):
                 return 'pause'
             return 'run'
 
-        out = cs.answer_courses(cfg, only, submit=True,
+        out = cs.answer_courses(cfg, only, submit=not draft,
                                 progress=progress, control=control)
         with LOCK:
             STATE['summary'] = {'交卷': out.get('submitted', 0),
                                 '未确认': out.get('unverified', 0),
                                 '部分暂存': out.get('partial', 0),
+                                '已暂存': out.get('saved', 0),
                                 '需人工': out.get('report', 0)
                                           + out.get('skipped', 0),
                                 '失败': out.get('fail', 0)}
@@ -606,7 +609,10 @@ def _answer_single_worker(opts):
     同题干复用上次答案、含不支持题型跳过。
     """
     cs.log('')
-    cs.log('▶ 任务开始：刷题（单份作业，答完直接交卷）')
+    draft = bool(opts.get('draft'))
+    cs.log('▶ 任务开始：刷题（%s）'
+           % ('单份作业，答完暂存不交卷' if draft
+              else '单份作业，答完直接交卷'))
     PAUSE.clear()
     CANCEL.clear()
     with LOCK:
@@ -638,11 +644,13 @@ def _answer_single_worker(opts):
         out = cs.answer_urls(cfg, [{'url': opts.get('url'),
                                     'course': opts.get('course'),
                                     'title': opts.get('title')}],
-                             submit=True, progress=progress, control=control)
+                             submit=not draft, progress=progress,
+                             control=control)
         with LOCK:
             STATE['summary'] = {'交卷': out.get('submitted', 0),
                                 '未确认': out.get('unverified', 0),
                                 '部分暂存': out.get('partial', 0),
+                                '已暂存': out.get('saved', 0),
                                 '需人工': out.get('report', 0),
                                 '此前已交': out.get('already', 0),
                                 '这份没做': out.get('fail', 0)}
@@ -1172,6 +1180,19 @@ PAGE = r"""<!DOCTYPE html>
   .mini:disabled{opacity:.38;cursor:not-allowed;}
   .mini.pri{background:var(--ac);border-color:var(--ac);color:#08110f;font-weight:600;}
   .mini.pri .ic{color:#08110f;}
+  .bmenu{
+    position:fixed;z-index:90;min-width:250px;padding:4px;
+    background:var(--raise);border:1px solid var(--line-2);border-radius:8px;
+    box-shadow:0 12px 30px rgba(0,0,0,.5);
+  }
+  .bmenu-it{
+    display:block;width:100%;text-align:left;border:0;background:none;
+    color:var(--tx);padding:8px 10px;border-radius:6px;cursor:pointer;
+    font:inherit;font-size:var(--fs-sm);
+  }
+  .bmenu-it:hover{background:#1c2b2e;}
+  .bmenu-it .t{display:block;font-size:var(--fs-base);}
+  .bmenu-it .s{display:block;color:var(--mut);margin-top:2px;line-height:1.5;}
   .mini.pri:hover:not(:disabled){background:var(--ac-hi);border-color:var(--ac-hi);}
   .mini.attn{animation:attn 1s var(--ease) 2;}
   @keyframes attn{50%{box-shadow:0 0 0 3px var(--ac-soft);}}
@@ -1978,9 +1999,10 @@ function renderResult(r){
          + '<td class="num sub">' + esc(it.left || '—') + '</td>'
          + '<td class="col-act">'
          + (u ? '<a href="' + u + '" class="go-work" target="_blank" rel="noopener">去完成</a>' : '')
-         + (u ? ' <button class="mini" onclick="answerThis(event,' + i + ')"'
-              + ' title="让大模型直接做这一份并交卷：与任务点的「做作业并交卷」同一套'
-              + '判别——要上传附件的题整份跳过、题干读不出跳过，不会乱填">刷题</button>'
+         + (u ? ' <button class="mini" onclick="brushMenu(event,\'row\',' + i + ')"'
+              + ' title="让大模型做这一份：点开选「暂存」（存平台草稿，人工审查后自己交）'
+              + '或「提交」（直接正式交卷）。要上传附件的题整份跳过，不会乱填">'
+              + '<span class="ic">' + icon('chev') + '</span>刷题</button>'
               : '')
          + '</td></tr>';
     }
@@ -2011,7 +2033,8 @@ function renderResult(r){
        + '<span class="ic">' + icon('play') + '</span>刷选中的课的视频</button>'
        + '<button class="mini" onclick="startCombo(event)">'
        + '<span class="ic">' + icon('play') + '</span>刷课+刷题</button>'
-       + '<button class="mini pri" onclick="startAnswer(event)">做作业并交卷（正式提交）</button>'
+       + '<button class="mini pri" onclick="brushMenu(event,\'tasks\')">'
+       + '<span class="ic">' + icon('chev') + '</span>做作业</button>'
        + '<button class="mini" onclick="toggleAllBrush(event)">全选</button>'
        + '<label class="chk inline" title="播放倍速。只提供播放器官方档位：别的值平台会拨回去，'
        + '来回打架反而频繁卡顿。实际播放会在这档和相邻档之间随机取挡，中途还会换一次挡">倍速 '
@@ -2021,8 +2044,9 @@ function renderResult(r){
        + '<label class="chk inline"><input type="checkbox" id="sdafter"'
        + (sdAfterOn ? ' checked' : '') + '> 刷完自动关机</label>'
        + '<span class="note">勾课程 = 全部章节；展开后可只勾某些章节。'
-       + '刷视频 = 倍速静音真实播放；做作业 = 大模型答题后直接交卷，'
-       + '同题干复用上次答案；附件 / 报告题会跳过并提示。'
+       + '刷视频 = 倍速静音真实播放；做作业 = 点开选「暂存」（存平台'
+       + '草稿不交卷）或「提交」（正式交卷）；同题干复用上次答案，'
+       + '附件 / 报告题会跳过并提示。'
        + '自动关机只在正常刷完时触发，关机前留 60 秒缓冲'
        + '（cmd 运行 shutdown /a 可取消）。熄屏后任务照常在后台跑，动下鼠标就亮。</span>'
        + '</div>';
@@ -2304,20 +2328,22 @@ function switchTab(t){
 // 只做点中的那一份。判别 / 答题 / 交卷与任务点的「做作业并交卷」共用同一条
 // 链（answer_urls → answer_one），所以行为一致：附件题整份跳过、题干读不出
 // 跳过、多空填空按空序切分、同题干复用上次答案。
-function answerThis(ev, i){
+function answerThis(ev, i, draft){
   if (ev) ev.stopPropagation();
   const it = (lastHw || [])[i];
   if (!it || !safeUrl(it.url)){ toast('这份作业没有可用的直达链接', 'warn'); return; }
-  if (!confirm('让大模型做这一份并交卷？\n\n' + it.title + '\n（' + it.course + '）'
+  if (!draft && !confirm('让大模型做这一份并交卷？\n\n' + it.title + '\n（' + it.course + '）'
       + '\n\n答完直接正式提交、记录成绩。要求上传附件的题会整份跳过，不会乱填。')) return;
   fetch('/api/answer-one', {method:'POST', headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({url: it.url, course: it.course, title: it.title})}).then(r => {
+    body: JSON.stringify({url: it.url, course: it.course, title: it.title,
+                          draft: !!draft})}).then(r => {
     if (r.status === 409){ toast('当前有任务在跑，等它结束再做', 'warn'); return; }
     if (!r.ok){ toast('刷题没能启动（HTTP ' + r.status + '）', 'err'); return; }
     since = 0; logEl.innerHTML = '';
     setCardsShown(false); cardFp = '';
     autoBack = true; brushLike = true;
-    $('res').innerHTML = '<div class="empty">正在后台刷这一份：' + esc(it.title)
+    $('res').innerHTML = '<div class="empty">正在后台'
+      + (draft ? '刷题并暂存：' : '刷这一份：') + esc(it.title)
       + '…（进度看「运行日志」，可以随时暂停 / 停止）</div>';
     $('bartip').textContent = '刷题中…';
     switchTab('log');
@@ -2325,6 +2351,45 @@ function answerThis(ev, i){
     poll();
   }).catch(() => toast('连不上本地程序，请确认那个黑色命令行窗口还在运行', 'err'));
 }
+
+// ---------- 刷题下拉菜单 ----------
+// 「刷题」「做作业」都只留一个按钮，点开浮层二选一：暂存（答完存平台草稿，
+// 人工审查后自己交）或提交（答完直接正式交卷）。菜单挂在 body 上，
+// 不随结果区 900ms 全量重绘消失；点别处 / 滚动 / 改窗口大小即收起。
+function closeBrushMenu(){
+  const m = document.querySelector('.bmenu');
+  if (m) m.remove();
+}
+function brushMenu(ev, kind, i){
+  if (ev) ev.stopPropagation();
+  closeBrushMenu();
+  const r = (ev.currentTarget || ev.target).getBoundingClientRect();
+  const m = document.createElement('div');
+  m.className = 'bmenu';
+  const items = kind === 'row'
+    ? [['draft', '刷题并暂存', '答完存平台草稿，不交卷；人工审查后自己交'],
+       ['submit', '刷题并提交', '答完直接正式提交并记录成绩']]
+    : [['draft', '做作业并暂存', '答完存平台草稿，不交卷；人工审查后自己交'],
+       ['submit', '做作业并提交', '答完直接正式提交并记录成绩']];
+  for (const mi of items){
+    const b = document.createElement('button');
+    b.className = 'bmenu-it';
+    b.innerHTML = '<span class="t">' + mi[1] + '</span>'
+                + '<span class="s">' + mi[2] + '</span>';
+    b.addEventListener('click', function(e2){
+      closeBrushMenu();
+      if (kind === 'row') answerThis(e2, i, mi[0] === 'draft');
+      else startAnswer(e2, mi[0] === 'draft');
+    });
+    m.appendChild(b);
+  }
+  m.style.left = Math.max(6, Math.min(r.left, window.innerWidth - 260)) + 'px';
+  m.style.top = (r.bottom + 5) + 'px';
+  document.body.appendChild(m);
+}
+document.addEventListener('click', closeBrushMenu);
+document.addEventListener('scroll', closeBrushMenu, true);
+window.addEventListener('resize', closeBrushMenu);
 
 // ---------- 刷视频 / 做作业 / 刷课+刷题 ----------
 // 勾选有两级（勾上即生效，不用再确认）：
@@ -2414,25 +2479,26 @@ function screenOff(ev){
 }
 
 // ---------- 大模型答题并交卷 ----------
-function startAnswer(ev){
+function startAnswer(ev, draft){
   if (ev) ev.stopPropagation();
   const keys = taskKeys();
   if (!keys.length){
     toast('先在「未完成任务点」里勾选要做作业的课程或章节', 'warn');
     return;
   }
-  if (!confirm('确定要「做作业并交卷」吗？\n\n大模型答完会直接正式提交并记录成绩，'
+  if (!draft && !confirm('确定要「做作业并交卷」吗？\n\n大模型答完会直接正式提交并记录成绩，'
       + '交卷后一般不能再改。')) return;
   fetch('/api/answer', {method:'POST', headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({only: keys})}).then(r => {
+    body: JSON.stringify({only: keys, draft: !!draft})}).then(r => {
     if (r.status === 409){ toast('当前有任务在跑，等它结束再做', 'warn'); return; }
     if (!r.ok){ toast('答题没能启动（HTTP ' + r.status + '）', 'err'); return; }
     since = 0; logEl.innerHTML = '';
     setCardsShown(false); cardFp = '';
     autoBack = true; brushLike = true;
-    $('res').innerHTML = '<div class="empty">正在后台做作业并交卷…（进度看'
-      + '「运行日志」；可以随时暂停/停止）</div>';
-    $('bartip').textContent = '答题并交卷中…';
+    $('res').innerHTML = '<div class="empty">正在后台做作业…（'
+      + (draft ? '答完暂存不交卷' : '答完直接交卷')
+      + '；进度看「运行日志」；可以随时暂停/停止）</div>';
+    $('bartip').textContent = draft ? '答题暂存中…' : '答题并交卷中…';
     switchTab('log');
     clearTimeout(timer);
     poll();
@@ -2447,6 +2513,7 @@ function startAnswer(ev){
 // 状态 → [文案, 记号类]。颜色交给盘色变量，不在这里写死色值。
 const AST = {
   done:       ['已交卷', 'ok'],
+  ok:         ['已暂存 · 待审查后交', 'ok'],
   already:    ['已交卷（此前已交）', 'ok'],
   fail:       ['交卷失败', 'err'],
   unverified: ['已发出 · 待平台确认', 'warn'],
@@ -2463,7 +2530,7 @@ function renderAnswerResult(a){
   aitems = a.items;
   const uv = aitems.filter(it => it.status === 'unverified' || it.status === 'still');
   const need = aitems.filter(it =>
-    ['report','unsupported','unsolved','partial'].includes(it.status));
+    ['report','unsupported','unsolved','partial','ok'].includes(it.status));
   const tags = [[aitems.length, '', '份']];
   if (uv.length) tags.push([uv.length, 'warn', '份待核实']);
   if (need.length) tags.push([need.length, 'warn', '份需人工']);
@@ -3037,9 +3104,9 @@ class Handler(BaseHTTPRequestHandler):
 
     # 解析请求体的 POST 接口：必须带 application/json 头。
     # HTML 表单发不出这个头 → 表单型 CSRF 无法伪造这些操作。
-    _JSON_PATHS = ('/api/run', '/api/brush', '/api/answer', '/api/combo',
-                   '/api/answer-verify', '/api/llm-config', '/api/llm-test',
-                   '/api/open-work')
+    _JSON_PATHS = ('/api/run', '/api/brush', '/api/answer', '/api/answer-one',
+                   '/api/combo', '/api/answer-verify', '/api/llm-config',
+                   '/api/llm-test', '/api/open-work')
 
     def do_POST(self):
         if not self._local_only():
@@ -3094,7 +3161,8 @@ class Handler(BaseHTTPRequestHandler):
                                    'rate': data.get('rate')})
             return self._send(200, b'{"ok":true}')
         if u.path == '/api/answer':
-            # 「做勾选课程的章节作业并交卷」。only 必填，答完直接正式提交。
+            # 「做勾选课程的章节作业」。only 必填；draft=True 走暂存，
+            # 缺省仍是答完正式交卷（v3.9.5 起二选一由下拉决定）。
             try:
                 data = json.loads(raw.decode('utf-8') or '{}')
             except Exception:
@@ -3109,10 +3177,12 @@ class Handler(BaseHTTPRequestHandler):
                 STATE.update(running=True, task=TASK_NAME['answer'],
                              lines=[], done=False, summary=None,
                              started=time.time(), login_fail=None)
-            _spawn(_answer_worker, {'only': only})
+            _spawn(_answer_worker, {'only': only,
+                                    'draft': bool(data.get('draft'))})
             return self._send(200, b'{"ok":true}')
         if u.path == '/api/answer-one':
-            # 「刷题」：对未完成作业清单里点中的那一份直接答题并交卷。
+            # 「刷题」：对未完成作业清单里点中的那一份答题；draft=True
+            # 暂存不交卷，缺省答完直接交卷。
             # 没有 http(s) 链接就无从定位这份作业，直接拒掉而不是猜。
             try:
                 data = json.loads(raw.decode('utf-8') or '{}')
@@ -3130,7 +3200,8 @@ class Handler(BaseHTTPRequestHandler):
                              started=time.time(), login_fail=None)
             _spawn(_answer_single_worker,
                    {'url': url, 'course': str(data.get('course') or ''),
-                    'title': str(data.get('title') or '')})
+                    'title': str(data.get('title') or ''),
+                    'draft': bool(data.get('draft'))})
             return self._send(200, b'{"ok":true}')
         if u.path == '/api/open-work':
             # 「去完成」免登录：用工具自己的浏览器（带登录态）打开作业页。

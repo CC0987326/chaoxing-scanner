@@ -77,7 +77,7 @@ EXAM_LIST = ('https://mooc1.chaoxing.com/exam-ans/mooc2/exam/exam-list'
 LOGIN_URL = 'https://passport2.chaoxing.com/login?fid=12'
 
 # 版本号：界面侧栏、启动日志、使用说明都引它，别再各处手写一份
-VERSION = 'v3.9.4'
+VERSION = 'v3.9.6'
 
 # 平台自身算「已完成」的状态；除此之外都视为未完成
 DONE_STATES = ('已完成', '已互评', '待批阅', '已提交', '待互评', '已结束', '已过期')
@@ -3824,9 +3824,10 @@ def answer_one(page, c, cpi, kid, cfg, submit, progress, pre=None, detail=None,
 
     submit 三态：
       True   = 答完走平台完整交卷链（正式提交，记录成绩）；
-      False  = 平台「暂存保存」。⚠ 实测平台侧暂存被接受后任务点同样
-               立即标记完成——「只存答案不记完成」在学习通并不存在，
-               所以界面的「暂存」不用这个模式（保留给 CLI）；
+      False  = 平台「暂存保存」，不交卷（界面「暂存」就是这个模式，
+               v3.9.5 起）。⚠ 章节作业的暂存被平台接受后任务点同样
+               立即标记完成，成绩要等正式交卷才有（answer_courses
+               侧会向用户播报这一点）；
       'dry'  = 预演：解析题目 + 大模型作答，但**不填表、不保存、不碰
                平台**，零痕迹。答案通过 detail 交回去，列清单由用户
                复核后手动或一键交卷。
@@ -4244,6 +4245,7 @@ def answer_urls(cfg, targets, progress=None, control=None, headless=None,
     targets: [{'url': 作业直达链接, 'course': 课程名, 'title': 作业名}]。
              url 必填；课程名/作业名只用于日志，不影响定位。
     submit:  True = 答完走正式交卷链（默认，与任务点那个按钮一致）；
+             False = 答完调平台「暂存保存」，不交卷（界面「刷题并暂存」）；
              'dry' = 只出答案不落库（预演）。
 
     判别逻辑**不重复实现**，全部复用 answer_one：附件题整份跳过、题干读不出
@@ -4270,8 +4272,8 @@ def answer_urls(cfg, targets, progress=None, control=None, headless=None,
                 log('本地没有可用登录态，请先登录。', 'err')
                 raise NotLoggedIn('未登录')
         banner('逐份答题（共 %d 份，%s）'
-               % (len(tgt), {True: '答完交卷', 'dry': '预演不落库'}.get(
-                   submit, str(submit))))
+               % (len(tgt), {True: '答完交卷', False: '答完暂存（不交卷）',
+                             'dry': '预演不落库'}.get(submit, str(submit))))
         for i, t in enumerate(tgt, 1):
             if _wait_control(control, progress) == 'stop':
                 out['stopped'] = True
@@ -4357,6 +4359,9 @@ def answer_courses(cfg, only, submit=False, progress=None, control=None,
         banner('逐门课做章节作业（共 %d 门，%s）'
                % (len(picked), {True: '答完交卷', False: '答完保存（不交卷）',
                                 'dry': '预演不落库'}.get(submit, str(submit))))
+        if submit is False:
+            log('    ⚠ 章节作业的暂存一旦被平台接受，这个任务点就会立即标记'
+                '完成（成绩要等正式交卷才有）。')
         for i, c in enumerate(picked, 1):
             if _wait_control(control, progress) == 'stop':
                 out['stopped'] = True
@@ -4449,6 +4454,22 @@ def answer_courses(cfg, only, submit=False, progress=None, control=None,
                         'status': ('ready' if r == 'dry' else
                                    {'report': 'report', 'unsupported': 'unsupported',
                                     'unsolved': 'unsolved'}.get(r, 'failed')),
+                    })
+                elif submit is False and r in ('ok', 'partial', 'already',
+                                               'report', 'unsupported',
+                                               'unsolved', 'failed', 'norender'):
+                    # 暂存模式（界面「做作业并暂存」）：逐份结果也要进清单，
+                    # 「交卷结果」面板才有得渲染——不然面板停在上一次任务
+                    # 的内容，用户只能从汇总数字里猜（审查 2026-10-09 补）。
+                    out['items'].append({
+                        'key': course_key(c), 'kid': node['kid'],
+                        'course': c['name'],
+                        'node': node.get('name') or ('节点 %d' % j),
+                        'url': CARDS_URL.format(clsid=c['clsid'], cid=c['cid'],
+                                                kid=node['kid'], cpi=cpi),
+                        'answers': {}, 'stems': {}, 'total': 0, 'miss': [],
+                        'status': {'ok': 'ok', 'partial': 'partial',
+                                   'already': 'already'}.get(r, r),
                     })
                 elif submit is True and r in ('submitted', 'already', 'unverified',
                                               'report', 'unsupported', 'unsolved',
