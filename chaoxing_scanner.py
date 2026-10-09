@@ -27,6 +27,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import urllib.request
 import zipfile
@@ -76,7 +77,7 @@ EXAM_LIST = ('https://mooc1.chaoxing.com/exam-ans/mooc2/exam/exam-list'
 LOGIN_URL = 'https://passport2.chaoxing.com/login?fid=12'
 
 # 版本号：界面侧栏、启动日志、使用说明都引它，别再各处手写一份
-VERSION = 'v3.8'
+VERSION = 'v3.9.4'
 
 # 平台自身算「已完成」的状态；除此之外都视为未完成
 DONE_STATES = ('已完成', '已互评', '待批阅', '已提交', '待互评', '已结束', '已过期')
@@ -106,6 +107,14 @@ DEFAULT_CONFIG = {
     # （非 Windows / DPAPI 故障）才留明文兜底。
     'llm_key': '',
     'llm_model': '',        # 模型名（如 gpt-4o-mini / deepseek-chat）
+    # ---- 视觉模型（可选）：文本模型看不了图，公式题 / 图表题的题面是图片或
+    # MathML，纯文本提取拿到的往往是空白或乱码，得让能看到图的模型「亲眼看」。
+    # 四项全空 = 不启用视觉，行为与之前完全一致（纯文本答题）。
+    # Key 同样走 DPAPI，存在 runtime/llm_vision_key.dpapi，与主模型那把互不覆盖。
+    'llm_vision_platform': '',
+    'llm_vision_url': '',
+    'llm_vision_key': '',
+    'llm_vision_model': '',
     # 点选验证码默认留给用户手点：弹验证码本身就说明已被风控关注，
     # OCR 识别率有限，点错重试反而加重标记。确要自动识别才改 true。
     'auto_captcha': False,
@@ -180,6 +189,16 @@ def keep_awake(on: bool):
 
 
 # ================================================================ 配置
+# 配置文件的「读—改—写」写侧串行锁。
+# save_config 已经做到「原子替换 + 临时名带线程 id」，两个并发写不会互相
+# 写坏文件；但 patch_config 是「先读、合并、再写」，两个 patch 撞在一起时
+# 会各自读到同一份旧值，后写的把先写的改动整个盖掉（丢更新）——真实路径
+# 就是「界面点保存模型信息」与「刷课线程给 brush_rate 落盘」同时发生。
+# 用 RLock（可重入）：patch_config 内部要调 load_config，而首次建配置时
+# load_config 又会调 save_config，同线程重入同一把锁不能死锁。
+_CONFIG_LOCK = threading.RLock()
+
+
 def load_config() -> dict:
     cfg = dict(DEFAULT_CONFIG)
     if not CONFIG_FILE.exists():
@@ -225,27 +244,29 @@ def save_config(cfg: dict):
     # 原子写：先写临时文件再替换。直接截断写 config.json 时，并发的
     # load_config 会读到半截 JSON → 解析失败 → 默认值覆盖写回 →
     # 用户保存的大模型信息丢失（v2.11.2 前的实测丢失路径）。
-    # 临时名带线程 id：界面保存与任务线程同时落盘也不会互抢同一文件
-    import threading
-    tmp = CONFIG_FILE.with_suffix('.json.tmp%d' % threading.get_ident())
-    tmp.write_text(
-        json.dumps(cfg, ensure_ascii=False, indent=2), encoding='utf-8')
-    # Windows 上目标文件被并发读句柄攥着时，os.replace 会瞬时
-    # PermissionError（WinError 5）。短暂重试即可成功；不重试的话，
-    # 扫描中途的检查点存盘失败会以异常中止整个任务（实测复现）。
-    last = None
-    for _ in range(10):
+    # 临时名带线程 id：界面保存与任务线程同时落盘也不会互抢同一文件；
+    # 再加一道写侧串行锁（_CONFIG_LOCK）——光靠「不撞同一临时文件」还挡不住
+    # patch_config 的丢更新（两边各读一份旧值，后写的盖掉先写的）。
+    with _CONFIG_LOCK:
+        tmp = CONFIG_FILE.with_suffix('.json.tmp%d' % threading.get_ident())
+        tmp.write_text(
+            json.dumps(cfg, ensure_ascii=False, indent=2), encoding='utf-8')
+        # Windows 上目标文件被并发读句柄攥着时，os.replace 会瞬时
+        # PermissionError（WinError 5）。短暂重试即可成功；不重试的话，
+        # 扫描中途的检查点存盘失败会以异常中止整个任务（实测复现）。
+        last = None
+        for _ in range(10):
+            try:
+                os.replace(tmp, CONFIG_FILE)
+                return
+            except PermissionError as e:
+                last = e
+                time.sleep(0.06)
         try:
-            os.replace(tmp, CONFIG_FILE)
-            return
-        except PermissionError as e:
-            last = e
-            time.sleep(0.06)
-    try:
-        tmp.unlink(missing_ok=True)
-    except Exception:
-        pass
-    raise last
+            tmp.unlink(missing_ok=True)
+        except Exception:
+            pass
+        raise last
 
 
 def patch_config(patch: dict) -> bool:
@@ -258,17 +279,21 @@ def patch_config(patch: dict) -> bool:
     刷课参数全丢。
 
     改完返回是否真的落盘（值没变就不写，省一次磁盘抖动）。
+
+    整个「读—改—写」在 _CONFIG_LOCK 里串行：读到的 cur 必须一路用到写回，
+    中途放别的线程进来改同一个文件，就退化成「各拿一份旧值、互相盖掉」。
     """
-    try:
-        cur = load_config()
-    except Exception:
-        cur = dict(DEFAULT_CONFIG)
-    changed = {k: v for k, v in (patch or {}).items() if cur.get(k) != v}
-    if not changed:
-        return False
-    cur.update(changed)
-    save_config(cur)
-    return True
+    with _CONFIG_LOCK:
+        try:
+            cur = load_config()
+        except Exception:
+            cur = dict(DEFAULT_CONFIG)
+        changed = {k: v for k, v in (patch or {}).items() if cur.get(k) != v}
+        if not changed:
+            return False
+        cur.update(changed)
+        save_config(cur)
+        return True
 
 
 # ================================================================ 浏览器内核
@@ -974,7 +999,16 @@ def do_login(cfg, auto=False, phone='', fresh=False):
 
 
 def _login_auto(cfg, phone=''):
-    """短信验证码 + 自动识别点选验证码的全自动登录"""
+    """短信验证码 + 自动识别点选验证码的全自动登录
+
+    失败原因同样写进模块级的 _login_fail，界面和 CLI 都能用
+    last_login_fail() 问「上一次为什么没登进去」。
+    ⚠ 下面那几处赋值**必须**先声明 global，否则只是在函数里新建一个同名
+    局部变量，标记永远不会生效（2026-10-08 审查发现：captcha 那一处一直
+    是死代码，等于全自动登录撞验证码后外界完全看不到原因）。
+    """
+    global _login_fail
+    _login_fail = ''
     phone = phone or cfg.get('phone') or ''
     if not phone:
         try:
@@ -1106,6 +1140,7 @@ def _login_auto(cfg, phone=''):
             return True
         log('自动登录未成功（验证码可能已过期）。建议改用手动登录：'
             'python chaoxing_scanner.py login', 'err')
+        _login_fail = 'other'
         return False
     finally:
         close_ctx(ctx)
@@ -1116,6 +1151,8 @@ def _login_auto(cfg, phone=''):
 # 表单没填上）绝不能报成密码错误，否则会把用户引到「去改密码」的错路上去。
 #   ''           没失败 / 没走到判定
 #   'credential' 平台明确回绝（密码错误 / 账号不存在 / 已锁定）
+#   'captcha'    全自动短信登录撞上点选验证码，而它是无头浏览器、
+#                没有窗口可人工点选，只能到此为止
 #   'other'      其它原因
 _login_fail = ''
 
@@ -1145,7 +1182,6 @@ def do_login_password(cfg, phone, password, headless=False) -> bool:
 
     ctx = launch(cfg, headless=headless, offscreen=False)
     page = ctx.new_page()
-    keep_open = False
     swapped = False          # 本次是否归档了旧痕迹、换成了全新的罐
     logged_in = False        # 是否真的登进去了（决定要不要回滚）
     try:
@@ -1259,7 +1295,6 @@ def do_login_password(cfg, phone, password, headless=False) -> bool:
                             continue
                         if not human_warned:
                             human_warned = True
-                            keep_open = True
                             log('自动识别未通过 → 请在弹出的浏览器窗口里手动点选完成验证。', 'warn')
                             log('（窗口会保持打开，完成后自动继续）', 'warn')
                             deadline = time.time() + 300   # 给人操作留足时间
@@ -1268,7 +1303,6 @@ def do_login_password(cfg, phone, password, headless=False) -> bool:
                     if read_targets(page):
                         if not human_warned:
                             human_warned = True
-                            keep_open = True
                             log('出现点选验证码 → 请在弹出的浏览器窗口里手动点选完成验证。', 'warn')
                             log('（窗口会保持打开，完成后自动继续）', 'warn')
                             deadline = time.time() + 300   # 给人操作留足时间
@@ -1286,16 +1320,26 @@ def do_login_password(cfg, phone, password, headless=False) -> bool:
                 _login_fail = 'credential'
                 return False
 
-        log('登录未在预期时间内完成', 'warn')
+        log('登录未在预期时间内完成（浏览器窗口已关闭：它占着本机的浏览器痕迹'
+            '目录，留着会让紧接着的下一次查询起不来）。要重试请再点一次登录。',
+            'warn')
         _login_fail = 'other'
         return False
     finally:
-        if not keep_open:
-            close_ctx(ctx)
-            # 换了新罐又没登成 → 把旧账号的痕迹与会话挪回原位，
-            # 别让一次没成的登录把原来的登录态也搭进去
-            if swapped and not logged_in:
-                restore_profile()
+        # 无论成败都要关掉这个浏览器。
+        # 它用的是**持久化** profile（runtime/profile）：留着不关，那个目录
+        # 就一直被占着，而同一个 user_data_dir 再启动一个持久化上下文会直接
+        # 失败（TargetClosedError，实测复现）。紧接着的「一键查询」正是拿这
+        # 个目录再开一次 —— 于是「刚用账号密码登录成功，紧接着就查不了」。
+        # 以前这里按 keep_open 跳过关闭（出现过点选验证码就把 keep_open 置
+        # True，想「把窗口留给用户点」），但那个变量从来起不到这个作用：
+        # 函数只要还没返回，窗口本来就是开着的，等人点验证码的那几分钟完全
+        # 够用；它唯一的效果就是每次带验证码的登录都漏一个浏览器进程。
+        close_ctx(ctx)
+        # 换了新罐又没登成 → 把旧账号的痕迹与会话挪回原位，
+        # 别让一次没成的登录把原来的登录态也搭进去
+        if swapped and not logged_in:
+            restore_profile()
 
 
 # ================================================================ 取课程
@@ -2053,7 +2097,11 @@ def list_courses(cfg, headless=None) -> dict:
         if cpi:
             cfg['cpi'] = cpi
             try:
-                save_config(cfg)
+                # 只把 cpi 合并进磁盘配置。以前是 save_config(cfg) —— cfg 是
+                # 任务线程启动时读的那份，读完名录（十来秒）才落盘，中间用户
+                # 在界面上保存的模型信息会被这份旧配置整体冲掉。
+                # 与 scan() 里那个坑同源，那里已经改成 patch_config 了。
+                patch_config({'cpi': cpi})
             except Exception as e:
                 log('cpi 写回配置失败（不影响本次查询）：%s' % str(e)[:60],
                     'warn')
@@ -2361,7 +2409,19 @@ _ATTACH_STEM_RE = re.compile(
     r'|提交.{0,8}(报告|文件|文档|压缩包|作品|附件)'
     r'|(报告|文件|作品|附件).{0,6}(上传|提交)')
 # 模型拒答特征（题干是反爬乱码时模型可能"猜懂"后拒绝作答，这种话不能进作业）
-_REFUSE_RE = None  # 延迟编译，见 llm_solve
+# 模型拒答 / 元话语特征。乱码题干（平台字体反爬）会诱发这类回复，它们绝不能
+# 被当成答案写进作业。原先在 llm_solve 里就地编译，现在文本通道与视觉通道都要
+# 用同一套判据，所以提到模块级。
+_REFUSE_RE = re.compile(
+    r'(无法|不能|不会).{0,8}(代[替理]|提交|上传|完成)'
+    r'|(请|需要).{0,8}(自行|亲自|本人).{0,4}(上传|提交|完成)'
+    r'|(语言模型|AI\s*助手|作为一个\s*AI)'
+    # 元话语：模型在描述「这题该怎么操作」而不是给出答案内容。真机实测：
+    # 实验报告题被填了「进入课程作业中的实验报告，点击上传文件，在下拉
+    # 菜单中选择要提交的文件，确认后提交即可。」→ 0 分。这类话绝不能进作业。
+    r'|(点击|选择|打开|进入).{0,14}(上传|提交|附件)'
+    r'|(上传|提交)(文件|附件).{0,10}(即可|就行|然后|最后)'
+    r'|下拉菜单.{0,8}选择')
 
 
 def _stem_missing(stem):
@@ -2443,6 +2503,7 @@ JS_PARSE_TIMUS = r"""
     }
     stem = stem.replace(/\s+/g, ' ').trim().slice(0, 500);
     const opts = [], fills = [];
+    let li_html = null, li_doc = null;
     li.querySelectorAll('input[name^=answer]').forEach(x => {
       if (x.type === 'hidden') return;
       const label = (x.closest('li') || x.parentElement);
@@ -2450,22 +2511,95 @@ JS_PARSE_TIMUS = r"""
                  label: ((label && label.textContent) || x.value)
                         .replace(/\s+/g, ' ').trim().slice(0, 150)});
     });
+    // 页面变体兜底（真机 2026-10-09：atype/题干都读得到，选项 radio 却不在
+    // 题容器子树里——选项另起一块的结构）。向上最多走两层找 radio/checkbox；
+    // 有 answertype<qid> 时优先只认 name="answer<qid>"，防止把别的题的选项
+    // 捞进来（只有该 scope 里压根没有精确匹配项时才放宽收任何 radio）。
+    if (!opts.length) {
+      const qid = at ? (at.name || '').replace('answertype', '') : '';
+      let scope = li;
+      for (let k = 0; k < 3 && scope && !opts.length; k++) {
+        const exact = qid
+          ? [...scope.querySelectorAll('input[name="answer' + qid + '"]')]
+              .filter(y => y.type === 'radio' || y.type === 'checkbox')
+          : [];
+        (exact.length ? exact
+          : [...scope.querySelectorAll('input[type=radio],input[type=checkbox]')])
+          .forEach(x => {
+            if (x.type === 'hidden') return;
+            if (exact.length && qid && x.name !== 'answer' + qid) return;
+            const label = (x.closest('li') || x.parentElement);
+            opts.push({name: x.name, val: x.value, type: x.type,
+                       label: ((label && label.textContent) || x.value)
+                              .replace(/\s+/g, ' ').trim().slice(0, 150)});
+          });
+        scope = scope.parentElement;
+      }
+    }
+    // 页面变体②（真机 2026-10-09 线代B）：整页没有 radio，选项是
+    // div[onclick=addChoice] + span[data=真实值]，点选后平台 JS 把值写进
+    // input[type=hidden][name=answer<qid>]。⚠ 显示字母与真实值**错位**
+    // （第 1 个显示 A 但 data=B）——视觉模型按截图里的**显示字母**作答，
+    // 所以必须按 DOM 顺序（=显示顺序）收选项、val 记 span 的 data；
+    // 落答侧对这种题禁用按值匹配、只走位置映射（见 answer_one）。
+    if (!opts.length) {
+      const hid2 = li.querySelector(
+        'input[type=hidden][name^=answer]:not([name^=answertype])');
+      const nm2 = hid2 ? hid2.name : '';
+      if (nm2) {
+        li.querySelectorAll('[onclick*=addChoice],[role=radio],[role=checkbox]')
+          .forEach(box => {
+            const sp = box.querySelector('span[data]');
+            if (!sp) return;
+            const lb = (box.getAttribute('aria-label') || box.textContent)
+              .replace(/\s+/g, ' ').trim().slice(0, 150);
+            opts.push({name: nm2, val: sp.getAttribute('data') || '',
+                       type: 'divradio', label: lb});
+          });
+      }
+    }
+    // 仍拿不到选项：把整题结构转储给 page_diag（iframe/自定义控件一次看清）
+    if (!opts.length) {
+      const c2 = li.cloneNode(true);
+      c2.querySelectorAll('script,style').forEach(x => x.remove());
+      c2.querySelectorAll('textarea').forEach(x => { x.textContent = ''; });
+      li_doc = {
+        radios: document.querySelectorAll('input[type=radio]').length,
+        answerInputs: document.querySelectorAll('input[name^=answer]').length,
+        questionLi: document.querySelectorAll('.questionLi').length,
+        timu: document.querySelectorAll('.TiMu').length,
+        liIf: li.querySelectorAll('iframe').length};
+      li_html = c2.outerHTML.replace(/\s+/g, ' ').trim().slice(0, 6000);
+    }
     li.querySelectorAll('textarea, input[type=text]').forEach(x => {
       fills.push({name: x.name || '', tag: x.tagName.toLowerCase()});
     });
     // 「上传附件」型主观题（LLM 替不了）：两条都查，任一命中即判为附件题。
-    // ① 题内有文件选择控件 / 上传类组件（题干可能被反爬加密或结构不同，
-    //    这时只能靠控件本身认）；
+    // ① 题内有**真正的**文件选择控件。⚠ 判据绝不能放宽成「class/id 含 upload」：
+    //    超星答题容器里普遍混着富文本编辑器 UEditor 的上传工具条（.edui-upload
+    //    一类），拿它判会把普通填空题整份误判成附件题——真机实测：「设齐次线性
+    //    方程组…则 k=( )」这道填空题 atype=2，被当成附件题整份跳过。所以只认
+    //    input[type=file]，再把编辑器子树里的 upload 类元素剔掉。真要求传附件的
+    //    题，它的 file 控件必然落在题目容器里，不会漏。
     // ② 题干点名要上传/提交材料——表述千变万化（「请提交实验报告」「以附件
     //    形式提交」「上传视频」…），动作词+对象词组合着扫，宁宽勿漏：
     //    漏判的代价是乱填一个占位答案拿 0 分，误判只是整份跳过让用户自己做。
-    const hasUploader = !!li.querySelector(
-      'input[type=file], [class*=upload], [id*=upload], .edui-upload');
+    const hasUploader = !!li.querySelector('input[type=file]')
+      || [...li.querySelectorAll('[class*=upload],[id*=upload]')].some(
+           e => !e.closest('.edui-default, .edui-editor, .edui-toolbar'));
     const stemUpload = /上传附件|提交附件|附件上传|附件提交|以附件|附件形式|拍照上传|上传.{0,8}(报告|文件|文档|图片|视频|音频|压缩包|作品|附件)|提交.{0,8}(报告|文件|文档|压缩包|作品|附件)|(报告|文件|作品|附件).{0,6}(上传|提交)/.test(stem);
     const upload = hasUploader || stemUpload;
+    // 题干里是否带图/公式：这类题靠纯文本拿不到题面——超星的数学公式常以图片或
+    // MathML 渲染，提取出来是空白或乱码。命中就标记，交给视觉模型「亲眼看」
+    // （见 llm_solve 的视觉通道）。判据宁可宽一点：多截一张图只是多花几分钱，
+    // 漏了则是整题答不出。
+    const hasMedia = !!li.querySelector(
+      'img, svg, math, .MathJax, .MathJax_Preview, [class*=formula], [class*=math], canvas');
+    // 供截图按题定位（Playwright 侧用 [data-cx-idx="N"] 抓这一题的图）
+    li.setAttribute('data-cx-idx', idx);
     out.push({no: idx + 1, stem: stem.slice(0, 500),
               atype: at ? at.value : '',
-              opts, fills, upload});
+              opts, fills, upload, hasMedia, li_html, doc_counts: li_doc});
   });
   return out;
 }
@@ -2479,7 +2613,24 @@ JS_FILL_ANSWERS = r"""
     a.vals.forEach(v => {
       const el = [...document.querySelectorAll('input[name="' + a.name + '"]')]
         .find(x => x.value === v && x.type !== 'hidden');
-      if (el) { el.click(); ok++; } else { miss++; }
+      if (el) { el.click(); ok++; return; }
+      // div 选区变体：点 span[data] 所在的选块，再回读 hidden input 校验
+      // 真的写进去了——点了个寂寞也按 miss 计，让安全阀拦住不交低分卷
+      const hid = document.querySelector(
+        'input[type=hidden][name="' + a.name + '"]');
+      const base = hid ? (hid.id || hid.name) : '';
+      const qid = /^answer\d+$/.test(base) ? base.replace(/^answer/, '') : null;
+      const sp = qid
+        ? document.querySelector('span.choice' + qid + '[data="' + v + '"]')
+        : null;
+      const box = sp && sp.closest(
+        '[onclick*=addChoice],[role=radio],[role=checkbox]');
+      if (box) {
+        box.click();
+        const got = (hid.value || '').trim();
+        if (got === v || got.split(/[,;，；]/).includes(v)) { ok++; return; }
+      }
+      miss++;
     });
   });
   return {ok, miss};
@@ -2615,27 +2766,68 @@ JS_DO_SAVE = r"""
 # 预设表只有后端这一份真相源，界面的下拉直接用它渲染，避免前后端两份漂移。
 LLM_PLATFORMS = [
     {'key': 'deepseek', 'label': 'DeepSeek',
-     'url': 'https://api.deepseek.com/v1', 'model': 'deepseek-chat'},
+     'url': 'https://api.deepseek.com/v1', 'model': 'deepseek-chat',
+     'vision_model': ''},          # DeepSeek 开放平台暂无视觉模型
     {'key': 'openai', 'label': 'OpenAI',
-     'url': 'https://api.openai.com/v1', 'model': 'gpt-4o-mini'},
+     'url': 'https://api.openai.com/v1', 'model': 'gpt-4o-mini',
+     'vision_model': 'gpt-4o'},
     {'key': 'qwen', 'label': '通义千问 Qwen',
      'url': 'https://dashscope.aliyuncs.com/compatible-mode/v1',
-     'model': 'qwen-plus'},
+     'model': 'qwen-plus', 'vision_model': 'qwen-vl-max'},
     {'key': 'moonshot', 'label': 'Moonshot Kimi',
-     'url': 'https://api.moonshot.cn/v1', 'model': 'moonshot-v1-8k'},
+     'url': 'https://api.moonshot.cn/v1', 'model': 'moonshot-v1-8k',
+     'vision_model': 'moonshot-v1-8k-vision-preview'},
     {'key': 'glm', 'label': '智谱 GLM',
-     'url': 'https://open.bigmodel.cn/api/paas/v4', 'model': 'glm-4-flash'},
+     'url': 'https://open.bigmodel.cn/api/paas/v4', 'model': 'glm-4-flash',
+     'vision_model': 'glm-4v-flash'},
     {'key': 'custom', 'label': '自定义（任何 OpenAI 兼容接口）',
-     'url': '', 'model': ''},
+     'url': '', 'model': '', 'vision_model': ''},
 ]
 
 LLM_KEY_FILE = RUNTIME / 'llm_key.dpapi'
+# 视觉模型的 Key 单独一份文件：两个模型可能落在不同平台、各用各的 Key，
+# 共用一份必然互相覆盖。
+LLM_VISION_KEY_FILE = RUNTIME / 'llm_vision_key.dpapi'
+# 「用途」→ 该用途的 Key 文件**属性名**（不是路径本身！见 _llm_key_path）。
+# 刻意只存属性名、每次现读 globals()：测试沙箱（tmp/_sandbox.py）是在 import
+# **之后**把 LLM_KEY_FILE / LLM_VISION_KEY_FILE 改道到临时目录的，
+# import 时就把路径收进容器的话改道改不到 —— 那等于「测试以为隔离了，
+# 实际在写真实用户的 runtime/llm_key.dpapi」。2026-10-08 被逐套件日志抓到。
+_KEY_FILE_ATTR = {'main': 'LLM_KEY_FILE', 'vision': 'LLM_VISION_KEY_FILE'}
+_KEY_FILE_NAME = {'main': 'llm_key.dpapi', 'vision': 'llm_vision_key.dpapi'}
 # 自定文件头（照 ToolKnit 的 TKDpapi1 路子）：魔数 + 版本号，后面才是 DPAPI 块。
 # 带上头是为了「一眼认出这不是普通文本」，也留出以后换算法/换范围的余地。
 LLM_KEY_MAGIC = b'CXLLM1'
 _LLM_KEY_HEADER = len(LLM_KEY_MAGIC) + 4      # 魔数 + 4 字节小版本号
-_LLM_KEY_CACHE = ''
-_LLM_KEY_TRIED = False
+_LLM_KEY_CACHE = {}      # 用途 → Key（解密一次就缓存，别每道题都解一遍）
+_LLM_KEY_TRIED = set()   # 已经去磁盘找过的用途
+
+
+def _llm_key_purpose(purpose: str) -> str:
+    return purpose if purpose in _KEY_FILE_ATTR else 'main'
+
+
+def _llm_key_path(purpose: str = 'main'):
+    """该用途的 Key 文件路径。
+
+    ⚠️ 必须**每次现读**模块级常量，不能预先收进 dict：沙箱是在 import 之后
+    改道这些常量的（见 _KEY_FILE_ATTR 的注释）。
+    """
+    purpose = _llm_key_purpose(purpose)
+    p = globals().get(_KEY_FILE_ATTR[purpose])
+    if p is None:                       # 常量还没定义出来（老版本/半加载）
+        p = RUNTIME / _KEY_FILE_NAME[purpose]
+    return p
+
+
+def llm_key_files() -> dict:
+    """{用途: 路径}。给要一次看两份文件的调用方用；同样现读常量。"""
+    return {k: _llm_key_path(k) for k in _KEY_FILE_ATTR}
+
+
+def _llm_key_field(purpose: str) -> str:
+    """该用途在 config.json 里的明文字段名（仅加密不可用时兜底）。"""
+    return 'llm_key' if purpose == 'main' else 'llm_vision_key'
 
 
 def llm_platform(key: str) -> dict:
@@ -2687,13 +2879,12 @@ def _dpapi(data: bytes, protect: bool) -> bytes:
         ctypes.windll.kernel32.LocalFree(dst.pbData)
 
 
-def save_llm_key(key: str) -> bool:
-    """把 Key 加密存到 runtime/llm_key.dpapi；返回是否真的加密存了。
+def save_llm_key(key: str, purpose: str = 'main') -> bool:
+    """把 Key 加密存到该用途的 dpapi 文件；返回是否真的加密存了。
 
     返回 False = 加密不可用，调用方继续把 Key 留在 config.json（明文），
     并且**不要**去清掉明文，否则用户会两头落空。
     """
-    global _LLM_KEY_CACHE
     key = (key or '').strip()
     if not key:
         return True
@@ -2704,22 +2895,23 @@ def save_llm_key(key: str) -> bool:
     except Exception as e:
         log('API Key 加密失败（将明文存放在 config.json）：%s' % str(e)[:80], 'warn')
         return False
+    path = _llm_key_path(purpose)
     try:
         RUNTIME.mkdir(parents=True, exist_ok=True)
-        tmp = LLM_KEY_FILE.with_name('llm_key.dpapi.tmp')
+        tmp = path.with_name(path.name + '.tmp')
         tmp.write_bytes(LLM_KEY_MAGIC + b'\x01\x00\x00\x00' + blob)
-        os.replace(tmp, LLM_KEY_FILE)     # 原子替换：写一半崩掉不会留坏文件
+        os.replace(tmp, path)             # 原子替换：写一半崩掉不会留坏文件
     except Exception as e:
         log('API Key 写入失败（将明文存放在 config.json）：%s' % str(e)[:80], 'warn')
         return False
-    _LLM_KEY_CACHE = key
+    _LLM_KEY_CACHE[purpose] = key
     return True
 
 
-def load_llm_key() -> str:
-    """读加密的 Key。文件不存在 / 头不对 / 解不开都返回 ''（不抛异常）。"""
+def load_llm_key(purpose: str = 'main') -> str:
+    """读指定用途的加密 Key。文件不存在 / 头不对 / 解不开都返回 ''（不抛异常）。"""
     try:
-        raw = LLM_KEY_FILE.read_bytes()
+        raw = _llm_key_path(purpose).read_bytes()
     except Exception:
         return ''
     if not raw.startswith(LLM_KEY_MAGIC) or len(raw) <= _LLM_KEY_HEADER:
@@ -2734,52 +2926,67 @@ def load_llm_key() -> str:
         return ''
 
 
-def clear_llm_key():
-    """清除加密文件与内存缓存。"""
-    global _LLM_KEY_CACHE
-    _LLM_KEY_CACHE = ''
+def clear_llm_key(purpose: str = 'main'):
+    """清除该用途的加密文件与内存缓存。"""
+    _LLM_KEY_CACHE.pop(purpose, None)
+    _LLM_KEY_TRIED.discard(purpose)
     try:
-        LLM_KEY_FILE.unlink(missing_ok=True)
+        _llm_key_path(purpose).unlink(missing_ok=True)
     except Exception:
         pass
 
 
-def llm_key_of(cfg: dict) -> str:
-    """取当前可用的 API Key。
+def forget_llm_keys():
+    """只忘掉内存里缓存的 Key，**不删文件**——下次取值会重新去磁盘读。
+
+    给「文件被外部改过，要重新读一遍」的场景用（测试、以及用户手动换过
+    Key 文件后的重读）。别让调用方去碰 `_LLM_KEY_CACHE` / `_LLM_KEY_TRIED`
+    这两个容器：它们的类型以前改过一次（标量 → 按用途分的 dict/set），
+    直接赋值 `= ''` 的地方全炸了（2026-10-08 的跑批就是这么红的）。
+    """
+    _LLM_KEY_CACHE.clear()
+    _LLM_KEY_TRIED.clear()
+
+
+def llm_key_of(cfg: dict, purpose: str = 'main') -> str:
+    """取当前可用的 API Key（按用途：main = 答题模型，vision = 视觉模型）。
 
     加密文件是唯一真相源；config.json 里的明文只在**加密不可用**时兜底。
     老版本（v3.7 及以前）留下的明文在这里一次性迁移进加密文件并从配置里撤掉
     ——否则明文会一直躺着，加密就成了摆设。
     """
-    global _LLM_KEY_CACHE, _LLM_KEY_TRIED
-    if _LLM_KEY_CACHE:
-        return _LLM_KEY_CACHE
-    if not _LLM_KEY_TRIED:
-        _LLM_KEY_TRIED = True
-        stored = load_llm_key()
-        legacy = (cfg.get('llm_key') or '').strip()
+    if _LLM_KEY_CACHE.get(purpose):
+        return _LLM_KEY_CACHE[purpose]
+    field = _llm_key_field(purpose)
+    if purpose not in _LLM_KEY_TRIED:
+        _LLM_KEY_TRIED.add(purpose)
+        stored = load_llm_key(purpose)
+        legacy = (cfg.get(field) or '').strip()
         if legacy:
-            if save_llm_key(legacy):
-                _drop_plain_key(cfg)
-                log('已把 API Key 改为加密存放（config.json 里不再留明文）')
+            if save_llm_key(legacy, purpose):
+                _drop_plain_key(cfg, purpose)
+                log('已把 API Key 改为加密存放（config.json 里不再留明文）'
+                    if purpose == 'main' else
+                    '已把视觉模型的 API Key 改为加密存放（config.json 里不再留明文）')
                 return legacy
             return legacy                # 加密不可用：明文继续用着，不折腾用户
         if stored:
-            _LLM_KEY_CACHE = stored
+            _LLM_KEY_CACHE[purpose] = stored
             return stored
-    return (cfg.get('llm_key') or '').strip()
+    return (cfg.get(field) or '').strip()
 
 
-def _drop_plain_key(cfg: dict):
-    """把 config.json 里的明文 Key 撤掉（只在加密确实落盘之后调用）。
+def _drop_plain_key(cfg: dict, purpose: str = 'main'):
+    """把 config.json 里该用途的明文 Key 撤掉（只在加密确实落盘之后调用）。
 
-    用 patch_config 只动 llm_key 一个字段：cfg 可能只是调用方拼的半个
-    dict（界面「测试连接」那条路径就是），整体 save_config 会顺手把
-    用户其余设置抹掉。
+    用 patch_config 只动一个字段：cfg 可能只是调用方拼的半个 dict
+    （界面「测试连接」那条路径就是），整体 save_config 会顺手把用户其余
+    设置抹掉。
     """
+    field = _llm_key_field(purpose)
     try:
-        patch_config({'llm_key': ''})
-        cfg['llm_key'] = ''
+        patch_config({field: ''})
+        cfg[field] = ''
     except Exception as e:
         log('明文 Key 清理失败（不影响使用）：%s' % str(e)[:60], 'warn')
 
@@ -2799,6 +3006,28 @@ def llm_ready(cfg: dict) -> bool:
     return bool((cfg.get('llm_url') or '').strip()
                 and (cfg.get('llm_model') or '').strip()
                 and llm_key_of(cfg))
+
+
+def llm_vision_ready(cfg: dict) -> bool:
+    """视觉模型是否配齐。
+
+    四项**全空** = 用户选择不启用视觉（完全合法，行为退回纯文本答题）；
+    只要填了其中任意一项，就必须填全，否则算「配了一半」——这种情况按未启用
+    处理，但调用方会给出明确提示，免得用户以为填了个地址就能看图。
+    """
+    url = (cfg.get('llm_vision_url') or '').strip()
+    model = (cfg.get('llm_vision_model') or '').strip()
+    if not url and not model and not (cfg.get('llm_vision_platform') or '').strip():
+        return False
+    return bool(url and model and llm_key_of(cfg, 'vision'))
+
+
+def llm_vision_configured(cfg: dict) -> bool:
+    """用户是否**试图**启用视觉（填了任意一项）——用于给「配了一半」的提示。"""
+    return any((cfg.get(k) or '').strip() for k in
+               ('llm_vision_platform', 'llm_vision_url',
+                'llm_vision_model', 'llm_vision_key')) or bool(
+        llm_key_of(cfg, 'vision'))
 
 
 # ---------------------------------------------------------------- 地址规范化
@@ -2923,7 +3152,7 @@ def _llm_net_err_text(e: Exception) -> str:
 LLM_MAX_BYTES = 2 * 1024 * 1024     # 响应体上限，防对方回超大内容把内存吃满
 
 
-def llm_chat(cfg, prompt, timeout=120, key=None):
+def llm_chat(cfg, prompt, timeout=120, key=None, images=None, purpose=None):
     """OpenAI 兼容 /chat/completions。返回回复文本；失败抛 RuntimeError。
 
     v3.8：先规范化地址（base 或完整地址都行）、错误分类成中文、
@@ -2932,22 +3161,49 @@ def llm_chat(cfg, prompt, timeout=120, key=None):
     key 显式传入时直接用它——「测试连接」要能测**刚填进界面、还没保存**
     的 Key；否则 llm_key_of 会优先吐内存里缓存的那把旧 Key，用户改了 Key
     点测试却测的是旧的，测通了再保存反而失败（最坏的一种误导）。
+
+    images：PNG / JPEG 字节列表。一旦带了图就自动改走**视觉模型**那套配置
+    （llm_vision_url / llm_vision_model / llm_vision_key）——文本模型看不了
+    图，拿文本配置发图片只会被对方回 400。purpose 可强制指定走哪一套
+    （「测试连接」要能分别测两边，传 'main' / 'vision'）。
     """
     import urllib.request
     import urllib.error
-    url, err = normalize_llm_url(cfg.get('llm_url'))
+    import base64
+    if purpose is None:
+        purpose = 'vision' if images else 'main'
+    vis = purpose == 'vision'
+    url, err = normalize_llm_url(
+        cfg.get('llm_vision_url' if vis else 'llm_url'))
     if err:
-        raise RuntimeError('接口地址有问题：' + err)
-    key = (key if key is not None else llm_key_of(cfg)) or ''
+        # 视觉模型也走这条函数，报错必须点明是哪一边：只说「接口地址有问题」
+        # 会把人引去改主模型的地址，怎么改都不对。
+        raise RuntimeError(('视觉模型的接口地址有问题：' if vis
+                            else '接口地址有问题：') + err)
+    key = (key if key is not None else llm_key_of(cfg, purpose)) or ''
     key = key.strip()
     if not key:
-        raise RuntimeError('没有可用的 API Key：请在「模型」里填一次并保存')
-    model = (cfg.get('llm_model') or '').strip()
+        raise RuntimeError(
+            '视觉模型还没填 API Key：请在「模型」的视觉模型里填一次并保存'
+            if vis else '没有可用的 API Key：请在「模型」里填一次并保存')
+    model = (cfg.get('llm_vision_model' if vis else 'llm_model') or '').strip()
     if not model:
-        raise RuntimeError('还没填模型名（如 deepseek-chat）')
+        raise RuntimeError(
+            '视觉模型还没填模型名（如 qwen-vl-max / glm-4v-flash）'
+            if vis else '还没填模型名（如 deepseek-chat）')
+    content = prompt
+    if images:
+        content = [{'type': 'text', 'text': prompt}]
+        for b in images:
+            # 按真实字节头挑 MIME：截图走 JPEG（小），也允许外部塞 PNG 进来
+            mime = ('image/png' if bytes(b[:8]) == b'\x89PNG\r\n\x1a\n'
+                    else 'image/jpeg')
+            content.append({'type': 'image_url', 'image_url': {
+                'url': 'data:%s;base64,%s'
+                       % (mime, base64.b64encode(b).decode('ascii'))}})
     body = json.dumps({
         'model': model,
-        'messages': [{'role': 'user', 'content': prompt}],
+        'messages': [{'role': 'user', 'content': content}],
         'temperature': 0,
     }).encode('utf-8')
     last = ''
@@ -3066,9 +3322,19 @@ def _parse_llm_answers(txt, n, types=None):
 
 
 def _stem_key(stem):
-    """题干 → 缓存键。去空白后取 sha1 前 16 位。"""
+    """题干 → 缓存键。去空白后取 sha1 前 16 位；**空题干返回空串**。
+
+    空题干绝不能给一个固定值：调用方（llm_solve）靠「键非空」判断「这题有
+    题干可以代表」，返回 sha1('') 的话所有空题干答案就挤在同一个键上，
+    换道题就可能拿旧答案去填 —— 而带图的公式题题干常常正是空的。
+    读取侧不受影响：空键永远 cache.get 不到东西。
+    （2026-10-08 审查发现：守卫写法 `and _stem_key(...)` 对空串恒为真，
+    等于这条守卫从来没生效过。）
+    """
     import hashlib
     norm = re.sub(r'\s+', '', stem or '')
+    if not norm:
+        return ''
     return hashlib.sha1(norm.encode('utf-8')).hexdigest()[:16]
 
 
@@ -3099,93 +3365,228 @@ def _answer_cache_save(cache):
             pass
 
 
+# ---------------------------------------------------------------- 视觉识别
+# 题面是图片 / 公式的题（超星的数学公式常以图片或 MathML 渲染），纯文本提取拿到
+# 的往往是空白或乱码——光靠文字模型怎么也答不出，还可能被判成「题干读不出来」
+# 整份跳过。配了视觉模型后，这类题改成「截图 → 让模型亲眼看着题作答」。
+def _need_vision(t) -> bool:
+    """这题要不要交给视觉模型看。
+
+    范围：主观题（填空 / 简答），或题干里带图 / 公式的题。不含图的客观选择题
+    不截——纯文字选择题给文本就够，省流量也省等待。
+    """
+    return bool(t.get('hasMedia')) or (t.get('atype') in STYPES)
+
+
+def _shot_timu(hw, idx):
+    """把第 idx 道题（0 基）整块截成 JPEG 字节；失败返回 None。
+
+    定位靠 JS 解析时打的 data-cx-idx（与 JS_PARSE_TIMUS 的 _boxes 同序）。
+    整题连题干带公式带选项一起截，模型才看得全。走 JPEG q60：题面多是文字
+    与线条，压完通常几十 KB，比 PNG 小一个数量级，字照样清楚。
+    """
+    try:
+        el = hw.query_selector('[data-cx-idx="%d"]' % idx)
+        if not el:
+            return None
+        return el.screenshot(type='jpeg', quality=60)
+    except Exception as e:
+        log('    第 %d 题截图失败（%s），这题按纯文本处理。'
+            % (idx + 1, str(e)[:60]), 'warn')
+        return None
+
+
+def _attach_shots(hw, timus, cfg):
+    """给需要看图的题挂上截图（t['shot']）。视觉模型没配就原样返回。
+
+    「配了一半」（填了地址却没填 Key 之类）会明确提示一句——否则用户会以为
+    填了地址就能看图，白等一场还不知道为什么没生效。
+    """
+    if not llm_vision_ready(cfg):
+        if llm_vision_configured(cfg):
+            log('    视觉模型没配全（地址 / 模型名 / Key 要都填上），'
+                '这次仍按纯文本答题。', 'warn')
+        return timus
+    want = [t for t in timus if _need_vision(t)]
+    if not want:
+        return timus
+    got = 0
+    for t in want:
+        png = _shot_timu(hw, t['no'] - 1)
+        if png:
+            t['shot'] = png
+            got += 1
+    if got:
+        log('    已给 %d/%d 道题截了图（交给视觉模型 %s 看图作答）。'
+            % (got, len(want), (cfg.get('llm_vision_model') or '').strip()))
+    else:
+        log('    这 %d 道题都没截到图，按纯文本答题。' % len(want), 'warn')
+    return timus
+
+
+def _clean_vision_answer(a: str) -> str:
+    """收拾视觉模型的回答：只留答案本身；'?' 表示没把握（按未答处理）。"""
+    s = (a or '').strip()
+    if not s:
+        return ''
+    # 只取第一行：模型偶尔会在答案后面补一句解释
+    s = s.splitlines()[0].strip()
+    s = re.sub(r'^(答案|答)\s*[:：]\s*', '', s).strip()
+    s = s.strip('"\'“”「」『』（）()').strip()
+    if s in ('?', '？', '无', '未知'):
+        return ''
+    return s
+
+
+def _ask_one_vision(cfg, t):
+    """把一道题的截图交给视觉模型作答，返回原始回答文本。"""
+    tn = ATYPES.get(t['atype']) or STYPES.get(t['atype']) or '其他'
+    nb = len(t.get('fills') or [])
+    if t['atype'] == '3':
+        hint = '判断题：只输出「对」或「错」。'
+    elif t['atype'] == '2' and nb > 1:
+        hint = ('填空题，共 %d 个空：按横线先后顺序逐个给答案，'
+                '空与空之间用 | 分隔。' % nb)
+    elif t['atype'] == '2':
+        hint = '填空题：只输出空里应填的内容本身。'
+    elif t['atype'] == '4':
+        hint = '简答题：150 字以内直接作答，不要客套话。'
+    else:
+        hint = '选择题：只输出所选选项的大写字母，多选连写（如 AC）。'
+    stem = (t.get('stem') or '').strip()
+    parts = ['图片是作业里的一道%s题，请**直接看图**作答。%s' % (tn, hint)]
+    if stem:
+        # 提取到的题干可能因公式渲染而残缺，说明以图为准，免得模型被误导
+        parts.append('（页面提取的题干文字，可能与图不一致，以图中的题目为准）：'
+                     + stem[:400])
+    opts = [o['label'] for o in (t.get('opts') or [])]
+    if opts and t['atype'] not in STYPES:
+        parts.append('页面给的选项：\n' + '\n'.join('   ' + x for x in opts))
+    parts.append('只输出答案本身：不要题号、不要解释、不要任何多余文字。'
+                 '如果图上是要求上传文件/报告的题，或者你看不清、没把握，'
+                 '就只输出一个 ?。')
+    return llm_chat(cfg, '\n'.join(parts), timeout=180, images=[t['shot']])
+
+
+def _solve_by_vision(cfg, timus, progress):
+    """逐题看图作答。返回 {题号: 答案}；没把握或调用失败的题不出现。
+
+    逐题发而不是整卷一次发：一题一张图时模型不会把题号串起来，答完也好对应；
+    这类题（公式 / 图表）通常就那么一两道，多几次调用换准确率是划算的。
+    """
+    out = {}
+    for t in timus:
+        try:
+            a = _clean_vision_answer(_ask_one_vision(cfg, t))
+        except RuntimeError as e:
+            progress('    第 %d 题视觉模型调用失败：%s'
+                     % (t['no'], str(e)[:110]), 'warn')
+            continue
+        if a:
+            out[t['no']] = a
+            progress('    第 %d 题（看图作答）→ %s' % (t['no'], a[:60]))
+        else:
+            progress('    第 %d 题看图后仍没把握，按未答处理。' % t['no'])
+    return out
+
+
 def llm_solve(cfg, timus, progress):
     """把整卷发给大模型。返回 {题号: 答案}，没答上的题不出现。
 
     客观题答案是大写字母/对错；主观题（填空/简答）答案是文本。
     「上传附件」型主观题（upload=True）不发给模型，替不了。
+    配了视觉模型时，带了截图（t['shot']）的题改走**视觉通道**——题面是图片或
+    公式的题纯文本拿不到内容，只能让模型亲眼看。
     本地答案缓存：按题干哈希查 runtime/answer_cache.json，命中直接复用
     （同题干=同一道题，不重复花模型的钱）；模型答上的新题写回缓存。
     """
     # 题干压根没取到的题不发给模型：模型看不到题干会瞎编一段「这题该怎么
     # 操作」当答案（真机实测被填进卷子拿 0 分），白白花钱还误导。
     # 留给 answer_one 判成「需人工」。
+    # ⚠ 例外：已经截了图的题照发——题干提不出来正是公式/图片题的典型症状，
+    # 而模型看图就能读题，这批题恰恰是视觉通道要救的。
     todo = [t for t in timus
-            if not t.get('upload') and not _stem_missing(t.get('stem'))]
+            if not t.get('upload')
+            and (t.get('shot') or not _stem_missing(t.get('stem')))]
     if not todo:
         return {}
     # ---- 先查本地缓存 ----
     cache = _answer_cache_load()
     ans, rest = {}, []
     for t in todo:
-        hit = cache.get(_stem_key(t.get('stem')))
-        if hit:
-            ans[t['no']] = hit
-        else:
-            rest.append(t)
+        # 有图的题不查缓存也不用缓存：截图内容（图形 / 公式）没法用题干哈希
+        # 代表，拿旧答案复用有答错的风险，宁可多花一次调用。
+        if not t.get('shot'):
+            hit = cache.get(_stem_key(t.get('stem')))
+            if hit:
+                ans[t['no']] = hit
+                continue
+        rest.append(t)
     if ans:
         progress('    本地答案缓存命中 %d/%d 题%s。' % (
             len(ans), len(todo), '，其余问模型' if rest else ''))
     if not rest:
         return ans
     todo = rest
-    lines = []
-    for t in todo:
-        tn = ATYPES.get(t['atype']) or STYPES.get(t['atype']) or '其他'
-        line = '%d.【%s】%s' % (t['no'], tn, t['stem'])
-        if t['atype'] == '3':
-            line += '（判断题：对/错）'
-        elif t['atype'] == '2':
-            nb = len(t.get('fills') or [])
-            if nb > 1:
-                # 多空填空必须点明空数：不点明模型会把「A、B、C」当成一整个答案
-                # 返回，工具再把它灌进每个空 → 3 个空全错（真机实测踩过）。
-                line += ('（填空，共 %d 个空：按横线出现的先后顺序逐个给答案，'
-                         '空与空之间用 | 分隔，例如 桥接模式|NAT模式|仅主机模式）'
-                         % nb)
+    vis = [t for t in todo if t.get('shot')]
+    txt = [t for t in todo if not t.get('shot')]
+    got = {}
+    # ---- 视觉通道：带截图的题，逐题「看图作答」 ----
+    if vis:
+        progress('    有 %d 道题带截图，走视觉模型。' % len(vis))
+        got.update(_solve_by_vision(cfg, vis, progress))
+    # ---- 文本通道：其余题照旧整卷一次发 ----
+    if txt:
+        lines = []
+        for t in txt:
+            tn = ATYPES.get(t['atype']) or STYPES.get(t['atype']) or '其他'
+            line = '%d.【%s】%s' % (t['no'], tn, t['stem'])
+            if t['atype'] == '3':
+                line += '（判断题：对/错）'
+            elif t['atype'] == '2':
+                nb = len(t.get('fills') or [])
+                if nb > 1:
+                    # 多空填空必须点明空数：不点明模型会把「A、B、C」当成一整个
+                    # 答案返回，工具再把它灌进每个空 → 3 个空全错（真机实测踩过）。
+                    line += ('（填空，共 %d 个空：按横线出现的先后顺序逐个给答案，'
+                             '空与空之间用 | 分隔，例如 桥接模式|NAT模式|仅主机模式）'
+                             % nb)
+                else:
+                    line += '（填空：只输出空里应填的内容本身）'
+            elif t['atype'] == '4':
+                line += '（简答：150 字以内直接作答，不要客套话）'
             else:
-                line += '（填空：只输出空里应填的内容本身）'
-        elif t['atype'] == '4':
-            line += '（简答：150 字以内直接作答，不要客套话）'
-        else:
-            for o in t['opts']:
-                line += '\n   %s' % o['label']
-        lines.append(line)
-    prompt = ('你是答题助手。请回答下面的题目。\n'
-              '输出要求：只输出一个 JSON 对象，键为题号（字符串），值为答案。\n'
-              '单选/多选输出大写字母（多选如 "AC"）；判断题输出 "对" 或 "错"；\n'
-              '填空只输出应填内容本身，多空题按空序用 "|" 分隔；'
-              '简答输出答案文本（150 字内）。\n'
-              '凡题干要求上传附件/文件/报告、或需要粘贴外部资料的题，输出 "?"。\n'
-              '没有把握的题输出 "?"。不要输出 JSON 以外的任何文字。\n\n'
-              + '\n\n'.join(lines))
-    txt = llm_chat(cfg, prompt)
-    # 上限用真实最大题号而非题数：todo 可能是带空洞的子集
-    # （交卷复用预演答案时只重问没答上的题，题号仍是整卷序号）
-    ans = _parse_llm_answers(
-        txt, max((t['no'] for t in timus), default=0),
-        types={t['no']: t['atype'] for t in todo})
-    # 模型拒答拦截：「无法代为提交…」「我不能替你…」这类话不算答案。
+                for o in t['opts']:
+                    line += '\n   %s' % o['label']
+            lines.append(line)
+        prompt = ('你是答题助手。请回答下面的题目。\n'
+                  '输出要求：只输出一个 JSON 对象，键为题号（字符串），值为答案。\n'
+                  '单选/多选输出大写字母（多选如 "AC"）；判断题输出 "对" 或 "错"；\n'
+                  '填空只输出应填内容本身，多空题按空序用 "|" 分隔；'
+                  '简答输出答案文本（150 字内）。\n'
+                  '凡题干要求上传附件/文件/报告、或需要粘贴外部资料的题，输出 "?"。\n'
+                  '没有把握的题输出 "?"。不要输出 JSON 以外的任何文字。\n\n'
+                  + '\n\n'.join(lines))
+        txtresp = llm_chat(cfg, prompt)
+        # 上限用真实最大题号而非题数：todo 可能是带空洞的子集
+        # （交卷复用预演答案时只重问没答上的题，题号仍是整卷序号）
+        got.update(_parse_llm_answers(
+            txtresp, max((t['no'] for t in timus), default=0),
+            types={t['no']: t['atype'] for t in txt}))
+    # 拒答拦截：「无法代为提交…」「我不能替你…」这类话不算答案。
     # 乱码题干（平台字体反爬）会诱发拒答，拒答文本绝不能写进作业。
-    import re as _re
-    refuse = _re.compile(
-        r'(无法|不能|不会).{0,8}(代[替理]|提交|上传|完成)'
-        r'|(请|需要).{0,8}(自行|亲自|本人).{0,4}(上传|提交|完成)'
-        r'|(语言模型|AI\s*助手|作为一个\s*AI)'
-        # 元话语：模型在描述「这题该怎么操作」而不是给出答案内容。真机实测：
-        # 实验报告题被填了「进入课程作业中的实验报告，点击上传文件，在下拉
-        # 菜单中选择要提交的文件，确认后提交即可。」→ 0 分。这类话绝不能进作业。
-        r'|(点击|选择|打开|进入).{0,14}(上传|提交|附件)'
-        r'|(上传|提交)(文件|附件).{0,10}(即可|就行|然后|最后)'
-        r'|下拉菜单.{0,8}选择')
     for t in todo:
-        a = ans.get(t['no'])
-        if a and t['atype'] in STYPES and refuse.search(a):
+        a = got.get(t['no'])
+        if a and t['atype'] in STYPES and _REFUSE_RE.search(str(a)):
             progress('    第 %d 题模型拒答（%s…），按没把握处理。'
-                     % (t['no'], a[:24]))
-            del ans[t['no']]
-    # 新答上的题写回缓存（'?' = 没把握，绝不能进缓存）
-    fresh = {t['no']: t for t in todo if ans.get(t['no']) not in (None, '?', '')}
+                     % (t['no'], str(a)[:24]))
+            del got[t['no']]
+    ans.update(got)
+    # 新答上的题写回缓存（'?' = 没把握，绝不能进缓存）。
+    # 带图的题题干常常为空，哈希键为空时跳过，免得把不同题混成一个键。
+    fresh = {t['no']: t for t in todo
+             if ans.get(t['no']) not in (None, '?', '')
+             and _stem_key(t.get('stem'))}
     if fresh:
         for t in fresh.values():
             cache[_stem_key(t.get('stem'))] = ans[t['no']]
@@ -3354,6 +3755,69 @@ def _submit_ok(resp_seen):
     return False
 
 
+# 选项位置兜底用的字母表（测试证伪杠杆：置空即可让位置映射全军覆没）
+_POS_LETTERS = 'ABCDEFG'
+
+
+def _fallback_by_position(t, vals):
+    """按选项**位置**把字母答案映射到选项，返回 (names, vals)；失败 (set(), None)。
+
+    背景（2026-10-09 真机实测）：部分答题页选项 radio 的 value 不是 A/B/C/D
+    字面量（选项 ID 或被字体反爬搅乱的文本），「按 value 匹配字母」全军覆没，
+    模型看图答对的题整份被判「没答上」→ 白白作废。截图里选项的呈现顺序就是
+    DOM 顺序，字母序号与选项位置一一对应，按位置取该选项自己的 value 再交给
+    页面去点，对 value 的任何形态都成立。判断题只有两个选项：对=第 1 个、
+    错=第 2 个（平台判卷按选项值，顺序是固定的）。
+    """
+    opts = t.get('opts') or []
+    if t['atype'] == '3':
+        # 判断题：vals 已归一成「对/错」或 true/false，统一回「对/错」再定位
+        idx = 0 if ('对' in vals or 'true' in vals) else (
+            1 if ('错' in vals or 'false' in vals) else -1)
+        if not (0 <= idx < len(opts)) or not opts[idx].get('name') \
+                or not opts[idx].get('val'):
+            return set(), None
+        return {opts[idx]['name']}, [opts[idx]['val']]
+    out_names, out_vals = set(), []
+    for ch in vals:
+        i = _POS_LETTERS.find(str(ch).strip().upper())
+        if not (0 <= i < len(opts)):
+            return set(), None
+        o = opts[i]
+        if not o.get('name') or not o.get('val'):
+            return set(), None
+        out_names.add(o['name'])
+        out_vals.append(o['val'])
+    return out_names, out_vals or None
+
+
+def _dump_page_diag(t, why):
+    """把「模型答了却落不下去」的题面结构转储到 runtime/page_diag.jsonl。
+
+    这类题十有八九是答题页变体（选项没有标准 radio / value 为空），不拿到
+    页面的真实结构就没法根治写答。只追加不覆盖；任何失败都吞掉，绝不影响
+    答题主流程。
+    """
+    try:
+        rec = {'time': time.strftime('%Y-%m-%d %H:%M:%S'), 'ver': VERSION,
+               'no': t.get('no'), 'atype': t.get('atype'), 'why': why,
+               'stem': (t.get('stem') or '')[:80],
+               'opts': [{'name': (o.get('name') or '')[:40],
+                         'val': str(o.get('val') or '')[:40],
+                         'type': o.get('type'),
+                         'label': (o.get('label') or '')[:40]}
+                        for o in (t.get('opts') or [])],
+               'n_fills': len(t.get('fills') or []), 'shot': bool(t.get('shot'))}
+        if t.get('li_html'):
+            rec['li_html'] = t['li_html']
+        if t.get('doc_counts'):
+            rec['doc_counts'] = t['doc_counts']
+        with open(RUNTIME / 'page_diag.jsonl', 'a', encoding='utf-8') as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + '\n')
+    except Exception:
+        pass
+
+
 def answer_one(page, c, cpi, kid, cfg, submit, progress, pre=None, detail=None,
                url=None):
     """对单个章节节点：有作业卡就解析-作答-填表。
@@ -3400,6 +3864,9 @@ def answer_one(page, c, cpi, kid, cfg, submit, progress, pre=None, detail=None,
     if not timus:
         log('    作业卡打开但没解析到题目（可能结构变了），跳过。', 'warn')
         return 'failed'
+    # 视觉识别（可选）：主观题与带图/公式的题先截好图。没配视觉模型就什么都不做，
+    # 后续全走纯文本——行为与之前完全一致。
+    _attach_shots(hw, timus, cfg)
     # 题目分三类：客观题（选字母/对错）、文本主观题（LLM 写）、附件题（替不了）
     attach = [t for t in timus if t.get('upload') and t['atype'] in STYPES]
     todo = [t for t in timus if not (t.get('upload') and t['atype'] in STYPES)]
@@ -3465,7 +3932,10 @@ def answer_one(page, c, cpi, kid, cfg, submit, progress, pre=None, detail=None,
             # /附件题 → 归「需人工」。⚠ 这条只敢用在主观题上：客观题纯中文
             # 题干太常见，用它会误伤一大片。
             stem = t.get('stem') or ''
-            if t['atype'] in STYPES and (
+            # 已经截了图的题不走这条：题干提不出来正是公式/图片题的症状，而模型
+            # 看图就能读题。答不上说明模型确实没把握，落到下面按「没答上」处理，
+            # 不该冤枉成附件题让整份跳过。
+            if t['atype'] in STYPES and not t.get('shot') and (
                     _stem_missing(stem)
                     or not re.search(r'[A-Za-z0-9]', stem)):
                 log('    第 %d 题题干读不出来（平台字体反爬/作业卡结构变化，'
@@ -3477,7 +3947,8 @@ def answer_one(page, c, cpi, kid, cfg, submit, progress, pre=None, detail=None,
         # 语义兜底：题干点名要「提交/上传」报告·文件·作品，模型却只给了极短
         # 占位答案（如 "1"）——这类题的答案区本就是给用户传附件的，填字必得
         # 0 分（真机实测：实验报告题被填「1」整题 0 分）。宁可不碰。
-        if (t['atype'] in STYPES and len(str(a).strip()) <= 2
+        if (t['atype'] in STYPES and not t.get('shot')
+                and len(str(a).strip()) <= 2
                 and _ATTACH_STEM_RE.search(t.get('stem') or '')):
             log('    第 %d 题题干要求提交/上传材料，模型只给出占位答案「%s」，'
                 '判为附件题，整份跳过（保存会让任务点直接完成，'
@@ -3499,11 +3970,13 @@ def answer_one(page, c, cpi, kid, cfg, submit, progress, pre=None, detail=None,
                     continue
                 for f, pv in zip(t['fills'], parts):
                     if f['name']:
-                        fills.append({'name': f['name'], 'val': pv})
+                        fills.append({'name': f['name'], 'val': pv,
+                                      'no': t['no']})
                 continue
             for f in t['fills']:
                 if f['name']:
-                    fills.append({'name': f['name'], 'val': a})
+                    fills.append({'name': f['name'], 'val': a,
+                                  'no': t['no']})
             continue
         if t['atype'] == '3':                # 判断题：统一转平台认的值
             a = '对' if a in ('对', '正确', 'TRUE', 'T', '√') else '错'
@@ -3513,36 +3986,142 @@ def answer_one(page, c, cpi, kid, cfg, submit, progress, pre=None, detail=None,
                 vals = ['true' if a == '对' else 'false']
         else:
             vals = list(a)                   # 多选 "AC" → ['A','C']
-        names = {o['name'] for o in t['opts'] if o['val'] in vals}
+        # div 选区变体（type=divradio）：显示字母与真实值错位，按值匹配
+        # 会把模型按截图答的显示字母对到错误选项上，只走位置映射
+        names = {o['name'] for o in t['opts']
+                 if o['val'] in vals and o.get('type') != 'divradio'}
         if not names:
+            # 先试大小写归一（有的页面 value 是小写字母），再按位置兜底
+            up = [str(v).upper() for v in vals]
+            names = {o['name'] for o in t['opts']
+                     if str(o.get('val', '')).upper() in up
+                     and o.get('type') != 'divradio'}
+        pos_vals = None
+        if not names:
+            names, pos_vals = _fallback_by_position(t, vals)
+            if names:
+                peek = ' / '.join(str(o.get('val', ''))[:14]
+                                  for o in (t['opts'][:4]))
+                log('    第 %d 题选项值不是字母（%s），已按选项位置落答。'
+                    % (t['no'], peek), 'info')
+        if not names:
+            peek = ('%d 个选项' % len(t['opts'])) if t['opts'] \
+                else '页面里解析到 0 个选项'
+            log('    第 %d 题模型答了（%s）但选项落不下去（%s），'
+                '按没答上处理。' % (t['no'], str(a)[:12], peek), 'warn')
+            _dump_page_diag(t, 'opts_unmappable')
             missing.append(t['no'])
             continue
         for nm in names:
-            fills.append({'name': nm, 'vals': vals})
-    if missing:
-        log('    ⚠ 有 %d 道题没答上（第 %s 题）：不保存不交卷，这份需要你手动做。'
-            % (len(missing), '、'.join(map(str, missing[:8]))), 'warn')
+            fills.append({'name': nm, 'vals': pos_vals or vals,
+                          'no': t['no']})
+    if not fills:
+        # 一道都没答上 = 确实没有可保存的内容，保持「整份不碰」。
+        # 注意判据是 fills（真的能填进去的）而不是 missing：
+        # 只要有一道答上了，就要往下走，把它存进平台（v3.9.2 起同 v4.0）。
+        log('    ⚠ 这一整份都没答上（第 %s 题），没有可保存的内容，'
+            '这份需要你手动做。'
+            % '、'.join(map(str, missing[:8])), 'warn')
         return 'unsolved'
-    picked = [f for f in fills if 'val' in f]
-    opt_fills = [f for f in fills if 'vals' in f]
-    if opt_fills:
-        r = hw.evaluate(JS_FILL_ANSWERS, opt_fills)
-        log('    已填 %d 个选项（未命中 %d）。' % (r.get('ok', 0), r.get('miss', 0)))
-    if picked:
-        # 客观题与主观题之间隔一会，别一瞬全填完
-        time.sleep(random.uniform(1.0, 3.0))
-        r = hw.evaluate(JS_FILL_TEXT, picked)
-        log('    已填 %d 道主观题（未命中 %d）。' % (r.get('ok', 0), r.get('miss', 0)))
-        # 主观题没真正写进编辑器（UE 未就绪等）＝平台会收到空答案。
-        # 这是「误交卷」级别的事故，宁可不交也不能悄悄交白卷（实测踩过）。
-        if r.get('miss'):
-            log('    ⚠ 有 %d 道主观题没写进答题编辑器（平台会读到空），'
-                '不保存不交卷，这份需要你手动做。' % r['miss'], 'warn')
-            return 'unsolved'
     ids = hw.evaluate(JS_PREP_WQB)
     if not ids:
-        log('    ⚠ 没拿到题目清单（answerwqbid），平台会拒绝保存。', 'warn')
+        # 不补 answerwqbid，平台会回「无效的参数：code-1」，保存直接被拒
+        # （实测）。这种时候填了也存不下来，索性别在页面上留一堆没落库的字。
+        log('    ⚠ 没拿到题目清单（answerwqbid），平台会拒绝保存，'
+            '这份没法落库。', 'warn')
         return 'failed'
+    # ---- 分批填 + 分批暂存：「做几道存几道」（v3.9.2 自 v4.0 移植） ----
+    #   · 答上的题**一律填进去**，并且每 save_every 道调一次平台暂存 ——
+    #     中途被停止 / 断网 / 窗口被关，前面已填的答案也不会白填；
+    #   · 有题没答上 / 选项没点中 / 主观题没进编辑器 → **只暂存、绝不交卷**
+    #     （交上去就是白拿低分），剩下的题打开作业网址补完再点提交，
+    #     先前暂存的答案还在，不用重答一遍。
+    # 以前是「有一道没答上就整份不填不存」，用户实测的后果是：答案都对，
+    # 平台上却什么都没有，等于白做。
+    try:
+        step = max(int(cfg.get('save_every') or 5), 1)
+    except Exception:
+        step = 5
+    order = sorted(fills, key=lambda f: 0 if 'vals' in f else 1)   # 先客观后主观
+    batches = [order[i:i + step] for i in range(0, len(order), step)]
+    n_q = len({f['no'] for f in fills})
+    n_save_fail = 0
+
+    def _save_draft():
+        """调平台自己的「临时保存」（saveWork）。返回 True = 调用成功。
+
+        evaluate 包在 try 里：核实环节会整页重新导航，cards 链上的 hw
+        是内层 iframe，届时早已分离（Frame was detached）—— 兜底调用
+        绝不能让异常冲出去，把状态记账炸成 failed。
+        """
+        nonlocal n_save_fail
+        try:
+            act = hw.evaluate(JS_DO_SAVE)
+        except Exception as e:
+            act = 'err:%s' % type(e).__name__
+        if act != 'ok':
+            n_save_fail += 1
+            log('    ⚠ 暂存没调起来（%s），这批答案可能没落到平台。' % act,
+                'warn')
+        return act == 'ok'
+
+    def _strip(fs):
+        """'no' 只是本地分组用的，不往页面里塞。"""
+        return [{k: v for k, v in f.items() if k != 'no'} for f in fs]
+
+    txt_miss = 0
+    op_miss = 0
+    saved_last = False
+    for bi, batch in enumerate(batches):
+        op = _strip([f for f in batch if 'vals' in f])
+        tx = _strip([f for f in batch if 'val' in f])
+        if op:
+            r = hw.evaluate(JS_FILL_ANSWERS, op)
+            op_miss += int(r.get('miss') or 0)
+            log('    已填 %d 个选项（未命中 %d）。'
+                % (r.get('ok', 0), r.get('miss', 0)))
+        if tx:
+            # 客观题与主观题之间隔一会，别一瞬全填完
+            time.sleep(random.uniform(1.0, 3.0))
+            r = hw.evaluate(JS_FILL_TEXT, tx)
+            txt_miss += int(r.get('miss') or 0)
+            log('    已填 %d 道主观题（未命中 %d）。'
+                % (r.get('ok', 0), r.get('miss', 0)))
+        last = (bi + 1) >= len(batches)
+        # 还有下一批、或本来就是暂存模式、或已知有题答不上 → 落一次库。
+        # 只有「最后一批 + 要交卷 + 没缺题」才省掉这一次：提交马上就到，
+        # 多存一次纯属白多一个请求。
+        saved_last = False
+        if (not last) or (not submit) or bool(missing):
+            saved_last = _save_draft()
+        if not last:
+            time.sleep(random.uniform(0.8, 2.2))
+    # 主观题没真正写进编辑器（UE 未就绪等）＝平台会收到空答案。
+    # 这是「误交卷」级别的事故，宁可不交也不能悄悄交白卷（实测踩过）。
+    if txt_miss or missing or op_miss:
+        if not saved_last:
+            _save_draft()          # 已填进去的必须落库，别停在页面上
+        if n_save_fail:
+            log('    ⚠ 暂存调用失败了 %d 次，答案可能没落到平台，'
+                '请打开作业网址自己确认。' % n_save_fail, 'warn')
+        else:
+            log('    ✓ 已对答上的 %d 题调用平台暂存（未交卷）。' % n_q,
+                'warn')
+        if txt_miss:
+            log('    其中 %d 道主观题没写进答题编辑器（平台会读到空），'
+                '所以没有交卷。' % txt_miss, 'warn')
+        if op_miss:
+            log('    其中 %d 个选项没点中（平台会读到空），所以没有交卷。'
+                % op_miss, 'warn')
+        if missing:
+            log('    没答上的：第 %s 题。打开作业网址补完这些题再点提交，'
+                '先前暂存的答案还在，不用重答。'
+                % '、'.join(map(str, missing[:8])), 'warn')
+        return 'partial'
+    if not submit:
+        log('    ✓ 已执行暂存（未走正式交卷弹窗）。平台是否受理，'
+            '以作业页状态为准。')
+        return 'ok'
     # 交卷必须「核实后再报成功」：监听平台的提交响应，btnBlueSubmit 是异步链，
     # 调用返回 ok 只代表链路启动了，不代表服务端收下了（实测踩过假 ✓）。
     # 测试桩的 FakePage 没有事件接口，跳过监听、维持旧的直接判定。
@@ -3582,11 +4161,17 @@ def answer_one(page, c, cpi, kid, cfg, submit, progress, pre=None, detail=None,
     try:
         # 提交前再停一下：填完立刻点提交在时序上太齐整
         time.sleep(random.uniform(2.0, 5.0))
-        act = hw.evaluate(JS_DO_SUBMIT if submit else JS_DO_SAVE)
+        act = hw.evaluate(JS_DO_SUBMIT)
         if act != 'ok':
-            log('    %s调用失败：%s' % ('交卷' if submit else '暂存', act), 'warn')
+            log('    交卷调用失败：%s' % act, 'warn')
+            # 交卷没调起来 ≠ 这份白做。先把已填的答案暂存到平台，
+            # 用户打开作业网址补点一下「提交」就行，不用从头再答一遍。
+            if _save_draft():
+                log('    已改为暂存：已调用平台暂存，打开作业网址点提交即可。',
+                    'warn')
+                return 'partial'
             return 'failed'
-        if submit and can_listen:
+        if can_listen:
             # 平台受理可能要几十秒甚至几分钟（实测一次 20 秒内毫无动静、
             # 数分钟后已批阅），轮询着等。窗口可在 config 调（submit_verify_window）。
             vwin = max(int(cfg.get('submit_verify_window') or 30), 10)
@@ -3602,15 +4187,23 @@ def answer_one(page, c, cpi, kid, cfg, submit, progress, pre=None, detail=None,
                 page.remove_listener('request', _on_req)
             except Exception:
                 pass
-    if not submit:
-        log('    ✓ 已保存（平台接受，任务点会标记完成；未走正式交卷弹窗）。')
-        return 'ok'
     if not can_listen:
         log('    ✓ 已交卷（平台完整提交流程）。')
         return 'submitted'
     if req_seen and _submit_ok(resp_seen):
         log('    ✓ 已交卷（平台已受理提交）。')
         return 'submitted'
+    # 「提交请求没发出去」时，趁作业页还没被核实导航冲掉、答案还在
+    # 页面上，先补存一次 —— 重开核实会整页导航：cards 链上的 hw frame
+    # 会随之分离，页面上没落库的最后一批答案也会一起消失，到那时
+    # 再想存就来不及了。
+    saved_post = False
+    if not req_seen:
+        log('    ⚠ 没观察到平台的提交请求，这份大概率没交上。', 'warn')
+        if _save_draft():
+            saved_post = True
+            log('    已把答案暂存进平台：打开作业网址补点「提交」即可，'
+                '不用重答一遍。', 'warn')
     # 响应没抓到 → 重开作业卡核实是否已切「已批阅」。平台翻转状态可能
     # 要几分钟，一次没翻不算数：次数/间隔可在 config 调
     # （submit_recheck_times / submit_recheck_interval）。
@@ -3631,8 +4224,16 @@ def answer_one(page, c, cpi, kid, cfg, submit, progress, pre=None, detail=None,
             '平台可能延迟生效，请稍后打开作业网址确认这份的状态。'
             % (req_seen[0], vwin), 'warn')
     else:
-        log('    ⚠ 没观察到平台的提交请求，这份大概率没交上，'
-            '请打开作业网址手动确认。', 'warn')
+        # 上面趁页面还在时补存过一次（saved_post）；这里是第二次机会：
+        # 万一那次没调起来再试一回。frame 多半已随核实导航分离，
+        # _save_draft 里的 try 会兜住，不会炸掉状态记账。
+        if not saved_post:
+            if _save_draft():
+                log('    已把答案暂存进平台：打开作业网址补点「提交」即可，'
+                    '不用重答一遍。', 'warn')
+            else:
+                log('    暂存也没调起来，请打开作业网址手动确认这份的状态。',
+                    'warn')
     return 'unverified'
 
 
@@ -3654,7 +4255,8 @@ def answer_urls(cfg, targets, progress=None, control=None, headless=None,
     tgt = [t for t in (targets or [])
            if isinstance(t, dict) and t.get('url')]
     out = {'total': len(tgt), 'submitted': 0, 'unverified': 0, 'report': 0,
-           'already': 0, 'skipped': 0, 'fail': 0, 'stopped': False, 'items': []}
+           'already': 0, 'skipped': 0, 'saved': 0, 'fail': 0, 'partial': 0,
+           'stopped': False, 'items': []}
     if not tgt:
         raise RuntimeError('没有可做的作业（这份清单里缺少作业链接）')
     ctx = launch(cfg, headless=headless)
@@ -3696,6 +4298,10 @@ def answer_urls(cfg, targets, progress=None, control=None, headless=None,
                 out['already'] += 1
             elif r in ('nohw', 'norender', 'dry'):
                 out['skipped'] += 1
+            elif r == 'partial':
+                out['partial'] += 1      # 部分作答已暂存，要人工补完再交
+            elif r == 'ok':
+                out['saved'] += 1        # submit=False 的纯暂存成功
             else:                        # unsolved / failed
                 out['fail'] += 1
             rec = {'course': t.get('course'), 'title': t.get('title'),
@@ -3729,7 +4335,7 @@ def answer_courses(cfg, only, submit=False, progress=None, control=None,
     ctx = launch(cfg, headless=headless)
     page = ctx.new_page()
     out = {'courses': [], 'submitted': 0, 'saved': 0, 'skipped': 0,
-           'fail': 0, 'stopped': False, 'items': []}
+           'fail': 0, 'partial': 0, 'stopped': False, 'items': []}
     if submit == 'dry':
         progress('预演模式：只答题不落库，答完列出清单，由你核对后手动或一键交卷。')
     try:
@@ -3774,7 +4380,7 @@ def answer_courses(cfg, only, submit=False, progress=None, control=None,
                 progress('  没有待完成的章节节点。')
                 continue
             progress('  待处理节点 %d 个，逐个找作业卡…' % len(nodes))
-            s = su = sk = f = rp = uw = 0
+            s = su = sk = f = rp = uw = pt = 0
             stopped_here = False
             nr = 0          # 连续「作业卡内页打不开」数（疑似限流的信号）
             cooled = False  # 本门课是否已冷却过一次
@@ -3845,7 +4451,8 @@ def answer_courses(cfg, only, submit=False, progress=None, control=None,
                                     'unsolved': 'unsolved'}.get(r, 'failed')),
                     })
                 elif submit is True and r in ('submitted', 'already', 'unverified',
-                                              'report', 'unsupported', 'unsolved'):
+                                              'report', 'unsupported', 'unsolved',
+                                              'partial'):
                     # 正式交卷模式：逐份结果也进清单，界面据此渲染「交卷结果」，
                     # 其中未确认的作业可以在面板里「重新核实」。
                     out['items'].append({
@@ -3864,6 +4471,9 @@ def answer_courses(cfg, only, submit=False, progress=None, control=None,
                     sk += 1    # 预演/暂存模式遇到已批阅的：没东西可做，跳过
                 elif r == 'unverified' and submit is True:
                     uw += 1    # 请求发出但没核实到结果，单独记账不混进失败
+                elif r == 'partial':
+                    s += 1     # 已落库的部分作答，算进「已保存」一路
+                    pt += 1    # 但另记一笔：这几份还得人工补完才能交
                 elif r == 'ok':
                     s += 1
                 elif r == 'dry':
@@ -3879,13 +4489,15 @@ def answer_courses(cfg, only, submit=False, progress=None, control=None,
                 time.sleep(max(float(cfg.get('course_delay', 3.0)), 1.0))
             out['courses'].append({'name': c['name'], 'submitted': su,
                                    'saved': s, 'skipped': sk, 'fail': f,
-                                   'report': rp, 'unverified': uw})
+                                   'report': rp, 'unverified': uw,
+                                   'partial': pt})
             out['submitted'] += su
             out['saved'] += s
             out['skipped'] += sk
             out['fail'] += f
             out['report'] = out.get('report', 0) + rp
             out['unverified'] = out.get('unverified', 0) + uw
+            out['partial'] = out.get('partial', 0) + pt
             progress('  ✓ %s 做完：交卷 %d，已答/保存 %d，需人工 %d，失败 %d%s。'
                      % (cut(c['name'], 24), su, s, rp, f,
                         '，未确认 %d' % uw if uw else ''))
@@ -3954,7 +4566,7 @@ def submit_items(cfg, items, progress=None, control=None, headless=None) -> dict
     ctx = launch(cfg, headless=headless)
     page = ctx.new_page()
     out = {'submitted': 0, 'fail': 0, 'skip': 0, 'unverified': 0,
-           'stopped': False, 'results': []}
+           'partial': 0, 'stopped': False, 'results': []}
     try:
         banner('检查登录状态')
         if not check_login(page):
@@ -4004,6 +4616,9 @@ def submit_items(cfg, items, progress=None, control=None, headless=None) -> dict
             elif r == 'unverified':
                 out['unverified'] += 1     # 请求发了但没核实到结果，不算失败
                 st = 'unverified'
+            elif r == 'partial':
+                out['partial'] += 1   # 没交成，但答案已暂存：要人工补完再交
+                st = 'partial'
             elif r in ('unsolved', 'report', 'unsupported'):
                 out['skip'] += 1
                 st = r
@@ -4017,6 +4632,10 @@ def submit_items(cfg, items, progress=None, control=None, headless=None) -> dict
                  '用时 %.0f 分钟。'
                  % (out['submitted'], out['unverified'], out['fail'],
                     out['skip'], (time.time() - t0) / 60))
+        if out.get('partial'):
+            progress('⚠ 有 %d 份没交成、但答案已暂存到平台（有几道题模型没答上'
+                     '或没写进答题框）：打开作业网址补完再点提交即可，'
+                     '不用重答。' % out['partial'], 'warn')
     finally:
         save_state(ctx)
         close_ctx(ctx)

@@ -16,6 +16,7 @@ import subprocess
 import sys
 import threading
 import time
+import queue
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
@@ -229,6 +230,61 @@ def _screen_off():
             cs.log('熄屏失败：%s' % e, 'err')
 
 
+# 「去完成」常驻作业窗口：一个带登录态的浏览器伺候多次点击。
+# 以前把链接丢给系统默认浏览器，用户得重新登录一次；现在改走工具
+# 自己的 Chrome（persistent profile + restore_state），点开即已登录。
+# 独立线程 + 独立 sync_playwright 实例：sync API 不能跨线程操作，
+# 复用活着的浏览器开新标签页比每次重开快，也避免 profile 目录被
+# 两个进程同时占住。窗口期间任务互斥由 /api/open-work 的 busy 闸 +
+# 用户自觉（日志里已提示）兜底。
+_WORK = {'q': None}
+
+
+def _open_work_async(url):
+    q = _WORK['q']
+    if q is not None:
+        q.put(url)
+        cs.log('作业窗口已开着，这次在窗口里新开标签页。')
+        return
+    q = queue.Queue()
+    _WORK['q'] = q
+
+    def run():
+        ctx = None
+        try:
+            cfg = cs.load_config()
+            ctx = cs.launch(cfg, headless=False)
+            cs.restore_state(ctx)
+            page = ctx.new_page()
+            page.goto(url, wait_until='domcontentloaded', timeout=60000)
+            cs.log('已用本机登录态打开作业窗口（不用重新登录）。'
+                   '做完关掉窗口即可；窗口开着时刷题/一键刷暂不可用。')
+            while True:
+                try:
+                    nxt = q.get(timeout=1.0)
+                except queue.Empty:
+                    nxt = None
+                if not ctx.pages:          # 用户把窗口关了
+                    break
+                if nxt:
+                    try:
+                        p = ctx.new_page()
+                        p.goto(nxt, wait_until='domcontentloaded',
+                               timeout=60000)
+                        cs.log('已在作业窗口新开标签页。')
+                    except Exception as e:
+                        cs.log('打开链接失败：%s' % e, 'warn')
+        except Exception as e:
+            cs.log('作业窗口打开失败：%s' % e, 'warn')
+        finally:
+            if ctx is not None:
+                cs.close_ctx(ctx)
+            _WORK['q'] = None
+            cs.log('作业窗口已关闭，「去完成」下次点击会重新开窗。')
+
+    threading.Thread(target=run, daemon=True, name='open-work').start()
+
+
 def _spawn(fn, *args):
     """任务线程统一入口：运行期间阻止系统自动睡眠（屏幕仍可关）。
 
@@ -413,7 +469,9 @@ def _brush_worker(opts):
     try:
         cfg = cs.load_config()
         if _apply_rate(opts, cfg):
-            cs.save_config(cfg)     # 记住这次选的倍速，下次打开还是它
+            # 只合并倍速这一个字段：整份 save_config(cfg) 会把任务启动时那份
+            # 旧配置整体落盘，冲掉这期间用户在界面上保存的模型信息。
+            cs.patch_config({'brush_rate': cfg['brush_rate']})
         rate = cs.g_rate(cfg)
         cs.log('播放方式：%sx 倍速 + 静音，真实播放到片尾（不伪造心跳）。' % rate)
         cs.log('只刷视频任务点；测验 / 作业不会替你自动完成。')
@@ -509,6 +567,7 @@ def _answer_worker(opts):
         with LOCK:
             STATE['summary'] = {'交卷': out.get('submitted', 0),
                                 '未确认': out.get('unverified', 0),
+                                '部分暂存': out.get('partial', 0),
                                 '需人工': out.get('report', 0)
                                           + out.get('skipped', 0),
                                 '失败': out.get('fail', 0)}
@@ -583,6 +642,7 @@ def _answer_single_worker(opts):
         with LOCK:
             STATE['summary'] = {'交卷': out.get('submitted', 0),
                                 '未确认': out.get('unverified', 0),
+                                '部分暂存': out.get('partial', 0),
                                 '需人工': out.get('report', 0),
                                 '此前已交': out.get('already', 0),
                                 '这份没做': out.get('fail', 0)}
@@ -646,11 +706,14 @@ def _verify_worker(opts):
               for r in out.get('results', [])}
         with LOCK:
             ares = STATE['ares']
+            if ares:
+                # 就地改状态也要在锁里：轮询线程可能正拿着同一份数据做
+                # json 序列化，跟它抢着改是白送一个偶发崩溃。
+                for it in ares.get('items', []):
+                    s = st.get((it.get('key'), it.get('kid')))
+                    if s:
+                        it['status'] = s
         if ares:
-            for it in ares.get('items', []):
-                s = st.get((it.get('key'), it.get('kid')))
-                if s:
-                    it['status'] = s
             _set_ares(ares)
         with LOCK:
             STATE['summary'] = {'核实确认已交': out.get('confirmed', 0),
@@ -665,9 +728,19 @@ def _verify_worker(opts):
         cs.log('任务失败：%s' % e, 'err')
         import traceback
         cs.log(traceback.format_exc()[-900:], 'err')
-        # 结果区给一版错误卡片：不然「查询中…」占位永远挂着（rv 没变
-        # 前端不会重画），用户只看到无限转圈，失败原因却藏在日志页签
-        _set_result({'error': str(e)[:200] or type(e).__name__})
+        # 这里**不能**照别处那样画一张「任务失败」卡去顶结果区：此刻结果区
+        # 挂着的是用户的「交卷结果」面板 —— 哪些交了、哪些没交、还有「重新
+        # 核实」按钮。核实失败多半只是会话过期，把这份记录冲掉，用户既丢了
+        # 清单又没法再点一次核实，比不提示还糟。所以：有面板就只提示（错误
+        # 就在用户此刻正看的「运行日志」页里），没面板才画卡，免得停在
+        # 「查询中…」的假象里。
+        with LOCK:
+            has_ares = bool(STATE.get('ares'))
+            if not has_ares:
+                STATE['summary'] = {'提示': '核实失败：'
+                                  + (str(e)[:60] or type(e).__name__)}
+        if not has_ares:
+            _set_result({'error': str(e)[:200] or type(e).__name__})
     finally:
         cs.set_control_hook(None)
         PAUSE.clear()
@@ -714,7 +787,7 @@ def _combo_worker(opts):
 
         # ---- 第一段：刷视频 ----
         if _apply_rate(opts, cfg):
-            cs.save_config(cfg)     # 记住这次选的倍速，下次打开还是它
+            cs.patch_config({'brush_rate': cfg['brush_rate']})   # 同上：只落这一个字段
         rate = cs.g_rate(cfg)
         cs.log('【第 1 步】刷视频：%sx 倍速 + 静音，真实播放到片尾。' % rate)
         out = cs.brush_videos(cfg, only, progress=progress, control=control)
@@ -737,6 +810,7 @@ def _combo_worker(opts):
             STATE['summary'] = {'刷完视频': out.get('done', 0),
                                 '交卷': out2.get('submitted', 0),
                                 '未确认': out2.get('unverified', 0),
+                                '部分暂存': out2.get('partial', 0),
                                 '需人工': out2.get('report', 0)
                                           + out2.get('skipped', 0),
                                 '失败': out2.get('fail', 0)}
@@ -1324,6 +1398,25 @@ PAGE = r"""<!DOCTYPE html>
   details.notes a{color:var(--ac);text-decoration:none;overflow-wrap:anywhere;}
   details.notes a:hover{text-decoration:underline;}
 
+  /* 视觉模型（可选）：默认折起。它只是主模型的补充，常驻展开会把「地址 /
+     模型名 / Key」这三样淹掉；沿用说明区那套 chev 折叠语言，展开时才亮主色。 */
+  details.visbox{
+    margin-top:10px;padding-top:9px;border-top:1px solid var(--line);
+  }
+  details.visbox > summary{
+    display:flex;align-items:center;gap:7px;cursor:pointer;list-style:none;
+    font-size:var(--fs-xs);font-weight:600;color:var(--mut);padding:4px 0;
+  }
+  details.visbox > summary::-webkit-details-marker{display:none;}
+  details.visbox > summary:hover{color:var(--tx-2);}
+  details.visbox > summary .chev{
+    width:13px;height:13px;flex:none;transition:transform var(--t) var(--ease);
+  }
+  details.visbox[open] > summary .chev{transform:rotate(90deg);}
+  details.visbox[open] > summary{color:var(--ac);}
+  details.visbox > .mstat{margin-top:9px;}
+  details.visbox .note{margin-top:8px;}
+
   /* 页脚：联系方式与下载地址。常驻可见（不折进说明区），
      但用小字号弱化，不抢操作区的注意力。 */
   .foot{
@@ -1471,6 +1564,40 @@ PAGE = r"""<!DOCTYPE html>
         <p class="note">任何 OpenAI 兼容接口都能用。Key 加密保存在本机
           （Windows 用户级加密，换电脑或换 Windows 用户后需重填），
           不回显在页面上。做作业用你自己的 Key 按量计费，一份选择题通常几分钱。</p>
+
+        <details class="visbox">
+          <summary><span class="chev" data-i="chev"></span>视觉模型（可选）—— 让模型「亲眼看」公式题 / 图表题</summary>
+          <div class="mstat" id="visstate">
+            <span class="ic" data-i="plug"></span><span>读取中…</span>
+          </div>
+          <div class="field">
+            <select id="vis_platform"></select>
+          </div>
+          <div class="field">
+            <input type="text" id="vis_url" placeholder="接口地址（填到 /v1 即可）">
+          </div>
+          <div class="field">
+            <input type="text" id="vis_model" placeholder="视觉模型名，如 qwen-vl-max">
+          </div>
+          <div class="field has-in">
+            <input type="password" id="vis_key" placeholder="API Key">
+            <button type="button" class="ic-in" id="bviskeyeye" data-for="vis_key"
+                    aria-pressed="false" title="显示 / 隐藏 API Key"
+                    aria-label="显示或隐藏 API Key"></button>
+          </div>
+          <div class="row" style="margin-bottom:8px">
+            <button class="btn sm pri grow" id="bvis">
+              <span class="ic" data-i="check"></span>保存</button>
+            <button class="btn sm grow" id="bvistest">
+              <span class="ic" data-i="bolt"></span>测试连接</button>
+            <button class="btn sm dgr" id="bvisclear" title="清除本机保存的视觉模型 Key">
+              <span class="ic" data-i="trash"></span></button>
+          </div>
+          <p class="note">题面是图片或公式的题（超星的数学公式常以图片 / MathML 渲染），
+            纯文字提取拿不到题面，交给它看图作答。留空 = 不启用，仍按纯文本答题；
+            只对主观题和带图 / 公式的题调用，客观选择题不花这份钱。
+            可以跟上面用同一家的同一个 Key。</p>
+        </details>
       </div>
     </section>
 
@@ -1542,6 +1669,29 @@ let rv = -1;            // 已经拿到的结果版本号（回传给服务端�
 let av = -1;            // 交卷结果面板的版本号（机制同 rv）
 let aitems = [];        // 交卷结果面板的数据（重新核实按钮要用）
 let cardFp = '';        // 左侧统计卡片的指纹：内容没变就不重建 DOM
+// 刷题 / 刷课 / 答题这类任务在启动成功时置位；任务一结束就把界面收回到
+// 「查询结果」，并用左侧当前勾选自动重跑一次查询。不这样做的话，结果区会一直
+// 挂着启动时那句「正在后台刷这一份…」——因为单份刷题不产生交卷面板
+// （_answer_single_worker 只写 summary，不调 _set_ares），没人来覆盖它。
+//
+// 这条自动刷新的**副作用必须收窄**（2026-10-08 被三个老套件抓出来的）：
+// 它是系统自己发的，不是用户点的，所以不能顺手干掉用户正看着的东西——
+//   · 不清日志（那是刚才刷题的全过程）
+//   · 不动「记住手机号」偏好
+//   · 不收起「本次统计」卡片（那正是刚跑完那个任务的结果：刷完几个、是否已停止）
+//   · 不把结果面板换成占位/错误卡片（会话过期时最容易踩：刚刷完的清单会被
+//     一张「未登录」冲掉，用户白等一场）
+// 另外，勾了「刷完自动关机」时不重跑：机器马上要关，再挂一个 1~2 分钟的全量
+// 扫描纯属添乱。见 startBrush / startCombo 里的 `autoBack = !shut`。
+// 还有一条「撤销」：任务确实产出了交卷面板（做作业并交卷 / 刷课+刷题）时，
+// 那块面板本身就是用户要的结果，poll 里会当场把 autoBack 撤掉、不再重跑。
+let autoBack = false;
+// 自动刷新这一趟是不是还在飞。用于让「自动刷新的失败」只提示、不冲掉面板。
+let autoRun = false;
+// 这是一次「刷题 / 刷课 / 答题」类任务：结束时要收口状态行。
+// 单独一个变量是因为存在「结束但不重查」的路（勾了自动关机），
+// 那条路同样不能把「刷视频中…」留在屏幕上。
+let brushLike = false;
 const $ = id => document.getElementById(id);
 const logEl = $('log');
 
@@ -1827,7 +1977,7 @@ function renderResult(r){
          + '</td><td><span class="st err">' + esc(it.state) + '</span></td>'
          + '<td class="num sub">' + esc(it.left || '—') + '</td>'
          + '<td class="col-act">'
-         + (u ? '<a href="' + u + '" target="_blank" rel="noopener">去完成</a>' : '')
+         + (u ? '<a href="' + u + '" class="go-work" target="_blank" rel="noopener">去完成</a>' : '')
          + (u ? ' <button class="mini" onclick="answerThis(event,' + i + ')"'
               + ' title="让大模型直接做这一份并交卷：与任务点的「做作业并交卷」同一套'
               + '判别——要上传附件的题整份跳过、题干读不出跳过，不会乱填">刷题</button>'
@@ -1997,8 +2147,16 @@ async function poll(){
     // DOM，正在选中的文字也会被抖掉；现在轮询只负责把新版本交过来。
     if (j.result && !j.running && j.result_v !== rv){
       rv = j.result_v;
-      renderResult(j.result);
-      setText($('bartip'), j.result.error ? '任务失败' : '查询完成');
+      if (j.result.error && autoRun){
+        // 自动刷新是系统自己发的，不是用户点的。它失败时**只提示、不动面板**：
+        // 结果面板里那份清单是用户刚拿到手的东西，会话过期时最容易被一张
+        // 「未登录」错误卡片冲掉，用户白等一场还丢了清单。
+        toast('自动刷新失败：' + j.result.error, 'err');
+        setText($('bartip'), '刷新失败 · 详见运行日志');
+      } else {
+        renderResult(j.result);
+        setText($('bartip'), j.result.error ? '任务失败' : '查询完成');
+      }
     }
     // 交卷结果面板同理：任务结束才生成，换版才重画，重画时切到结果页
     // 让用户直接看到「哪些可交卷」。
@@ -2007,6 +2165,11 @@ async function poll(){
       renderAnswerResult(j.ares);
       setText($('bartip'), '交卷结果已生成');
       switchTab('res');
+      // 交卷面板就是用户要看的「刚才那批结果」：它一出现就别再自动重跑查询了——
+      // 重跑会把面板整个冲掉，连面板里「重新核实未确认的」那个按钮一起没了。
+      // 四个任务入口启动时都置位了 autoBack，在这里按实际结果撤销。
+      autoBack = false;
+      brushLike = false;
     }
     // 任务收尾时明确交代一句。否则重复点「获取课程列表」而名单没变时，
     // DOM 不会重建、界面毫无动静，用户会以为按钮坏了
@@ -2033,6 +2196,19 @@ async function poll(){
           $('bartip').textContent = '课程列表为空';
         }
       }
+      // 刷题 / 刷课 / 答题跑完：把界面收回「查询结果」，并用左侧当前勾选重跑一次
+      // 查询，让清单反映刚做完的进度（做掉的作业会从清单里消失）。这同时兜掉了
+      // 「任务早结束了、结果区还挂着『正在后台刷这一份…』」那个割裂。
+      if (autoBack){
+        autoBack = false;
+        run('query', {auto: true});   // 它会自己把 autoRun 置位
+      } else {
+        autoRun = false;
+        // 「要自动关机，所以不重跑」这条路也得收口状态行，否则屏幕上永远留着
+        // 「刷视频中…」——那正是用户报过的「任务结束了还显示在刷题」。
+        if (brushLike) setText($('bartip'), '任务已结束');
+      }
+      brushLike = false;
     }
     $('bopen').disabled = !j.report;
   }catch(e){}
@@ -2042,15 +2218,22 @@ async function poll(){
 }
 poll();
 
-async function run(action){
-  if ($('remember').checked) {
-    try { localStorage.setItem('cx_phone', $('phone').value.trim()); } catch(e){}
-  } else {
-    try { localStorage.removeItem('cx_phone'); } catch(e){}
+async function run(action, opts){
+  // opts.auto：任务跑完后自动发起的刷新。它是系统自己发的、不是用户点的，
+  // 所以除了「切回结果页 + 用当前勾选重查」之外，什么都不该做：
+  // 不动用户偏好（手机号记不记）、不弹提示、不清空日志区、不收起本次统计、
+  // 不把结果面板换成占位（失败也留着用户正看的那份清单）。
+  const auto = !!(opts && opts.auto);
+  if (!auto){
+    if ($('remember').checked) {
+      try { localStorage.setItem('cx_phone', $('phone').value.trim()); } catch(e){}
+    } else {
+      try { localStorage.removeItem('cx_phone'); } catch(e){}
+    }
   }
   const nPick = picked().length;
   const nTop = parseInt($('recentTop').value || '0', 10) || 0;
-  if (action === 'query' && nPick && nTop){
+  if (!auto && action === 'query' && nPick && nTop){
     toast('你勾选了 ' + nPick + ' 门具体课程，「只查最近 N 门」这次不生效（以勾选为准）', 'warn');
   }
   const body = {
@@ -2073,22 +2256,31 @@ async function run(action){
   // 实际什么也没跑，用户看到的就只是「点了没反应」。
   if (!resp.ok){
     if (resp.status === 409){
-      toast('上一个任务还在收尾（正在生成报告），等状态变成「已完成」再点一次', 'warn');
-    } else {
+      if (!auto) toast('上一个任务还在收尾（正在生成报告），等状态变成「已完成」再点一次', 'warn');
+    } else if (!auto){
       toast('任务没能启动（HTTP ' + resp.status + '）', 'err');
     }
-    return;
+    return false;
   }
-  since = 0; logEl.innerHTML = '';
-  setCardsShown(false);
-  cardFp = '';   // 卡片已隐藏，指纹一并清掉，否则同样的统计出来时不会重新展开
+  // 自动刷新时保留日志：那是刚才刷题的过程记录，用户很可能正看着
+  if (!auto){ since = 0; logEl.innerHTML = ''; }
+  // 「本次统计」卡片展示的正是刚跑完那个任务的结果（刷完几个、是否已停止），
+  // 自动刷新不该在用户还没看清时把它收走。新查询的统计一到就会顶掉它
+  // （指纹不同 → 重画）。
+  // 非自动时连指纹一起清掉：卡片已隐藏，不清指纹的话同样的统计出来时不会重新展开。
+  if (!auto){ setCardsShown(false); cardFp = ''; }
+  autoRun = auto;
   if (action === 'query') {
     const n = picked().length;
-    $('res').innerHTML = '<div class="empty">'
-      + (n ? ('正在查询你勾选的 ' + n + ' 门课程…')
-           : (nTop ? ('正在查询最近学习的 ' + nTop + ' 门课程…')
-                   : '查询进行中，请稍候…（全量通常 1~2 分钟）')) + '</div>';
-    $('bartip').textContent = '查询中…';
+    // 自动刷新**不换掉结果面板**：那里面是用户刚拿到的那份清单，刷新失败时
+    // 更要留着（错误由 toast + 状态行交代）。新版结果一到就整块替换。
+    if (!auto){
+      $('res').innerHTML = '<div class="empty">'
+        + (n ? ('正在查询你勾选的 ' + n + ' 门课程…')
+             : (nTop ? ('正在查询最近学习的 ' + nTop + ' 门课程…')
+                     : '查询进行中，请稍候…（全量通常 1~2 分钟）')) + '</div>';
+    }
+    $('bartip').textContent = auto ? '正在刷新…' : '查询中…';
     switchTab('res');
   } else if (action === 'list') {
     $('res').innerHTML = '<div class="empty">正在读取课程列表…（约 10 秒，不抓作业）</div>';
@@ -2124,6 +2316,7 @@ function answerThis(ev, i){
     if (!r.ok){ toast('刷题没能启动（HTTP ' + r.status + '）', 'err'); return; }
     since = 0; logEl.innerHTML = '';
     setCardsShown(false); cardFp = '';
+    autoBack = true; brushLike = true;
     $('res').innerHTML = '<div class="empty">正在后台刷这一份：' + esc(it.title)
       + '…（进度看「运行日志」，可以随时暂停 / 停止）</div>';
     $('bartip').textContent = '刷题中…';
@@ -2152,15 +2345,23 @@ function startBrush(ev){
     toast('先在「未完成任务点」里勾选要刷的课程或章节', 'warn');
     return;
   }
+  const shut = !!($('sdafter') && $('sdafter').checked);
   fetch('/api/brush', {method:'POST', headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({only: keys, shutdown: !!($('sdafter') && $('sdafter').checked),
-                          rate: brateVal})}).then(r => {
+    body: JSON.stringify({only: keys, shutdown: shut, rate: brateVal})}).then(r => {
     if (r.status === 409){ toast('当前有任务在跑，等它结束再刷', 'warn'); return; }
     if (!r.ok){ toast('刷视频没能启动（HTTP ' + r.status + '）', 'err'); return; }
     since = 0; logEl.innerHTML = '';
     setCardsShown(false); cardFp = '';
-    $('res').innerHTML = '<div class="empty">正在后台刷视频…（倍速静音真实播放，'
-      + '进度看「运行日志」；可以随时暂停/停止）</div>';
+    // 要自动关机就别再重跑一次全量查询：机器马上要关，挂一个 1~2 分钟的
+    // 扫描只会在关机倒计时里被掐断，白白多开一次浏览器。
+    autoBack = !shut; brushLike = true;
+    // 要关机时不写那句占位：任务结束后不会再重跑查询，写了就没人来换掉它，
+    // 结果区会永远停在「正在后台刷视频…」——正是用户报过的
+    // 「任务结束了还显示在刷题」。非关机时照写，收尾时由自动刷新顶掉。
+    if (!shut){
+      $('res').innerHTML = '<div class="empty">正在后台刷视频…（倍速静音真实播放，'
+        + '进度看「运行日志」；可以随时暂停/停止）</div>';
+    }
     $('bartip').textContent = '刷视频中…';
     switchTab('log');
     clearTimeout(timer);
@@ -2176,15 +2377,18 @@ function startCombo(ev){
     toast('先在「未完成任务点」里勾选要做的课程或章节', 'warn');
     return;
   }
+  const shut = !!($('sdafter') && $('sdafter').checked);
   fetch('/api/combo', {method:'POST', headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({only: keys, shutdown: !!($('sdafter') && $('sdafter').checked),
-                          rate: brateVal})}).then(r => {
+    body: JSON.stringify({only: keys, shutdown: shut, rate: brateVal})}).then(r => {
     if (r.status === 409){ toast('当前有任务在跑，等它结束再做', 'warn'); return; }
     if (!r.ok){ toast('任务没能启动（HTTP ' + r.status + '）', 'err'); return; }
     since = 0; logEl.innerHTML = '';
     setCardsShown(false); cardFp = '';
-    $('res').innerHTML = '<div class="empty">正在后台「刷课+刷题」…（先刷视频，'
-      + '再做作业并交卷；进度看「运行日志」，可以随时暂停/停止）</div>';
+    autoBack = !shut; brushLike = true;   // 同「刷视频」：要关机就别再挂一个全量查询
+    if (!shut){                           // 同上：不重跑查询就别留占位
+      $('res').innerHTML = '<div class="empty">正在后台「刷课+刷题」…（先刷视频，'
+        + '再做作业并交卷；进度看「运行日志」，可以随时暂停/停止）</div>';
+    }
     $('bartip').textContent = '刷课+刷题中…';
     switchTab('log');
     clearTimeout(timer);
@@ -2225,6 +2429,7 @@ function startAnswer(ev){
     if (!r.ok){ toast('答题没能启动（HTTP ' + r.status + '）', 'err'); return; }
     since = 0; logEl.innerHTML = '';
     setCardsShown(false); cardFp = '';
+    autoBack = true; brushLike = true;
     $('res').innerHTML = '<div class="empty">正在后台做作业并交卷…（进度看'
       + '「运行日志」；可以随时暂停/停止）</div>';
     $('bartip').textContent = '答题并交卷中…';
@@ -2249,6 +2454,7 @@ const AST = {
   report:     ['需人工 · 要传附件', 'warn'],
   unsupported:['需人工 · 题型不支持', 'warn'],
   unsolved:   ['需人工 · 模型没把握', 'warn'],
+  partial:    ['已暂存 · 待补完再交', 'warn'],
   skip:       ['已跳过', 'mut'],
 };
 
@@ -2256,7 +2462,8 @@ function renderAnswerResult(a){
   if (!a || !a.items) return;
   aitems = a.items;
   const uv = aitems.filter(it => it.status === 'unverified' || it.status === 'still');
-  const need = aitems.filter(it => ['report','unsupported','unsolved'].includes(it.status));
+  const need = aitems.filter(it =>
+    ['report','unsupported','unsolved','partial'].includes(it.status));
   const tags = [[aitems.length, '', '份']];
   if (uv.length) tags.push([uv.length, 'warn', '份待核实']);
   if (need.length) tags.push([need.length, 'warn', '份需人工']);
@@ -2437,6 +2644,135 @@ $('bllmclear').onclick = () => {
   }).catch(() => toast('连不上本地程序', 'err'));
 };
 
+// ---------- 视觉模型（可选） ----------
+// 与主模型完全独立的一套配置：地址 / 模型名 / Key 各存各的，互不覆盖。
+// 四项全空 = 不启用视觉，答题照旧走纯文本（与之前版本行为一致）。
+let visKeySet = false, visStateMask = '';
+
+function visForm(){
+  // vis_key 留空 = 不动已保存的那把（后端同样这样理解）
+  return {platform: $('vis_platform').value,
+          url: $('vis_url').value.trim(),
+          model: $('vis_model').value.trim(),
+          llm_key: $('vis_key').value.trim()};
+}
+
+function visSetState(kind, text){
+  const el = $('visstate');
+  el.className = 'mstat' + (kind ? ' ' + kind : '');
+  el.innerHTML = '<span class="ic">' + icon(kind === 'err' ? 'alert'
+                : kind === 'ok' ? 'check' : kind === 'warn' ? 'alert' : 'plug')
+                + '</span><span>' + esc(text) + '</span>';
+}
+
+function visRefreshState(){
+  const url = $('vis_url').value.trim(), model = $('vis_model').value.trim();
+  const typed = $('vis_key').value.trim();
+  const hasKey = !!typed || visKeySet;
+  const p = llmPlatformOf($('vis_platform').value);
+  // 「这家平台没有视觉型号」比通用的「还差模型名」具体得多，而且可行动。
+  // 必须在这里按状态派生，不能只在 onchange 里喊一句：onchange 末尾还要调
+  // 本函数，那一句会被下面的通用提示立刻盖掉 —— 实测选 DeepSeek 只看到
+  // 「还差模型名、API Key」，用户会去手填一个不存在的模型名。
+  const noVisModel = (p && p.url && !p.vision_model && !model);
+  if (!url && !model && !hasKey){
+    visSetState('', '未启用 —— 题面是图片 / 公式的题会答不上，其余题不受影响。');
+  } else if (url && model && hasKey){
+    visSetState('ok', '已配置 · ' + (p ? p.label : '自定义') + ' · ' + model
+      + (typed ? '（Key 待保存）' : ''));
+  } else if (noVisModel){
+    visSetState('warn', p.label + ' 目前没有视觉模型 —— 换一家'
+      + '（通义千问 / 智谱 / OpenAI），或自己把模型名填进去。');
+  } else {
+    const miss = [];
+    if (!url) miss.push('接口地址');
+    if (!model) miss.push('模型名');
+    if (!hasKey) miss.push('API Key');
+    visSetState('warn', '还差' + miss.join('、') + ' —— 三项都填上才生效。'
+      + '不想用就保持全空。');
+  }
+  $('vis_key').placeholder = visKeySet
+    ? ('已保存 ' + (visStateMask || '') + '　留空表示不改动')
+    : 'API Key（可以跟主模型用同一把）';
+}
+
+$('vis_platform').onchange = () => {
+  const p = llmPlatformOf($('vis_platform').value);
+  if (p && p.url){
+    $('vis_url').value = p.url;
+    $('vis_model').value = p.vision_model || '';
+  }
+  visRefreshState();      // 「这家没有视觉模型」的提示由它按当前状态派生
+};
+$('vis_url').oninput = visRefreshState;
+$('vis_model').oninput = visRefreshState;
+$('vis_key').oninput = visRefreshState;
+
+$('bvis').onclick = () => {
+  const b = $('bvis'), old = b.innerHTML;
+  b.disabled = true;
+  b.innerHTML = '<span class="ic">' + icon('check') + '</span>保存中…';
+  fetch('/api/llm-config', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({vision: visForm()})}).then(async r => {
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok){
+      visSetState('err', '保存失败：' + (j.error || ('HTTP ' + r.status)));
+      toast('视觉模型保存失败：' + (j.error || ('HTTP ' + r.status)), 'err');
+      return;
+    }
+    visKeySet = !!j.vision_key_set;
+    visStateMask = j.vision_key_mask || '';
+    $('vis_key').value = '';                 // 存好了就把明文从输入框里撤掉
+    visRefreshState();
+    toast('视觉模型设置已保存', 'ok');
+  }).catch(() => {
+    visSetState('err', '连不上本地程序，请确认那个黑色命令行窗口还在运行');
+    toast('连不上本地程序', 'err');
+  }).finally(() => {
+    b.disabled = false; b.innerHTML = old;
+  });
+};
+
+$('bvistest').onclick = () => {
+  const b = $('bvistest'), old = b.innerHTML;
+  b.disabled = true;
+  b.innerHTML = '<span class="ic">' + icon('bolt') + '</span>连接中…';
+  visSetState('', '正在连接…（最长约 30 秒）');
+  fetch('/api/llm-test', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({vision: true,
+                          llm_url: $('vis_url').value.trim(),
+                          llm_model: $('vis_model').value.trim(),
+                          llm_key: $('vis_key').value.trim()})}).then(async r => {
+    const j = await r.json().catch(() => ({}));
+    if (r.ok){
+      visSetState('ok', '连接正常，模型回了：' + (j.reply || '（空）'));
+      toast('视觉模型连接正常', 'ok');
+    } else {
+      visSetState('err', j.error || ('连接失败（HTTP ' + r.status + '）'));
+      toast('视觉模型连接失败：' + (j.error || ('HTTP ' + r.status)), 'err');
+    }
+  }).catch(() => {
+    visSetState('err', '连不上本地程序，请确认那个黑色命令行窗口还在运行');
+    toast('连不上本地程序', 'err');
+  }).finally(() => {
+    b.disabled = false; b.innerHTML = old;
+  });
+};
+
+$('bvisclear').onclick = () => {
+  if (!visKeySet && !$('vis_key').value.trim()){ toast('本来就没有保存过视觉模型的 Key', 'warn'); return; }
+  fetch('/api/llm-config', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({vision: {clear_key: true}})}).then(async r => {
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok){ toast('清除失败（HTTP ' + r.status + '）', 'err'); return; }
+    visKeySet = !!j.vision_key_set;
+    visStateMask = j.vision_key_mask || '';
+    $('vis_key').value = '';
+    visRefreshState();
+    toast('已清除本机保存的视觉模型 Key', 'ok');
+  }).catch(() => toast('连不上本地程序', 'err'));
+};
+
 // 打开页面就把已有配置带出来。**Key 不回显**：后端只给「有没有存」和脱敏串，
 // 页面上拿不到完整 Key（少一条泄露路径：截图求助、浏览器扩展抓 DOM 都拿不到）。
 fetch('/api/llm-config').then(r => r.json()).then(c => {
@@ -2451,6 +2787,23 @@ fetch('/api/llm-config').then(r => r.json()).then(c => {
   llmKeySet = !!c.key_set;
   llmStateMask = c.key_mask || '';
   llmRefreshState();
+  // 视觉模型（可选）：同一份平台列表，但默认模型名取该平台的视觉型号
+  const vsel = $('vis_platform');
+  vsel.innerHTML = llmPlatforms.map(p =>
+    '<option value="' + esc(p.key) + '"'
+    + (p.key === c.vision_platform ? ' selected' : '') + '>' + esc(p.label)
+    + '</option>').join('');
+  $('vis_url').value = c.vision_url || '';
+  $('vis_model').value = c.vision_model || '';
+  visKeySet = !!c.vision_key_set;
+  visStateMask = c.vision_key_mask || '';
+  visRefreshState();
+  // 配过就默认展开，省得用户以为「我明明填过」——收起时状态行也看得见，
+  // 但展开才能改
+  if (c.vision_ready || c.vision_url || c.vision_model){
+    const vb = document.querySelector('details.visbox');
+    if (vb) vb.open = true;
+  }
   if (c.brush_rate !== undefined && c.brush_rate !== null && c.brush_rate !== ''){
     brateVal = String(c.brush_rate);
     // 结果区可能已经按默认值画出了一个下拉：不同步它，下一次重绘的
@@ -2526,6 +2879,20 @@ document.querySelectorAll('.ic-in[data-for]').forEach(btn => {
     btn.innerHTML = icon(show ? 'eyeoff' : 'eye');
     inp.focus();
   };
+});
+// 「去完成」不再走系统默认浏览器（那边没有登录态），改请后端用
+// 工具自己的浏览器开——点开即已登录。失败时把原因告诉用户。
+document.addEventListener('click', function (ev) {
+  const a = ev.target && ev.target.closest
+    ? ev.target.closest('a.go-work') : null;
+  if (!a) return;
+  ev.preventDefault();
+  fetch('/api/open-work', {method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({url: a.getAttribute('href')})})
+    .then(r => r.json().then(j => ({ok: r.ok, j})))
+    .then(({ok, j}) => { if (!ok) alert(j.error || '打开失败'); })
+    .catch(() => alert('打开失败：后台服务未响应'));
 });
 $('bopen').onclick  = () => fetch('/api/open-report', {method:'POST'});
 $('bdir').onclick   = () => fetch('/api/open-dir', {method:'POST'});
@@ -2640,6 +3007,7 @@ class Handler(BaseHTTPRequestHandler):
         if u.path == '/api/llm-config':
             cfg = cs.load_config()
             key = cs.llm_key_of(cfg)
+            vkey = cs.llm_key_of(cfg, 'vision')
             payload = {
                 'llm_platform': (cfg.get('llm_platform')
                                  or cs.guess_llm_platform(cfg.get('llm_url'))),
@@ -2652,6 +3020,15 @@ class Handler(BaseHTTPRequestHandler):
                 'key_mask': cs.mask_key(key),
                 'ready': cs.llm_ready(cfg),
                 'platforms': cs.LLM_PLATFORMS,
+                # 视觉模型（可选）：与主模型分开存、分开验，四项全空 = 未启用。
+                'vision_platform': (cfg.get('llm_vision_platform')
+                                    or cs.guess_llm_platform(
+                                        cfg.get('llm_vision_url'))),
+                'vision_url': cfg.get('llm_vision_url') or '',
+                'vision_model': cfg.get('llm_vision_model') or '',
+                'vision_key_set': bool(vkey),
+                'vision_key_mask': cs.mask_key(vkey),
+                'vision_ready': cs.llm_vision_ready(cfg),
             }
             # 顺手把刷课倍速也带给前端（页面加载时回填下拉框的上次选择）
             payload['brush_rate'] = cfg.get('brush_rate', 1.25)
@@ -2661,7 +3038,8 @@ class Handler(BaseHTTPRequestHandler):
     # 解析请求体的 POST 接口：必须带 application/json 头。
     # HTML 表单发不出这个头 → 表单型 CSRF 无法伪造这些操作。
     _JSON_PATHS = ('/api/run', '/api/brush', '/api/answer', '/api/combo',
-                   '/api/answer-verify', '/api/llm-config', '/api/llm-test')
+                   '/api/answer-verify', '/api/llm-config', '/api/llm-test',
+                   '/api/open-work')
 
     def do_POST(self):
         if not self._local_only():
@@ -2754,6 +3132,28 @@ class Handler(BaseHTTPRequestHandler):
                    {'url': url, 'course': str(data.get('course') or ''),
                     'title': str(data.get('title') or '')})
             return self._send(200, b'{"ok":true}')
+        if u.path == '/api/open-work':
+            # 「去完成」免登录：用工具自己的浏览器（带登录态）打开作业页。
+            # 只放行超星 / 高校域名，防变成任意网址的跳板。
+            try:
+                data = json.loads(raw.decode('utf-8') or '{}')
+            except Exception:
+                data = {}
+            url = str(data.get('url') or '').strip()
+            host = urlparse(url).netloc.lower()
+            host_ok = (host == 'chaoxing.com' or host.endswith('.chaoxing.com')
+                       or host.endswith('.edu.cn'))
+            if (not url.lower().startswith(('http://', 'https://'))
+                    or not host_ok):
+                return self._send(400, json.dumps(
+                    {'error': '仅支持打开超星 / 高校域名的链接'}).encode('utf-8'))
+            with LOCK:
+                if STATE['running']:
+                    return self._send(409, json.dumps(
+                        {'error': '任务运行中，浏览器被占用，'
+                                  '等任务结束再点'}).encode('utf-8'))
+            _open_work_async(url)
+            return self._send(200, b'{"ok":true}')
         if u.path == '/api/combo':
             # 「刷课+刷题」：先刷选中范围的视频，再对同一批范围做作业并交卷。
             try:
@@ -2799,15 +3199,20 @@ class Handler(BaseHTTPRequestHandler):
             except Exception:
                 data = {}
             cfg = cs.load_config()
+            # 只把**这次真动过的字段**并进磁盘配置（patch_config），不整份回写：
+            # cfg 是刚读的没错，但整份写入会把别的线程这期间改过的东西一起盖掉
+            # （典型：查询 / 刷课任务线程手里那份旧配置落盘）。同 scan() 的教训。
+            patch = {}
             # 平台：预设平台只接受用户改过的那几项（地址默认用预设的）；
             # 自定义平台则地址与模型都听用户的。
             plat = str(data.get('llm_platform') or '').strip()
             if plat:
-                cfg['llm_platform'] = plat
+                patch['llm_platform'] = plat
             if 'url' in data:
-                cfg['llm_url'] = str(data.get('url') or '').strip()
+                patch['llm_url'] = str(data.get('url') or '').strip()
             if 'model' in data:
-                cfg['llm_model'] = str(data.get('model') or '').strip()
+                patch['llm_model'] = str(data.get('model') or '').strip()
+            cfg.update(patch)
             newkey = str(data.get('llm_key') or '').strip()
             # 地址当场规范化校验：填 base 或完整地址都行，错在这里就退回，
             # 别等答题跑到一半才发现地址拼错了（那时已经花掉时间和模型钱）
@@ -2819,14 +3224,46 @@ class Handler(BaseHTTPRequestHandler):
                         ensure_ascii=False).encode('utf-8'))
             if data.get('clear_key'):
                 cs.clear_llm_key()
-                cfg['llm_key'] = ''
+                patch['llm_key'] = ''
             elif newkey:
                 # 加密存成功 → 明文就不再落 config.json；加密不可用则留在原处兜底
                 if cs.save_llm_key(newkey):
-                    cfg['llm_key'] = ''
+                    patch['llm_key'] = ''
                 else:
-                    cfg['llm_key'] = newkey
-            cs.save_config(cfg)
+                    patch['llm_key'] = newkey
+            cfg.update(patch)
+            # ---- 视觉模型（可选）：字段独立成一节，与主模型互不影响 ----
+            # 界面只在动视觉那一块时才带 vision，所以保存主模型不会误清视觉配置。
+            vis = data.get('vision')
+            if isinstance(vis, dict):
+                vpatch = {}
+                vplat = str(vis.get('platform') or '').strip()
+                if vplat:
+                    vpatch['llm_vision_platform'] = vplat
+                if 'url' in vis:
+                    vpatch['llm_vision_url'] = str(vis.get('url') or '').strip()
+                if 'model' in vis:
+                    vpatch['llm_vision_model'] = str(vis.get('model') or '').strip()
+                patch.update(vpatch)
+                cfg.update(vpatch)
+                if (cfg.get('llm_vision_url') or '').strip():
+                    _vn, _verr = cs.normalize_llm_url(cfg['llm_vision_url'])
+                    if _verr:
+                        return self._send(400, json.dumps(
+                            {'error': '视觉模型接口地址有问题：' + _verr},
+                            ensure_ascii=False).encode('utf-8'))
+                vnew = str(vis.get('llm_key') or '').strip()
+                if vis.get('clear_key'):
+                    cs.clear_llm_key('vision')
+                    vpatch['llm_vision_key'] = ''
+                elif vnew:
+                    if cs.save_llm_key(vnew, 'vision'):
+                        vpatch['llm_vision_key'] = ''
+                    else:
+                        vpatch['llm_vision_key'] = vnew
+                patch.update(vpatch)
+                cfg.update(vpatch)
+            cs.patch_config(patch)
             # 写完必须回读确认。以前只写不查，「保存成功」的 toast 是
             # 假的：一旦写盘有竞态/权限问题，查询线程读不到 llm 键，
             # 刷作业就会提示「先配置大模型」（用户实测踩过）。
@@ -2843,14 +3280,28 @@ class Handler(BaseHTTPRequestHandler):
                 cs.log('⚠ 模型信息写入后回读校验未通过，请重试保存。', 'err')
                 return self._send(500, b'{"error":"save-verify-failed"}')
             key_now = cs.llm_key_of(back)
-            cs.log('模型设置已保存：%s ｜ %s ｜ Key %s'
-                   % (cs.llm_platform(back.get('llm_platform') or 'deepseek')['label'],
-                      back.get('llm_model') or '未填',
-                      ('已保存 ' + cs.mask_key(key_now)) if key_now else '未填'))
+            vkey_now = cs.llm_key_of(back, 'vision')
+            # 只在这次真的动了主模型字段时才打主模型那条日志：保存视觉模型时
+            # 也打一遍「模型设置已保存：DeepSeek…」会让人以为改错了东西。
+            if any(k in data for k in ('llm_platform', 'url', 'model',
+                                       'llm_key', 'clear_key')):
+                cs.log('模型设置已保存：%s ｜ %s ｜ Key %s'
+                       % (cs.llm_platform(
+                              back.get('llm_platform') or 'deepseek')['label'],
+                          back.get('llm_model') or '未填',
+                          ('已保存 ' + cs.mask_key(key_now)) if key_now else '未填'))
+            if (back.get('llm_vision_model') or '').strip():
+                cs.log('视觉模型已保存：%s ｜ Key %s'
+                       % (back.get('llm_vision_model'),
+                          ('已保存 ' + cs.mask_key(vkey_now)) if vkey_now else '未填'))
             return self._send(200, json.dumps(
                 {'ok': True, 'url': back.get('llm_url') or '',
                  'key_set': bool(key_now), 'key_mask': cs.mask_key(key_now),
-                 'ready': cs.llm_ready(back)},
+                 'ready': cs.llm_ready(back),
+                 'vision_url': back.get('llm_vision_url') or '',
+                 'vision_key_set': bool(vkey_now),
+                 'vision_key_mask': cs.mask_key(vkey_now),
+                 'vision_ready': cs.llm_vision_ready(back)},
                 ensure_ascii=False).encode('utf-8'))
         if u.path == '/api/llm-test':
             # 「测试连接」：拿界面**当前填的**模型信息真调一次 LLM（短问答）。
@@ -2860,22 +3311,35 @@ class Handler(BaseHTTPRequestHandler):
             except Exception:
                 data = {}
             tcfg = dict(cs.load_config())
-            for k in ('llm_url', 'llm_model'):
-                v = str(data.get(k) or '').strip()
-                if v:
-                    tcfg[k] = v
+            # 测视觉模型时把界面填的值写进 llm_vision_* 那一套字段，主模型那套
+            # 一个都不碰（两边的配置本就是独立的）。
+            vis = bool(data.get('vision'))
+            purpose = 'vision' if vis else 'main'
+            if vis:
+                for src, dst in (('llm_url', 'llm_vision_url'),
+                                 ('llm_model', 'llm_vision_model')):
+                    v = str(data.get(src) or '').strip()
+                    if v:
+                        tcfg[dst] = v
+            else:
+                for k in ('llm_url', 'llm_model'):
+                    v = str(data.get(k) or '').strip()
+                    if v:
+                        tcfg[k] = v
             # Key 的取值顺序：界面刚填的 → 已保存的（加密文件里那把）。
             # 这一路不写回 url/model，也不落盘：测试通过与否都不该改用户
             # 已存的模型设置。唯一例外是 llm_key_of 发现 config 里还留着
             # 老版本的明文 Key——那会顺手迁成加密存放（这是好事）。
             typed = str(data.get('llm_key') or '').strip()
-            tkey = typed or cs.llm_key_of(tcfg)
+            tkey = typed or cs.llm_key_of(tcfg, purpose)
+            uf = 'llm_vision_url' if vis else 'llm_url'
+            mf = 'llm_vision_model' if vis else 'llm_model'
             miss = []
-            if not (tcfg.get('llm_url') or '').strip():
+            if not (tcfg.get(uf) or '').strip():
                 miss.append('接口地址')
             if not tkey:
                 miss.append('API Key')
-            if not (tcfg.get('llm_model') or '').strip():
+            if not (tcfg.get(mf) or '').strip():
                 miss.append('模型名')
             if miss:
                 return self._send(400, json.dumps(
@@ -2885,14 +3349,16 @@ class Handler(BaseHTTPRequestHandler):
                 # timeout 给短值：连通测试只发「回复两个字」，12 秒足够，
                 # 也避免网络不通时用户对着按钮等太久（llm_chat 内部最多重试 3 次）
                 reply = cs.llm_chat(tcfg, '请只回复两个字：连通', timeout=12,
-                                    key=tkey)
-                cs.log('大模型连通验证通过（%s）：%s'
-                       % (tcfg['llm_model'], (reply or '')[:40]))
+                                    key=tkey, purpose=purpose)
+                cs.log('%s连通验证通过（%s）：%s'
+                       % ('视觉模型 ' if vis else '大模型',
+                          tcfg[mf], (reply or '')[:40]))
                 return self._send(200, json.dumps(
                     {'ok': True, 'reply': (reply or '')[:80]},
                     ensure_ascii=False).encode('utf-8'))
             except Exception as e:
-                cs.log('大模型连通验证失败：%s' % str(e)[:160], 'err')
+                cs.log('%s连通验证失败：%s'
+                       % ('视觉模型 ' if vis else '大模型', str(e)[:160]), 'err')
                 return self._send(502, json.dumps(
                     {'error': str(e)[:300]},
                     ensure_ascii=False).encode('utf-8'))
