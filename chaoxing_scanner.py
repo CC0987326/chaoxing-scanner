@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-学习通（超星）未完成事项巡检工具  v1.0
+学习通（超星）未完成事项巡检工具  v6.6
 ================================================================
 把「登录 → 逐门课翻作业/考试/任务点 → 汇总成清单」这套流程固化成本地程序。
 
@@ -11,9 +11,10 @@
     python chaoxing_scanner.py scan --limit 3 只扫前 3 门课（自检用）
     python chaoxing_scanner.py doctor         检查运行环境
     python chaoxing_scanner.py selftest       检测学习通是否改版（逐层验证解析规则）
-    python chaoxing_scanner.py gui            打开本地网页控制台
+    python chaoxing_scanner.py desktop        打开桌面窗口（默认入口）
+    python chaoxing_scanner.py gui            打开本地网页控制台（备用）
 
-依赖：playwright（浏览器驱动）、ddddocr（可选，用于自动过点选验证码）
+依赖：playwright（浏览器驱动）、pywebview（桌面窗口，v4.0 起）、ddddocr（可选，用于自动过点选验证码）
 本工具只读取数据，不会提交任何作业、不会修改任何课程内容。
 """
 from __future__ import annotations
@@ -25,6 +26,7 @@ import os
 import random
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import threading
@@ -35,6 +37,14 @@ from datetime import datetime
 from pathlib import Path
 
 # ---------------------------------------------------------------- 控制台编码
+# pythonw（无控制台启动，v4.0 桌面端启动器走它）下 stdout/stderr 是
+# None：log() 里一个 print 就会把整个程序炸掉。先兜底成空设备。
+for _n in ('stdout', 'stderr'):
+    if getattr(sys, _n) is None:
+        try:
+            setattr(sys, _n, open(os.devnull, 'w', encoding='utf-8'))
+        except Exception:
+            pass
 for _s in (sys.stdout, sys.stderr):
     try:
         _s.reconfigure(encoding='utf-8')  # type: ignore[union-attr]
@@ -77,7 +87,7 @@ EXAM_LIST = ('https://mooc1.chaoxing.com/exam-ans/mooc2/exam/exam-list'
 LOGIN_URL = 'https://passport2.chaoxing.com/login?fid=12'
 
 # 版本号：界面侧栏、启动日志、使用说明都引它，别再各处手写一份
-VERSION = 'v3.9.6'
+VERSION = 'v6.6'
 
 # 平台自身算「已完成」的状态；除此之外都视为未完成
 DONE_STATES = ('已完成', '已互评', '待批阅', '已提交', '待互评', '已结束', '已过期')
@@ -199,11 +209,49 @@ def keep_awake(on: bool):
 _CONFIG_LOCK = threading.RLock()
 
 
+# 手改 config 时数值字段很容易写成字符串 / 负数 / 天文数字。不归一的话，
+# "page_wait": "3" 会让 int("3"*1000) 得到 10^999 —— 页面渲染不出时
+# _poll 永不退出，且循环里没有检查点，界面上的「停止」也停不掉
+# （v4.0 二审发现）。在这里统一归一 + 夹回合理区间。
+_CFG_NUM = {
+    # 键: (类型, 默认值, 下限, 上限)
+    'page_wait': (float, 3.0, 0.0, 120.0),
+    'course_delay': (float, 3.0, 0.0, 60.0),
+    'max_courses': (int, 0, 0, 999),
+    'brush_rate': (float, 1.25, 0.5, 4.0),
+    'brush_rest_every': (int, 6, 0, 100),
+    'brush_rest_seconds': (int, 30, 0, 600),
+    'brush_retry': (int, 1, 0, 5),
+    'save_every': (int, 5, 1, 50),
+    'submit_verify_window': (int, 30, 10, 600),
+    'submit_recheck_times': (int, 3, 1, 10),
+    'submit_recheck_interval': (int, 10, 3, 300),
+}
+
+
+def _norm_cfg(cfg):
+    """数值字段归一：类型不对回落默认，合法但越界夹回区间。"""
+    for k, (cast, dft, lo, hi) in _CFG_NUM.items():
+        v = cfg.get(k, dft)
+        try:
+            v = float(v)
+        except (TypeError, ValueError):
+            v = dft
+        # float(v) 可能溢出成 inf（手改 config 写成超长数字串，如 '9'*400），
+        # 再 cast 成 int 就是 OverflowError —— 它一路冒到 main() 之外，
+        # **整个程序起不来**（双击桌面端即闪退）。非有限值（inf/nan）无法夹取，
+        # 一律回落默认值，与「类型不对」同款处置。
+        if v != v or v in (float('inf'), float('-inf')):
+            v = dft
+        cfg[k] = max(lo, min(hi, cast(v)))
+    return cfg
+
+
 def load_config() -> dict:
     cfg = dict(DEFAULT_CONFIG)
     if not CONFIG_FILE.exists():
         save_config(cfg)
-        return cfg
+        return _norm_cfg(cfg)
     # 读文件先容忍「瞬时不可读」：Windows 上 os.replace 进行中时，
     # 并发读方会拿到 PermissionError（Python 开文件不带 FILE_SHARE_DELETE）。
     # 这种情况重试就行；当成解析失败会把好端端的 config 归档成 .bad。
@@ -222,7 +270,7 @@ def load_config() -> dict:
         if perm_err:
             log('config.json 暂时不可读（正在被并发写入？），'
                 '本次先用默认值：%s' % perm_err, 'warn')
-        return cfg
+        return _norm_cfg(cfg)
     try:
         cfg.update(json.loads(txt))
     except Exception as e:
@@ -237,7 +285,7 @@ def load_config() -> dict:
                 '用默认值继续。' % (e, bak.name), 'warn')
         except Exception:
             log('配置文件解析失败，用默认值：%s' % e, 'warn')
-    return cfg
+    return _norm_cfg(cfg)
 
 
 def save_config(cfg: dict):
@@ -302,20 +350,36 @@ CFT_INDEX = ('https://googlechromelabs.github.io/chrome-for-testing/'
 
 
 def _chrome_candidates(cfg):
-    """按优先级列出候选内核路径"""
+    """按优先级列出候选内核路径。
+
+    v4.2 起**不再自带内核**（交付包瘦掉 ~190MB）。分享到别人机器上时靠
+    系统已装的浏览器顶上：Windows 10/11 预装 Edge（必定命中），有 Chrome
+    更佳。包内 / 开发缓存那几个路径保留在最前，只为兼容仍在用旧包的人
+    与开发机测试——干净机器上它们都不存在，会自然落到系统浏览器路径，
+    于是 doctor 能报出内核、launch 也无需下载。顺序上「包内优先」对
+    开发机零冲击（测试内核不变），分发时又必然落到系统浏览器。
+    """
     named = []
     if cfg.get('chrome_path'):
         named.append(Path(cfg['chrome_path']))
     named += [
-        # 免安装包内自带内核（包根/chrome/chrome-win64/chrome.exe）
+        # 免安装包内自带内核（旧包兼容；新包已移除 chrome/）
         HERE.parent / 'chrome' / 'chrome-win64' / 'chrome.exe',
         HERE / 'chrome' / 'chrome-win64' / 'chrome.exe',
         CHROME_DIR / 'chrome-win64' / 'chrome.exe',
         CHROME_DIR / 'chrome.exe',
         Path.home() / '.workbuddy' / 'tmp' / 'browser' / 'chrome-win64' / 'chrome.exe',
+        # 系统已装浏览器（分发到别人机器时的主力）
         Path(os.environ.get('LOCALAPPDATA', 'C:/')) / 'Google/Chrome/Application/chrome.exe',
         Path('C:/Program Files/Google/Chrome/Application/chrome.exe'),
         Path('C:/Program Files (x86)/Google/Chrome/Application/chrome.exe'),
+        # 系统 Edge：Win10/11 预装，几乎必定命中
+        Path(os.environ.get('PROGRAMFILES', 'C:/Program Files'))
+        / 'Microsoft/Edge/Application/msedge.exe',
+        Path(os.environ.get('PROGRAMFILES(X86)', 'C:/Program Files (x86)'))
+        / 'Microsoft/Edge/Application/msedge.exe',
+        Path(os.environ.get('LOCALAPPDATA', 'C:/'))
+        / 'Microsoft/Edge/Application/msedge.exe',
     ]
     for p in named:
         try:
@@ -326,11 +390,48 @@ def _chrome_candidates(cfg):
     return None
 
 
+def _resolve_channel_exe(channel):
+    """把 Playwright 的 channel 名解析成真实 exe 路径（拿版本号用）。
+
+    launch 走 `channel='msedge'` 时，候选顺序里的路径可能压根不是 Edge
+    （甚至为空），`_exe_version(<channel 名>)` 读不到版本资源 → UA 里会
+    退成一个假版本号，和真实内核版本对不上。这里按 channel 找它对应的
+    系统 exe，让 UA 版本号落到真实值。找不到就返回 None（fake_user_agent
+    自会退回默认主版本）。
+    """
+    name = str(channel or '').lower()
+    if 'edge' in name:
+        cands = [
+            Path(os.environ.get('PROGRAMFILES(X86)', 'C:/Program Files (x86)'))
+            / 'Microsoft/Edge/Application/msedge.exe',
+            Path(os.environ.get('PROGRAMFILES', 'C:/Program Files'))
+            / 'Microsoft/Edge/Application/msedge.exe',
+            Path(os.environ.get('LOCALAPPDATA', 'C:/'))
+            / 'Microsoft/Edge/Application/msedge.exe',
+        ]
+    elif 'chrome' in name:
+        cands = [
+            Path(os.environ.get('LOCALAPPDATA', 'C:/'))
+            / 'Google/Chrome/Application/chrome.exe',
+            Path('C:/Program Files/Google/Chrome/Application/chrome.exe'),
+            Path('C:/Program Files (x86)/Google/Chrome/Application/chrome.exe'),
+        ]
+    else:
+        return None
+    for p in cands:
+        try:
+            if p.exists():
+                return p
+        except Exception:
+            continue
+    return None
+
+
 def download_chrome() -> Path:
     """自动下载 Chrome for Testing（约 150MB，只在首次运行时做一次）"""
     RUNTIME.mkdir(parents=True, exist_ok=True)
     CHROME_DIR.mkdir(parents=True, exist_ok=True)
-    banner('首次运行：下载浏览器内核 Chrome for Testing')
+    banner('本机没找到系统 Edge/Chrome：下载独立内核 Chrome for Testing')
     log('这一步只需做一次，之后内核会留在 runtime/chrome 里复用。')
     req = urllib.request.Request(CFT_INDEX, headers={'User-Agent': 'Mozilla/5.0'})
     meta = json.loads(urllib.request.urlopen(req, timeout=60).read().decode('utf-8'))
@@ -427,74 +528,45 @@ def _exe_version(path) -> str:
 
 
 def fake_user_agent(cfg, exe=None) -> str:
-    """把 UA 里的 HeadlessChrome 换成正常 Chrome，降低被风控识别的概率"""
+    """按真实内核如实生成 UA，只在它暴露「自动化/无头」时才抹平。
+
+    旧版一律套「Chrome/<版本>」假 UA：在自带 Chrome 内核上没问题，但
+    v4.2 分发改为用**系统 Edge** 顶内核后就成了自相矛盾——UA 说自己是
+    Chrome，内核处处是 Edge 特征（`Edg/` 标志、Edge 私有行为、JS 可见的
+    navigator.userAgentData），比不伪装更扎眼。
+
+    所以：**忠实报告真实内核**。内核是 Edge 就带 `Edg/<版本>`，是 Chrome
+    就带 `Chrome/<版本>`；版本号取自 exe 的真实版本资源（`_exe_version`），
+    于是每台机器的 UA 天然不同（这本身就是比「所有人同一个假 Chrome UA」
+    更强的反聚类）。仅当 headless 把 `HeadlessChrome` 写进 UA 时才替换成
+    正常 Chrome——那种「无头」记号是真正需要抹掉的自动化特征。
+    用户手填了 UA 则以其为准（沿用旧行为）。
+    """
     if cfg.get('user_agent'):
         return cfg['user_agent']
     ver = _exe_version(exe) if exe else ''
     major = (ver.split('.')[0] if ver else '') or '131'
-    return ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
-            '(KHTML, like Gecko) Chrome/%s.0.0.0 Safari/537.36' % major)
+    base = ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+            '(KHTML, like Gecko) ')
+    is_edge = bool(exe) and 'edge' in str(exe).lower()
+    tail = 'Edg/%s.0.0.0' % major if is_edge else 'Chrome/%s.0.0.0' % major
+    return base + tail + ' Safari/537.36'
 
 
 
 # ================================================================ 浏览器会话
-def launch(cfg, headless=None, offscreen=False, auto_download=True):
-    """启动浏览器，返回 BrowserContext（带独立配置目录，登录态可持久化）"""
-    from playwright.sync_api import sync_playwright  # noqa
+# 桌面模式旗标：webui.serve_desktop 启动时置 True。置位后所有浏览器一律
+# 屏幕外启动（--window-position=-32000,-32000），由守夜线程直接从屏外
+# 入坞进「预览」页签——否则有头窗口会先在桌面正中闪一下、再被入坞/
+# 最小化收走（真机 2026-10-10「点查询弹个窗口又秒没」）。网页模式保持
+# False，行为同 v3.9：窗口可见，登录确认后 _quiet_win / brush_minimize
+# 收进任务栏。
+OFFSCREEN_LAUNCH = False
 
-    if auto_download and _chrome_candidates(cfg) is None:
-        try:
-            download_chrome()
-        except Exception as e:
-            log('自动下载失败（将尝试使用系统已装的 Chrome）：%s' % e, 'warn')
-
-    hl = cfg.get('headless', False) if headless is None else headless
-    args = [
-        '--no-sandbox',
-        '--disable-dev-shm-usage',
-        '--disable-blink-features=AutomationControlled',
-        '--disable-features=Translate,BackForwardCache',
-        '--no-first-run',
-        '--no-default-browser-check',
-        # 刷课时窗口会最小化到任务栏（brush_minimize，默认开）：这三个开关
-        # 保证最小化/被遮挡后计时器与播放不被 Chromium 后台节流，心跳照常
-        '--disable-background-timer-throttling',
-        '--disable-backgrounding-occluded-windows',
-        '--disable-renderer-backgrounding',
-    ]
-    if offscreen:
-        args += ['--window-position=-32000,-32000', '--window-size=1440,900']
-
-    PROFILE_DIR.mkdir(parents=True, exist_ok=True)
-    # viewport 每次启动随机抽一个常见分辨率：固定 1440x900 会让「同一工具
-    # 的所有账号」在平台侧呈现一模一样的画布尺寸，反而方便划成同一团伙
-    vw, vh = random.choice([(1440, 900), (1536, 864), (1366, 768),
-                            (1600, 900), (1920, 969)])
-    ua = fake_user_agent(cfg, _chrome_candidates(cfg))
-    errors = []
-    pw = sync_playwright().start()
-    for kind, val in browser_attempts(cfg):
-        opts = dict(
-            user_data_dir=str(PROFILE_DIR),
-            headless=hl,
-            args=args,
-            viewport={'width': vw, 'height': vh},
-            locale='zh-CN',
-            timezone_id='Asia/Shanghai',
-            ignore_https_errors=True,
-            user_agent=ua,
-        )
-        if kind == 'exe':
-            opts['executable_path'] = val
-        else:
-            opts['channel'] = val
-        try:
-            ctx = pw.chromium.launch_persistent_context(**opts)
-            ctx.set_default_timeout(30000)
-            # 抹掉最容易被风控识别的自动化特征。补丁对每个 frame 生效；
-            # 全部是「与真实浏览器对齐」的防御性补丁，缺什么补什么，
-            # 真实值存在时不动（伪装成固定值反而克隆化）。
-            ctx.add_init_script(r"""
+# 反检测补丁：抹掉最容易被风控识别的自动化特征。全部是「与真实浏览器对齐」
+# 的防御性补丁，缺什么补什么，真实值存在时不动（伪装成固定值反而克隆化）。
+# v4.3 起由 launch() 挂在**共享上下文**上，对每个新页面生效。
+_STEALTH_JS = r"""
 Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
 // window.chrome.runtime：部分检测脚本查它在不在；真实 Chrome 自带，
 // 只在缺失时补一个无功能的占位，headful 下基本是 no-op
@@ -519,20 +591,358 @@ try {
         : _q(p));
   }
 } catch (e) {}
-""")
-            log('浏览器已启动（%s%s，%s）' % (
-                '无头' if hl else '有窗口', '·屏幕外' if offscreen else '',
-                Path(val).name if kind == 'exe' else val))
-            ctx._wb_pw = pw  # 方便一起关闭
+"""
+
+# ---- 全局常驻浏览器进程（v4.3）-----------------------------------------
+# 全进程只跑**一个** chrome 进程，独占 PROFILE_DIR。任务/登录/作业窗口都通过
+# connect_over_cdp 连它、各开自己的 page。这样：
+#   · profile 由这唯一进程独占 → 结构上消灭「多任务抢 profile」的真机根因；
+#   · 不再每任务冷启动一整只浏览器 → 内存/耗时都降。
+# 进程一旦起来就常驻（进程死了下次 launch 会重启它）。
+_BROWSER = {'proc': None, 'port': None, 'hl': None, 'offscreen': None}
+_BROWSER_LOCK = threading.Lock()      # 只护「确保进程在跑」这一段
+
+# 每线程缓存自己的 (playwright, browser, context)。Playwright sync API 必须在
+# 创建它的线程里调用；launch() 在哪个线程调就在该线程 connect，同线程复用。
+# 约定：ctx 不跨线程传递。
+_TLS = threading.local()
+
+# 共享上下文对象（进程内唯一，多个线程的 CDP 连接都指向它）。反检测补丁是
+# 上下文级的，只需装一次；用 ctx 对象身份去重。
+_LAUNCH_CTX = {'ctx': None}
+
+# 网页模式画布指纹随机化的候选分辨率（见 launch 里 offscreen 分支）。
+_VIEWPORTS = [(1440, 900), (1536, 864), (1366, 768), (1600, 900), (1920, 969)]
+
+
+def browser_proc_pid():
+    """常驻浏览器**主进程** PID（入坞线程据此只认工具自己的窗口）。
+
+    用户自己开的 Edge/Chrome 与工具浏览器窗口类名同为 Chrome_WidgetWin_1，
+    但属主进程 PID 不同——按 PID 一刀切能精确区分（真机探针实测：工具窗口
+    pid == 常驻浏览器主进程 pid，外来浏览器 pid 不同）。没起来返回 None。
+    """
+    proc = _BROWSER.get('proc')
+    return proc.pid if proc is not None and proc.poll() is None else None
+
+
+def _free_port():
+    s = socket.socket()
+    s.bind(('127.0.0.1', 0))
+    port = s.getsockname()[1]
+    s.close()
+    return port
+
+
+def _wait_devtools(port, deadline):
+    url = 'http://127.0.0.1:%d/json/version' % port
+    while time.time() < deadline:
+        try:
+            with urllib.request.urlopen(url, timeout=1) as r:
+                if json.loads(r.read().decode('utf-8')).get('webSocketDebuggerUrl'):
+                    return True
+        except Exception:
+            pass
+        time.sleep(0.25)
+    return False
+
+
+def _profile_locked():
+    """profile 目录是否已被某个 chrome 实例占着。
+
+    Windows 版 Chromium 不落 SingletonLock 文件（那是 Linux 的做法），真正的
+    保护是「有活着的进程持有 --user-data-dir=PROFILE_DIR」——见 _start_browser_process
+    里的「进程秒退 = profile 被别的实例占着」判据。保留本函数仅为诊断打印。
+    """
+    try:
+        return (PROFILE_DIR / 'SingletonLock').exists() or _BROWSER['proc'] is not None
+    except Exception:
+        return _BROWSER['proc'] is not None
+
+
+def _browser_argv(exe, port, hl, offscreen, ua):
+    argv = [str(exe), '--remote-debugging-port=%d' % port,
+            '--user-data-dir=%s' % PROFILE_DIR]
+    argv += [
+        '--no-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-blink-features=AutomationControlled',
+        '--disable-features=Translate,BackForwardCache',
+        '--no-first-run',
+        '--no-default-browser-check',
+        # 刷课时窗口会最小化到任务栏（brush_minimize，默认开）：这三个开关
+        # 保证最小化/被遮挡后计时器与播放不被 Chromium 后台节流，心跳照常
+        '--disable-background-timer-throttling',
+        '--disable-backgrounding-occluded-windows',
+        '--disable-renderer-backgrounding',
+        # 非 Playwright 启动的浏览器要靠命令行自报：据实内核的 UA（抹掉
+        # HeadlessChrome 记号）+ 中文语言，与旧 launch 的 locale/user_agent 对齐。
+        '--user-agent=%s' % ua,
+        '--lang=zh-CN',
+        '--accept-lang=zh-CN,zh;q=0.9',
+    ]
+    if offscreen:
+        argv += ['--window-position=-32000,-32000', '--window-size=1440,900']
+    if hl:
+        argv += ['--headless=new']
+    return argv
+
+
+def _kill_tree(proc):
+    """杀掉 proc **及其整棵子进程树**，并等它退干净（收不掉就强杀）。
+
+    chromium 的 renderer/gpu/utility 子进程同样带 `--user-data-dir=PROFILE_DIR`
+    ——只杀主进程的话它们还攥着 profile 目录，紧接着对同一个目录的**启动/改名/
+    删除**都会撞 Windows 占用错误（真机 WinError 183 / 审查发现 WinError 5 的
+    共同病根）。凡是要放掉 profile 的场合（换号归档、候选重试）都走这里。
+    """
+    if proc is None:
+        return
+    try:
+        subprocess.run(['taskkill', '/F', '/T', '/PID', str(proc.pid)],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                       timeout=15)
+    except Exception:
+        pass
+    try:
+        proc.wait(timeout=10)
+    except Exception:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+
+
+def _start_browser_process(cfg, hl, offscreen):
+    """起常驻 chrome 进程（逐候选试），成功就登记到 _BROWSER。"""
+    exe = _chrome_candidates(cfg)
+    attempts = []
+    if exe:
+        attempts.append(('exe', str(exe)))
+    attempts += [('channel', 'chrome'), ('channel', 'msedge')]
+    errors = []
+    for kind, val in attempts:
+        if kind == 'exe':
+            real = Path(val)
+        else:
+            real = _resolve_channel_exe(val)
+            if not real:
+                errors.append('%s（未安装）' % val)
+                continue
+        # UA 按**这一次真用的内核**算：channel 名解析回真实 exe 是为了拿真实
+        # 版本号（否则 UA 版本对不上内核）。
+        ua = fake_user_agent(cfg, real)
+        port = _free_port()
+        try:
+            proc = subprocess.Popen(
+                _browser_argv(real, port, hl, offscreen, ua),
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception as e:
+            errors.append('%s(%s) → %s' % (kind, real.name, str(e)[:80]))
+            continue
+        ok = _wait_devtools(port, time.time() + 25)
+        # 若另一个实例已占着 profile：新进程会把参数转交给它、自己秒退，
+        # 而端口其实是那个既有实例在听。这里必须确认「这个端口确实是刚起的
+        # 进程在服务」，否则后续会连到别人的浏览器上。
+        if ok and proc.poll() is not None:
+            _kill_tree(proc)          # 连子进程收干净，别让它们占着 profile 拖累下一候选
+            errors.append('%s(%s) → 进程秒退（profile 可能被别的实例占着）'
+                          % (kind, real.name))
+            continue
+        if not ok:
+            _kill_tree(proc)
+            errors.append('%s(%s) → DevTools 未就绪' % (kind, real.name))
+            continue
+        _BROWSER['proc'], _BROWSER['port'] = proc, port
+        _BROWSER['hl'], _BROWSER['offscreen'] = hl, offscreen
+        log('常驻浏览器已启动（%s%s，%s）' % (
+            '无头' if hl else '有窗口', '·屏幕外' if offscreen else '',
+            real.name))
+        return
+    raise RuntimeError('所有浏览器内核都无法启动：\n    ' + '\n    '.join(errors))
+
+
+def ensure_browser(cfg, hl, offscreen):
+    """幂等：确保常驻 chrome 进程在跑。进程活着就直接返回。"""
+    proc = _BROWSER['proc']
+    if proc is not None and proc.poll() is None:
+        return
+    with _BROWSER_LOCK:
+        proc = _BROWSER['proc']
+        if proc is not None and proc.poll() is None:
+            return
+        PROFILE_DIR.mkdir(parents=True, exist_ok=True)
+        _start_browser_process(cfg, hl, offscreen)
+
+
+def browser_mode():
+    """返回当前常驻浏览器的 (headless, offscreen)（没起来则为 (None, None)）。"""
+    return _BROWSER['hl'], _BROWSER['offscreen']
+
+
+def browser_port():
+    return _BROWSER['port']
+
+
+def stop_browser():
+    """关掉常驻浏览器进程**及其整棵子进程树**（退出/换号归档 profile 时用）。
+
+    必须连子进程一起收：chromium 的 renderer/gpu/utility 子进程同样带
+    `--user-data-dir=PROFILE_DIR`，只杀主进程的话它们还攥着 profile 目录，
+    紧接着 fresh_profile 的改名就撞 WinError 5（拒绝访问）——真机那个
+    WinError 183 与之一脉相承（句柄没放）。/T 杀整棵树，等它们真退干净
+    再返回（taskkill /F 之后仍可能滞后释放，故 fresh/restore 端另有重试）。
+    """
+    proc = _BROWSER['proc']
+    _BROWSER['proc'], _BROWSER['port'] = None, None
+    _kill_tree(proc)
+
+
+def _drop_tls():
+    """丢弃本线程缓存的 (pw, br, ctx)：收掉本线程的 playwright 实例。
+
+    与 close_ctx 的分工：close_ctx 会**先关本线程开的页面**再收实例；这里
+    用在「进程已换、旧连接与旧页面随之失效」的场合，只需让本线程的
+    sync_playwright 实例干净退场——**不**去碰可能已死的连接/页面。
+
+    为什么必须 pw.stop()：Playwright sync API 的实例把 asyncio 事件循环挂在
+    **本线程**，不收掉就以挂起态留着，紧接着的 sync_playwright().start() 会报
+    「It looks like you are using Playwright Sync API inside the asyncio loop」。
+    v4.3 登录换罐正是这条路径：launch → stop_browser → fresh_profile → launch。
+    """
+    pw = getattr(_TLS, 'pw', None)
+    if pw is not None:
+        try:
+            pw.stop()
+        except Exception:
+            pass
+    _TLS.ctx = None
+    _TLS.br = None
+    _TLS.pw = None
+    _TLS.pages = set()
+
+
+def launch(cfg, headless=None, offscreen=None, auto_download=True):
+    """确保全局常驻浏览器在跑，返回**本线程**连上去的 BrowserContext。
+
+    v4.3 起改成「单进程 + 每线程 CDP 连接」：全进程只跑一个 chrome 进程
+    （独占 profile），本函数负责确保它起着，并让调用线程 connect_over_cdp
+    拿到共享上下文。返回的 context 接口与旧的 launch_persistent_context
+    一致（new_page / add_cookies / clear_cookies / storage_state /
+    set_default_timeout / add_init_script 都可用），调用方基本不用改。
+
+    与旧行为的差异：
+      · 浏览器**不再**在本函数返回时关闭——它是常驻的；收尾只关本线程的
+        page 与连接（见 close_ctx）。
+      · 首次调用决定 headless/offscreen，后续调用沿用（同一进程只能是一个
+        形态），请求不一致时忽略并记一条 warn。
+
+    offscreen=None（默认）= 跟随 OFFSCREEN_LAUNCH 旗标（桌面模式为 True）。
+    """
+    from playwright.sync_api import sync_playwright  # noqa
+
+    if offscreen is None:
+        offscreen = OFFSCREEN_LAUNCH
+    hl = cfg.get('headless', False) if headless is None else headless
+
+    if auto_download and _chrome_candidates(cfg) is None:
+        try:
+            download_chrome()
+        except Exception as e:
+            log('自动下载失败（将尝试使用系统已装的 Chrome）：%s' % e, 'warn')
+
+    ensure_browser(cfg, hl, offscreen)
+    cur_hl, cur_off = _BROWSER['hl'], _BROWSER['offscreen']
+    if (cur_hl, cur_off) != (hl, offscreen):
+        # 常驻浏览器同一时刻只能是一种形态。请求变了就重启成请求的形态——
+        # profile 不变、账号不掉，只是换一只进程。绝不「硬用错形态」：那会把
+        # 需要看见的登录窗口变成无头（用户没法扫码/输验证码）。
+        log('浏览器形态切换为%s，重启常驻浏览器 …'
+            % ('无头' if hl else ('屏幕外有窗口' if offscreen else '有窗口')),
+            'warn')
+        stop_browser()
+        ensure_browser(cfg, hl, offscreen)
+
+    if getattr(_TLS, 'ctx', None) is not None:
+        # 进程可能被别的线程换号时停掉重启过（pid 变了）——旧 _TLS.ctx 会指向
+        # 一个已死进程的连接，必须丢弃重连。pid 相同才复用。
+        cur_pid = _BROWSER['proc'].pid if _BROWSER['proc'] else None
+        if getattr(_TLS.ctx, '_wb_pid', None) == cur_pid:
+            return _TLS.ctx
+        # 丢弃旧连接时**必须收掉本线程的 playwright 实例**（_drop_tls 里的
+        # pw.stop()）——否则它的事件循环以挂起态留在本线程，紧接着的
+        # sync_playwright().start() 会报「Playwright Sync API inside the
+        # asyncio loop」。登录换罐（stop_browser → fresh_profile → launch）
+        # 必走这里，就是真机「查不到东西」的那条错。
+        _drop_tls()
+    if _BROWSER['port'] is None:
+        raise RuntimeError('常驻浏览器未能启动')
+
+    pw = sync_playwright().start()
+    last = None
+    for attempt in range(2):
+        endpoint = 'http://127.0.0.1:%d' % _BROWSER['port']
+        try:
+            br = pw.chromium.connect_over_cdp(endpoint)
+            ctx = br.contexts[0] if br.contexts else br.new_context()
+            ctx.set_default_timeout(30000)
+            # 反检测补丁只装**一次**：init script 是**上下文级**的，每个线程都
+            # 装会把同一段补丁堆 N 份（无害但脏）。用 ctx id 去重（CDP 连到同一个
+            # 浏览器时 id 一致——本机实测两个连接拿到同样的 id；万一对不上最坏
+            # 只是多装几次）。
+            if _LAUNCH_CTX.get('ctx') is not ctx:
+                try:
+                    ctx.add_init_script(_STEALTH_JS)
+                except Exception:
+                    pass
+                _LAUNCH_CTX['ctx'] = ctx
+            ctx._wb_pw = pw        # 本线程的 playwright 实例（close_ctx 收尾用）
+            ctx._wb_br = br        # 本线程的 CDP 连接（close_ctx 只断连接，不关进程）
+            ctx._wb_pid = _BROWSER['proc'].pid if _BROWSER['proc'] else None
+            # 每线程记录「自己经这个共享 ctx 开的页面」。close_ctx 只能关这些，
+            # **绝不能**关共享上下文里的全部页面——否则作业窗口线程一收尾就把
+            # 并发任务的页面一起关了。new_page 只包一次（挂 ctx._wb_new_page 记住
+            # 原方法），包装体在**调用时**读 _TLS 与当前浏览器形态，所以不同线程
+            # 各记各的、形态切换也立刻生效（不能把形态缓存进闭包）。
+            _TLS.pages = set()
+            if not hasattr(ctx, '_wb_new_page'):
+                ctx._wb_new_page = ctx.new_page
+
+                def _recorded_new_page(*a, **k):
+                    p = ctx._wb_new_page(*a, **k)
+                    try:
+                        _TLS.pages.add(p)
+                    except Exception:
+                        pass
+                    if not _BROWSER.get('offscreen'):
+                        # 网页模式（非桌面）：给这个新页面钉一个随机常见分辨率做
+                        # 画布指纹随机化——固定 1440x900 会让同一工具的所有账号
+                        # 在平台侧呈同一画布尺寸，方便被划成同一团伙。桌面模式不
+                        # 钉（窗口被 SetParent 嵌进「预览」面板，画布必须跟随面板
+                        # 回流，否则右边/下边被裁）。
+                        try:
+                            _w, _h = random.choice(_VIEWPORTS)
+                            p.set_viewport_size({'width': _w, 'height': _h})
+                        except Exception:
+                            pass
+                    return p
+
+                try:
+                    ctx.new_page = _recorded_new_page
+                except Exception:
+                    pass
+            _TLS.pw, _TLS.br, _TLS.ctx = pw, br, ctx
             return ctx
         except Exception as e:
-            first = str(e).strip().splitlines()[0][:150] if str(e).strip() else e.__class__.__name__
-            errors.append('%s(%s) → %s' % (kind, val, first))
+            last = e
+            # 端口可能因进程重启而变；重确保一次再试
+            ensure_browser(cfg, hl, offscreen)
+            time.sleep(0.5)
     try:
         pw.stop()
     except Exception:
         pass
-    raise RuntimeError('所有浏览器内核都无法启动：\n    ' + '\n    '.join(errors))
+    raise RuntimeError('连接常驻浏览器失败：%s' % last)
 
 
 def minimize_window(page):
@@ -552,19 +962,54 @@ def minimize_window(page):
         return False
 
 
+def _quiet_win(page, cfg, headless):
+    """非登录阶段把浏览器窗口收进任务栏（v4.0）。
+
+    登录/验证码阶段必须可见，所以一律在**登录确认之后**调。刷课那条路径
+    早就有同样的动作（brush_minimize），这里把查询、答题、交卷也一并收拢
+    —— 否则桌面上一个原生应用窗口 + 一个全屏浏览器，屏幕照样被占着，
+    桌面上线也就失去意义了。
+    无头模式没有窗口，直接返回（不去白拿一条「最小化失败」的 warn 日志）。
+    """
+    if OFFSCREEN_LAUNCH:
+        # 桌面模式：可见性归守夜入坞线程管。窗口要么已入坞（预览面板
+        # 开着就显示），要么屏外待坞——最小化会把已入坞的预览藏掉
+        # （ShowWindow SW_SHOWNA 救不回最小化的子窗口）。
+        return False
+    if headless is True or cfg.get('headless'):
+        return False
+    if not cfg.get('brush_minimize', True):
+        return False
+    return minimize_window(page)
+
+
 def close_ctx(ctx):
-    # pw.stop 必须独立于 ctx.close 的成败：ctx.close 抛异常就跳过 stop
-    # 的话，playwright driver 进程会留下来（泄漏，实测内存里挂一堆 node）
-    pw = getattr(ctx, '_wb_pw', None)
-    try:
-        ctx.close()
-    except Exception:
-        pass
-    if pw:
+    """收尾：关掉本线程经它开的**页面**，再断开本线程的连接。**不关常驻进程**。
+
+    v4.3 起浏览器是全局常驻的（见 launch），ctx 是**共享上下文**。旧语义
+    「close_ctx 收掉整只浏览器」现在变成「只关本线程自己开的页面」——三点必须
+    同时成立，否则会串线程：
+      · 只关 _TLS.pages（本线程经包装的 new_page 记下的），**不碰** ctx.pages
+        ——共享 ctx 的 pages 含别的线程的页面，全关会把并发任务的页面带走；
+      · 只断本线程这条 CDP 连接（ctx._wb_br），不关进程；
+      · 实测（tmp/_probe_session_close.py）断开连接**不会**关页面，所以必须
+        显式 page.close() 逐个收，否则任务越跑标签页越多。
+    """
+    pages = list(getattr(_TLS, 'pages', None) or [])
+    for pg in pages:
         try:
-            pw.stop()
+            pg.close()
         except Exception:
             pass
+    try:
+        br = getattr(ctx, '_wb_br', None)
+        if br is not None:
+            br.close()                       # 只断本线程这条 CDP 连接
+    except Exception:
+        pass
+    # 清掉本线程缓存并**收掉本线程的 playwright 实例**（_drop_tls 里的
+    # pw.stop()），下一次 launch 才能干净地 sync_playwright().start()。
+    _drop_tls()
 
 
 def mask_phone(p) -> str:
@@ -654,6 +1099,51 @@ def save_state(ctx):
         log('会话保存失败：%s' % e, 'warn')
 
 
+def _rmtree_retry(path, tries=6, delay=0.4):
+    """删除目录，Windows 上「句柄滞后释放」时重试几次；成功/已不存在返回 True。
+
+    为什么需要：chrome 刚被 stop_browser() 杀掉，它占着 profile 里的
+    Lockfile / Network / Cache 等句柄，内核还要几十~几百毫秒才真正释放。
+    此时 rmtree(..., ignore_errors=True) 会**静默失败**，紧接着的 rename
+    就撞 WinError 183（目标已存在）——真机换号回滚正是这么炸的
+    （restore_profile 把 profile_old 改回 profile 时）。所以这里不吞错，
+    而是重试到成功或超时，让调用方拿到真实结果再决定。
+    """
+    p = Path(path)
+    for i in range(tries):
+        if not p.exists():
+            return True
+        try:
+            shutil.rmtree(p)
+            return True
+        except Exception:
+            time.sleep(delay * (i + 1))
+    return not p.exists()
+
+
+def _rename_retry(src, dst, tries=8, delay=0.35):
+    """目录改名，被占用（WinError 5/32/183）时重试；成功返回 True。
+
+    与 _rmtree_retry 同理：chrome 进程树刚被杀，profile 目录句柄滞后释放，
+    此刻 rename 会抛 WinError 5（拒绝访问）。等几百毫秒重试即可成功。
+    """
+    s, d = Path(src), Path(dst)
+    for i in range(tries):
+        try:
+            s.rename(d)
+            return True
+        except Exception as e:
+            if i == tries - 1:
+                last = e
+            time.sleep(delay * (i + 1))
+    try:
+        log('目录改名始终失败（%s → %s）：%s' % (s.name, d.name, str(last)[:80]),
+            'warn')
+    except Exception:
+        pass
+    return False
+
+
 def fresh_profile():
     """换号登录前清场：归档浏览器 profile 与登录会话，新账号从零开始。
 
@@ -665,13 +1155,14 @@ def fresh_profile():
     做法：profile 目录整体改名归档（同盘 rename，瞬时完成），state.json
     一起挪进去。只保留最近一份归档；改名失败（多半有浏览器进程占用）
     就什么都不动并返回 False，由调用方提示。
+
+    v4.3：常驻浏览器独占 profile 目录，改名之前必须先停掉它（否则 Windows
+    下目录被占用、rename 直接失败）。停掉后由调用方的下一次 launch 用全新的
+    profile 重启。所有调用方（cs / webui）都走这里，不必各自 stop。
     """
+    stop_browser()
     old = PROFILE_DIR.with_name('profile_old')
-    try:
-        if old.exists():
-            shutil.rmtree(old, ignore_errors=True)
-    except Exception:
-        pass
+    _rmtree_retry(old)          # 清掉上一份归档（句柄滞后时重试，不静默留残）
     if not PROFILE_DIR.exists():
         # 本来就没有 profile（首次使用），只需清掉旧会话文件
         try:
@@ -681,10 +1172,8 @@ def fresh_profile():
             pass
         drop_identity()
         return True
-    try:
-        PROFILE_DIR.rename(old)
-    except Exception as e:
-        log('归档旧浏览器痕迹失败（可能有浏览器窗口还开着）：%s' % str(e)[:80],
+    if not _rename_retry(PROFILE_DIR, old):
+        log('归档旧浏览器痕迹失败（文件夹被占用，可能有浏览器窗口还开着）。',
             'warn')
         log('请关闭工具重开后再点登录，否则新旧账号会共用同一个浏览器痕迹。',
             'warn')
@@ -710,17 +1199,24 @@ def restore_profile():
     原来的登录态就被归档走了，下次查询还得重登一遍（反而更容易反复
     撞验证码）——这属于「换个号把老号也搭进去」，必须能回滚。
 
-    调用前要先关掉浏览器（profile 目录被占用时 rename 会失败）。
+    调用前要先关掉浏览器（profile 目录被占用时 rename 会失败）。v4.3 起常驻
+    浏览器独占 profile 目录，这里显式停掉它；下一次 launch 会用挪回来的
+    旧 profile 重启。
     """
+    stop_browser()
     old = PROFILE_DIR.with_name('profile_old')
     if not old.exists():
         return False
-    try:
-        if PROFILE_DIR.exists():
-            shutil.rmtree(PROFILE_DIR, ignore_errors=True)
-        old.rename(PROFILE_DIR)
-    except Exception as e:
-        log('回滚旧浏览器痕迹失败：%s' % str(e)[:80], 'warn')
+    # 目标必须**确实删干净**再改名：chrome 进程树刚被杀，句柄滞后释放时
+    # ignore_errors 的 rmtree 会静默留下半个 profile，随后 rename 撞
+    # WinError 183。删不掉就如实返回 False，绝不带病改名。
+    if not _rmtree_retry(PROFILE_DIR):
+        log('回滚旧浏览器痕迹失败：runtime/profile 目录被占用（删不掉）。',
+            'warn')
+        log('旧痕迹还在 runtime/profile_old，可手动改名回 runtime/profile。',
+            'warn')
+        return False
+    if not _rename_retry(old, PROFILE_DIR):
         log('旧痕迹还在 runtime/profile_old，可手动改名回 runtime/profile。',
             'warn')
         return False
@@ -759,7 +1255,10 @@ def _poll(page, expr, ok, timeout_ms, interval_ms=_POLL_MS):
     超时不抛异常，而是把「最后看到的东西」交回给调用方 —— 调用方原有的兜底
     分支（读不到就当无此模块 / 空列表）因此一行都不用改。
     """
-    deadline = time.time() + max(0, timeout_ms) / 1000.0
+    # 硬上限兜底：任何上游把 timeout 算成天文数字（config 手改坏、
+    # 类型没归一）也不能真的挂死 —— 10 分钟到了按超时返回。
+    timeout_ms = min(max(0, timeout_ms), 600_000)
+    deadline = time.time() + timeout_ms / 1000.0
     val = None
     while True:
         try:
@@ -872,11 +1371,19 @@ def _logined_enough(v):
 
 def check_login(page, navigate=True) -> bool:
     if navigate:
-        try:
-            page.goto(BASE_URL, wait_until='domcontentloaded')
-        except Exception as e:
-            log('打开个人空间失败：%s' % e, 'warn')
-            return False
+        err = None
+        for _ in range(2):            # 偶发被页面自身跳转顶掉（ERR_ABORTED），重试一次
+            try:
+                page.goto(BASE_URL, wait_until='domcontentloaded')
+                err = None
+                break
+            except Exception as e:
+                err = e
+                time.sleep(0.8)
+        if err is not None:
+            # goto 抛 net::ERR_ABORTED 时窗口多半已被页面自己的 JS 跳走——
+            # 别急着判「没有登录态」，继续按实际落点（下方 evaluate）判断。
+            log('打开个人空间失败：%s（按实际落点继续判断）' % err, 'warn')
         # 等「个人空间」的特征出现（课程链接 / 互动 iframe / 页面标题）。
         # 上限仍是改前的 3.5 秒，但特征一到就走。
         _poll(page, JS_IS_LOGINED, _logined_enough, 3500)
@@ -924,8 +1431,8 @@ def do_login(cfg, auto=False, phone='', fresh=False):
         return _login_auto(cfg, phone)
 
     ctx = launch(cfg, headless=False)
-    page = ctx.new_page()
     try:
+        page = ctx.new_page()
         if fresh:
             # 只跳过 restore_state 不够：launch 用的是持久化 profile，
             # 旧账号的 cookie 本来就躺在里面，启动即带——不主动清掉，
@@ -963,7 +1470,10 @@ def do_login(cfg, auto=False, phone='', fresh=False):
         deadline = time.time() + 480
         n = 0
         while time.time() < deadline:
-            page.wait_for_timeout(2000)
+            try:
+                page.wait_for_timeout(2000)
+            except Exception:
+                break        # 浏览器窗口被用户点掉了：不可能再登录成功
             n += 1
             try:
                 if check_login(page, navigate=False):
@@ -1018,8 +1528,8 @@ def _login_auto(cfg, phone=''):
             return False
 
     ctx = launch(cfg, headless=True)
-    page = ctx.new_page()
     try:
+        page = ctx.new_page()
         if restore_state(ctx) and check_login(page):
             have = (load_identity().get('phone') or '')
             if have and have == phone:
@@ -1180,7 +1690,7 @@ def do_login_password(cfg, phone, password, headless=False) -> bool:
         _login_fail = 'other'
         return False
 
-    ctx = launch(cfg, headless=headless, offscreen=False)
+    ctx = launch(cfg, headless=headless, offscreen=None)
     page = ctx.new_page()
     swapped = False          # 本次是否归档了旧痕迹、换成了全新的罐
     logged_in = False        # 是否真的登进去了（决定要不要回滚）
@@ -1220,17 +1730,17 @@ def do_login_password(cfg, phone, password, headless=False) -> bool:
         #   profile 里的 localStorage / IndexedDB / 缓存还留着；而且它
         #   在「会话只是瞬时判失败」时也会把仍然有效的 cookie 抹掉，
         #   直接把用户踢下线。换成整体归档就没有这两个问题。）
-        try:
-            close_ctx(ctx)
-        except Exception:
-            pass
+        # 常驻浏览器独占 profile：换号必须先把进程停掉，否则 profile 目录
+        # 被占用、fresh_profile() 改名会失败。停掉后下面的 launch 会用全新
+        # 的 profile 重启一个新的常驻进程。
+        stop_browser()
         if not fresh_profile():
             log('旧浏览器痕迹归档失败（可能有浏览器窗口还开着）。', 'err')
             log('请关闭本工具后重新打开，再重新登录一次。', 'err')
             _login_fail = 'other'
             return False
         swapped = True
-        ctx = launch(cfg, headless=headless, offscreen=False)
+        ctx = launch(cfg, headless=headless, offscreen=None)
         page = ctx.new_page()
 
         page.goto(LOGIN_URL, wait_until='domcontentloaded')
@@ -1265,7 +1775,10 @@ def do_login_password(cfg, phone, password, headless=False) -> bool:
         while time.time() < deadline:
             # 0.8 秒探一次：登录成功、或平台回绝密码，都能更早被认出来，
             # 界面上的红字提示 / 开始扫描也就来得更快
-            page.wait_for_timeout(800)
+            try:
+                page.wait_for_timeout(800)
+            except Exception:
+                break        # 浏览器窗口被用户点掉了：不可能再登录成功
             if check_login(page, navigate=False):
                 # 快速判定过了还要真导航复核一次：提交后平台有时把页面
                 # 跳到「个人空间」游客态，body 含「个人空间」三个字就骗过
@@ -1326,18 +1839,18 @@ def do_login_password(cfg, phone, password, headless=False) -> bool:
         _login_fail = 'other'
         return False
     finally:
-        # 无论成败都要关掉这个浏览器。
-        # 它用的是**持久化** profile（runtime/profile）：留着不关，那个目录
-        # 就一直被占着，而同一个 user_data_dir 再启动一个持久化上下文会直接
-        # 失败（TargetClosedError，实测复现）。紧接着的「一键查询」正是拿这
-        # 个目录再开一次 —— 于是「刚用账号密码登录成功，紧接着就查不了」。
-        # 以前这里按 keep_open 跳过关闭（出现过点选验证码就把 keep_open 置
-        # True，想「把窗口留给用户点」），但那个变量从来起不到这个作用：
-        # 函数只要还没返回，窗口本来就是开着的，等人点验证码的那几分钟完全
-        # 够用；它唯一的效果就是每次带验证码的登录都漏一个浏览器进程。
+        # 无论成败都要收尾：收掉本次登录开的页面（close_ctx）。keep_open 开关
+        # 早已删除——以前出现过点选验证码就把它置 True 想「把窗口留给用户」，
+        # 但函数没返回时窗口本来就开着，等人点那几分钟完全够用，那个变量只
+        # 起副作用（漏一个进程、占住 profile）。
+        # v4.3：浏览器是全局常驻的，close_ctx 不再关整只浏览器——否则登录一
+        # 结束就把常驻浏览器关了，紧接着的「一键查询」还得冷启动一次。旧注释
+        # 里「必须关掉持久化上下文否则 profile 被占」的前提已被常驻单进程架构
+        # 取代：profile 由那个唯一进程独占，不会再有「两个持久化上下文抢目录」。
         close_ctx(ctx)
         # 换了新罐又没登成 → 把旧账号的痕迹与会话挪回原位，
-        # 别让一次没成的登录把原来的登录态也搭进去
+        # 别让一次没成的登录把原来的登录态也搭进去（restore_profile 内部
+        # 会先停掉常驻浏览器再改名）。
         if swapped and not logged_in:
             restore_profile()
 
@@ -1847,8 +2360,8 @@ def scan(cfg, limit=0, headless=None, open_report=None, deep=True, only=None) ->
     scope_kind = ''        # ''=全量 ｜ selected=按勾选 ｜ recent=只查最近 N 门
 
     ctx = launch(cfg, headless=headless)
-    page = ctx.new_page()
     try:
+        page = ctx.new_page()
         banner('检查登录状态')
         if not check_login(page):
             if restore_state(ctx) and check_login(page):
@@ -1857,6 +2370,7 @@ def scan(cfg, limit=0, headless=None, open_report=None, deep=True, only=None) ->
                 log('本地没有可用登录态，请先执行：'
                     'python chaoxing_scanner.py login', 'err')
                 raise NotLoggedIn('未登录')
+        _quiet_win(page, cfg, headless)
 
         courses, cpi = collect_courses(page, cfg)
         if not courses:
@@ -2083,8 +2597,8 @@ def list_courses(cfg, headless=None) -> dict:
     """
     t0 = time.time()
     ctx = launch(cfg, headless=headless)
-    page = ctx.new_page()
     try:
+        page = ctx.new_page()
         banner('读取课程列表')
         if not check_login(page):
             if restore_state(ctx) and check_login(page):
@@ -2092,6 +2606,7 @@ def list_courses(cfg, headless=None) -> dict:
             else:
                 log('本地没有可用登录态，请先登录。', 'err')
                 raise NotLoggedIn('未登录')
+        _quiet_win(page, cfg, headless)
 
         courses, cpi = collect_courses(page, cfg)
         if cpi:
@@ -2393,7 +2908,9 @@ def brush_pace_rest(done_total, cfg, progress, control, state=None):
 # 思路：作业卡就是 doHomeWorkNew 的表单页。解析 .TiMu 题目 → 交给用户配置的
 # 大模型（OpenAI 兼容接口）作答 → 点选/填入 → 调平台自己的 btnBlueSubmit()
 # 完整链交卷（等价于人工点提交），并核实受理结果。安全阀：
-#   · LLM 没给出答案（返回 ? / 解析失败）的题 → 整份不填表不交卷
+#   · LLM 没给出答案（返回 ? / 解析失败）的题 → 已答上的照样填、照样
+#     每几道暂存一次，但**整份不交卷**（交上去就是白拿低分）；
+#     剩下没答上的由你打开作业网址补完再提交，先前暂存的答案还在
 #   · 要上传附件（实验报告）的整份跳过并提示
 #   · 交卷结果必须核实（响应监听 + 重开作业卡），核实不到如实报「未确认」
 #   · 答案按题干哈希落本地缓存（runtime/answer_cache.json），同题不重复花钱
@@ -2898,10 +3415,16 @@ def save_llm_key(key: str, purpose: str = 'main') -> bool:
     path = _llm_key_path(purpose)
     try:
         RUNTIME.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_name(path.name + '.tmp')
+        # 临时名带线程 id：HTTP 线程保存 Key 与任务线程迁移老明文 Key
+        # 可能并发，固定名会互相把对方写一半的文件截断重写
+        tmp = path.with_name('%s.%d.tmp' % (path.name, threading.get_ident()))
         tmp.write_bytes(LLM_KEY_MAGIC + b'\x01\x00\x00\x00' + blob)
         os.replace(tmp, path)             # 原子替换：写一半崩掉不会留坏文件
     except Exception as e:
+        try:
+            tmp.unlink()                  # 别留孤儿 .tmp
+        except Exception:
+            pass
         log('API Key 写入失败（将明文存放在 config.json）：%s' % str(e)[:80], 'warn')
         return False
     _LLM_KEY_CACHE[purpose] = key
@@ -2932,6 +3455,82 @@ def clear_llm_key(purpose: str = 'main'):
     _LLM_KEY_TRIED.discard(purpose)
     try:
         _llm_key_path(purpose).unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------- 记住密码
+# 界面「记住密码」：DPAPI 加密落 runtime/（与 LLM Key 同款基建），
+# config 与前端 localStorage 一律不碰——那两处是明文，密码不住那。
+# 路径每次现读 RUNTIME（沙箱在 import 后改道它，别把路径收进容器）。
+LOGIN_PWD_MAGIC = b'CXPWD1'
+_LOGIN_PWD_HEADER = len(LOGIN_PWD_MAGIC) + 4    # 魔数 + 4 字节小版本号
+_LOGIN_PWD_NAME = 'password.dpapi'
+
+
+def _login_pwd_path():
+    return RUNTIME / _LOGIN_PWD_NAME
+
+
+def save_login_pwd(pwd: str) -> bool:
+    """加密保存登录密码；返回是否真的存成了（False = 加密不可用）。
+
+    密码比 API Key 更敏感：加密不可用时**绝不留明文**（宁可让用户
+    每次手输），与 Key 的「明文兜底」策略刻意不同。
+    传空串 = 删除已保存的密码。
+    """
+    pwd = (pwd or '').strip()
+    if not pwd:
+        forget_login_pwd()
+        return True
+    if os.name != 'nt':
+        return False
+    try:
+        blob = _dpapi(pwd.encode('utf-8'), protect=True)
+    except Exception as e:
+        log('密码加密失败（未保存，仍需每次手输）：%s' % str(e)[:80],
+            'warn')
+        return False
+    path = _login_pwd_path()
+    try:
+        RUNTIME.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name('%s.%d.tmp' % (path.name,
+                                            threading.get_ident()))
+        tmp.write_bytes(LOGIN_PWD_MAGIC + b'\x01\x00\x00\x00' + blob)
+        os.replace(tmp, path)         # 原子替换：写一半崩不留坏文件
+    except Exception as e:
+        try:
+            tmp.unlink()
+        except Exception:
+            pass
+        log('密码写入失败（未保存）：%s' % str(e)[:80], 'warn')
+        return False
+    return True
+
+
+def load_login_pwd() -> str:
+    """读已保存的密码。没存过 / 头不对 / 解不开都返回 ''（不抛异常）。"""
+    try:
+        raw = _login_pwd_path().read_bytes()
+    except Exception:
+        return ''
+    if not raw.startswith(LOGIN_PWD_MAGIC) or len(raw) <= _LOGIN_PWD_HEADER:
+        return ''
+    try:
+        return _dpapi(raw[_LOGIN_PWD_HEADER:], protect=False).decode('utf-8')
+    except Exception:
+        # 换 Windows 用户或换电脑后解不开——设计使然。文件留着不管，
+        # 下次保存会覆盖。
+        return ''
+
+
+def has_login_pwd() -> bool:
+    return _login_pwd_path().exists()
+
+
+def forget_login_pwd():
+    try:
+        _login_pwd_path().unlink(missing_ok=True)
     except Exception:
         pass
 
@@ -3228,6 +3827,12 @@ def llm_chat(cfg, prompt, timeout=120, key=None, images=None, purpose=None):
                 last = '对方返回的不是接口数据（HTTP 200 却是网页或纯文本）：'\
                        '确认地址填的是接口地址，中间没有代理拦截页'
                 break
+            if not isinstance(data, dict):
+                # 网关/代理有时回 JSON 数组或字符串：归类成「填错了」，
+                # 别当网络异常白等 2+4 秒重发（带图时还会重传 base64）
+                last = '对方返回的不是接口数据（JSON 顶层不是对象）：'\
+                       '确认地址填的是接口地址'
+                break
             choice = (data.get('choices') or [{}])[0] or {}
             msg = choice.get('message') or {}
             # 推理模型（如 deepseek-reasoner）可能把最终答案放
@@ -3341,7 +3946,9 @@ def _stem_key(stem):
 def _answer_cache_load():
     """读本地答案缓存（runtime/answer_cache.json）。坏了就当没有。"""
     try:
-        return json.loads(ANSWER_CACHE_FILE.read_text(encoding='utf-8'))
+        d = json.loads(ANSWER_CACHE_FILE.read_text(encoding='utf-8'))
+        # 顶层必须是对象：手改成 list/数字时 get/赋值会每题都炸
+        return d if isinstance(d, dict) else {}
     except Exception:
         return {}
 
@@ -3841,7 +4448,10 @@ def answer_one(page, c, cpi, kid, cfg, submit, progress, pre=None, detail=None,
     返回 'nohw'(没有作业卡) | 'ok'(已暂存) | 'submitted'(已交卷，已核实)
          | 'dry'(预演完成) | 'already'(平台显示已批阅，此前已交)
          | 'unsupported'(含不支持的题型)
-         | 'unsolved'(有题没答上) | 'report'(整份是上传附件型，LLM 替不了)
+         | 'partial'(**部分作答已暂存**：已答上的都分批存进平台了，
+                    但还有题没答上，所以没交卷——需你补完再提交)
+         | 'unsolved'(一道都没答上，没有可保存的内容)
+         | 'report'(整份是上传附件型，LLM 替不了)
          | 'failed' | 'norender'。
     """
     from urllib.parse import urlencode  # noqa: F401  (仅说明用)
@@ -3976,8 +4586,7 @@ def answer_one(page, c, cpi, kid, cfg, submit, progress, pre=None, detail=None,
                 continue
             for f in t['fills']:
                 if f['name']:
-                    fills.append({'name': f['name'], 'val': a,
-                                  'no': t['no']})
+                    fills.append({'name': f['name'], 'val': a, 'no': t['no']})
             continue
         if t['atype'] == '3':                # 判断题：统一转平台认的值
             a = '对' if a in ('对', '正确', 'TRUE', 'T', '√') else '错'
@@ -4014,12 +4623,12 @@ def answer_one(page, c, cpi, kid, cfg, submit, progress, pre=None, detail=None,
             missing.append(t['no'])
             continue
         for nm in names:
-            fills.append({'name': nm, 'vals': pos_vals or vals,
-                          'no': t['no']})
+            # 'no' 只在本地用来分批（做几道存几道），发给页面前会摘掉
+            fills.append({'name': nm, 'vals': pos_vals or vals, 'no': t['no']})
     if not fills:
         # 一道都没答上 = 确实没有可保存的内容，保持「整份不碰」。
         # 注意判据是 fills（真的能填进去的）而不是 missing：
-        # 只要有一道答上了，就要往下走，把它存进平台（v3.9.2 起同 v4.0）。
+        # 只要有一道答上了，就要往下走，把它存进平台。
         log('    ⚠ 这一整份都没答上（第 %s 题），没有可保存的内容，'
             '这份需要你手动做。'
             % '、'.join(map(str, missing[:8])), 'warn')
@@ -4031,18 +4640,16 @@ def answer_one(page, c, cpi, kid, cfg, submit, progress, pre=None, detail=None,
         log('    ⚠ 没拿到题目清单（answerwqbid），平台会拒绝保存，'
             '这份没法落库。', 'warn')
         return 'failed'
-    # ---- 分批填 + 分批暂存：「做几道存几道」（v3.9.2 自 v4.0 移植） ----
+    # ---- 分批填 + 分批暂存：「做几道存几道」 ----
+    # 口径（v3.9.1 起）：
     #   · 答上的题**一律填进去**，并且每 save_every 道调一次平台暂存 ——
     #     中途被停止 / 断网 / 窗口被关，前面已填的答案也不会白填；
-    #   · 有题没答上 / 选项没点中 / 主观题没进编辑器 → **只暂存、绝不交卷**
+    #   · 有题没答上、或主观题没写进答题编辑器 → **只暂存、绝不交卷**
     #     （交上去就是白拿低分），剩下的题打开作业网址补完再点提交，
     #     先前暂存的答案还在，不用重答一遍。
     # 以前是「有一道没答上就整份不填不存」，用户实测的后果是：答案都对，
     # 平台上却什么都没有，等于白做。
-    try:
-        step = max(int(cfg.get('save_every') or 5), 1)
-    except Exception:
-        step = 5
+    step = max(int(cfg.get('save_every') or 5), 1)
     order = sorted(fills, key=lambda f: 0 if 'vals' in f else 1)   # 先客观后主观
     batches = [order[i:i + step] for i in range(0, len(order), step)]
     n_q = len({f['no'] for f in fills})
@@ -4262,8 +4869,8 @@ def answer_urls(cfg, targets, progress=None, control=None, headless=None,
     if not tgt:
         raise RuntimeError('没有可做的作业（这份清单里缺少作业链接）')
     ctx = launch(cfg, headless=headless)
-    page = ctx.new_page()
     try:
+        page = ctx.new_page()
         banner('检查登录状态')
         if not check_login(page):
             if restore_state(ctx) and check_login(page):
@@ -4271,6 +4878,7 @@ def answer_urls(cfg, targets, progress=None, control=None, headless=None,
             else:
                 log('本地没有可用登录态，请先登录。', 'err')
                 raise NotLoggedIn('未登录')
+        _quiet_win(page, cfg, headless)
         banner('逐份答题（共 %d 份，%s）'
                % (len(tgt), {True: '答完交卷', False: '答完暂存（不交卷）',
                              'dry': '预演不落库'}.get(submit, str(submit))))
@@ -4328,14 +4936,19 @@ def answer_courses(cfg, only, submit=False, progress=None, control=None,
 
     only: 课程 key（cid:clsid）与「key|kid」章节规格混用的列表（界面勾选），
           必填。key = 该课全部待完成节点；key|kid = 只做这个章节节点。
-    submit: True = 答完直接交卷；False = 平台暂存（仅 CLI，见 answer_one
-            的说明）；'dry' = 预演：不落库，收集 items 清单由用户复核交卷。
+    submit: True = 答完直接交卷；False = 平台暂存不交卷（界面「做作业并
+            暂存」就是这个模式，见 answer_one 的说明）；'dry' = 预演：
+            不落库，收集 items 清单由用户复核交卷。
     """
     progress = progress or (lambda m, *a: log(m, a[0] if a else 'info'))
     control = control or (lambda: 'run')
     t0 = time.time()
     ctx = launch(cfg, headless=headless)
-    page = ctx.new_page()
+    try:
+        page = ctx.new_page()
+    except Exception:
+        close_ctx(ctx)     # new_page 失败也要收浏览器，别把 profile 占死
+        raise
     out = {'courses': [], 'submitted': 0, 'saved': 0, 'skipped': 0,
            'fail': 0, 'partial': 0, 'stopped': False, 'items': []}
     if submit == 'dry':
@@ -4348,6 +4961,7 @@ def answer_courses(cfg, only, submit=False, progress=None, control=None,
             else:
                 log('本地没有可用登录态，请先登录。', 'err')
                 raise NotLoggedIn('未登录')
+        _quiet_win(page, cfg, headless)
         courses, cpi = collect_courses(page, cfg)
         keep, node_keep = split_only(only)
         picked = [c for c in courses if course_key(c) in keep]
@@ -4357,10 +4971,10 @@ def answer_courses(cfg, only, submit=False, progress=None, control=None,
         progress('共 %d 门课要做作业：%s' % (
             len(picked), '、'.join(cut(c['name'], 16) for c in picked)))
         banner('逐门课做章节作业（共 %d 门，%s）'
-               % (len(picked), {True: '答完交卷', False: '答完保存（不交卷）',
+               % (len(picked), {True: '答完交卷', False: '答完暂存（不交卷）',
                                 'dry': '预演不落库'}.get(submit, str(submit))))
         if submit is False:
-            log('    ⚠ 章节作业的暂存一旦被平台接受，这个任务点就会立即标记'
+            log('⚠ 章节作业的暂存一旦被平台接受，这个任务点就会立即标记'
                 '完成（成绩要等正式交卷才有）。')
         for i, c in enumerate(picked, 1):
             if _wait_control(control, progress) == 'stop':
@@ -4368,7 +4982,14 @@ def answer_courses(cfg, only, submit=False, progress=None, control=None,
                 log('已停止。', 'warn')
                 break
             progress('【%d/%d】%s' % (i, len(picked), c['name']))
-            pd = fetch_progress_detail(page, c, cpi, cfg)
+            try:
+                pd = fetch_progress_detail(page, c, cpi, cfg)
+            except Exception as e:
+                # 单门课的页面故障（网络抖动 / goto 超时）不该炸掉整批
+                # 任务：scan() 对同一调用就是这么兜的。降级成 page_failed
+                # 走下面已有的「这门课先跳过」分支。
+                pd = {'page_failed': True,
+                      'reason': str(e).splitlines()[0][:120]}
             if pd.get('page_failed'):
                 progress('  ⚠ 页面没加载成功（%s），这门课先跳过。'
                          % pd.get('reason', ''), 'warn')
@@ -4455,6 +5076,21 @@ def answer_courses(cfg, only, submit=False, progress=None, control=None,
                                    {'report': 'report', 'unsupported': 'unsupported',
                                     'unsolved': 'unsolved'}.get(r, 'failed')),
                     })
+                elif submit is True and r in ('submitted', 'already', 'unverified',
+                                              'report', 'unsupported', 'unsolved',
+                                              'partial'):
+                    # 正式交卷模式：逐份结果也进清单，界面据此渲染「交卷结果」，
+                    # 其中未确认的作业可以在面板里「重新核实」。
+                    out['items'].append({
+                        'key': course_key(c), 'kid': node['kid'],
+                        'course': c['name'],
+                        'node': node.get('name') or ('节点 %d' % j),
+                        'url': CARDS_URL.format(clsid=c['clsid'], cid=c['cid'],
+                                                kid=node['kid'], cpi=cpi),
+                        'answers': {}, 'stems': {}, 'total': 0, 'miss': [],
+                        'status': {'submitted': 'done', 'already': 'already',
+                                   'unverified': 'unverified'}.get(r, r),
+                    })
                 elif submit is False and r in ('ok', 'partial', 'already',
                                                'report', 'unsupported',
                                                'unsolved', 'failed', 'norender'):
@@ -4471,32 +5107,17 @@ def answer_courses(cfg, only, submit=False, progress=None, control=None,
                         'status': {'ok': 'ok', 'partial': 'partial',
                                    'already': 'already'}.get(r, r),
                     })
-                elif submit is True and r in ('submitted', 'already', 'unverified',
-                                              'report', 'unsupported', 'unsolved',
-                                              'partial'):
-                    # 正式交卷模式：逐份结果也进清单，界面据此渲染「交卷结果」，
-                    # 其中未确认的作业可以在面板里「重新核实」。
-                    out['items'].append({
-                        'key': course_key(c), 'kid': node['kid'],
-                        'course': c['name'],
-                        'node': node.get('name') or ('节点 %d' % j),
-                        'url': CARDS_URL.format(clsid=c['clsid'], cid=c['cid'],
-                                                kid=node['kid'], cpi=cpi),
-                        'answers': {}, 'stems': {}, 'total': 0, 'miss': [],
-                        'status': {'submitted': 'done', 'already': 'already',
-                                   'unverified': 'unverified'}.get(r, r),
-                    })
                 if r == 'submitted' or (r == 'already' and submit is True):
                     su += 1
                 elif r == 'already':
                     sk += 1    # 预演/暂存模式遇到已批阅的：没东西可做，跳过
                 elif r == 'unverified' and submit is True:
                     uw += 1    # 请求发出但没核实到结果，单独记账不混进失败
+                elif r == 'ok':
+                    s += 1
                 elif r == 'partial':
                     s += 1     # 已落库的部分作答，算进「已保存」一路
                     pt += 1    # 但另记一笔：这几份还得人工补完才能交
-                elif r == 'ok':
-                    s += 1
                 elif r == 'dry':
                     s += 1       # 预演完成，计进「已答」一路的计数
                 elif r == 'report':
@@ -4566,6 +5187,11 @@ def answer_courses(cfg, only, submit=False, progress=None, control=None,
                 progress('⚠ 有 %d 份作业没当场核实到结果（平台可能延迟生效）：'
                          '在「交卷结果」面板点「重新核实」，或稍后打开作业网址'
                          '自己确认。' % len(uv), 'warn')
+        if out.get('partial'):
+            progress('⚠ 有 %d 份只暂存了一部分（有几道题模型没答上、或者答案'
+                     '没写进答题框）：答案已经存在平台上了，打开作业网址补完'
+                     '剩下的题再点提交即可，不用重答一遍。' % out['partial'],
+                     'warn')
         progress('重新点「一键查询」可核对最新状态。')
     finally:
         save_state(ctx)
@@ -4585,7 +5211,11 @@ def submit_items(cfg, items, progress=None, control=None, headless=None) -> dict
     control = control or (lambda: 'run')
     t0 = time.time()
     ctx = launch(cfg, headless=headless)
-    page = ctx.new_page()
+    try:
+        page = ctx.new_page()
+    except Exception:
+        close_ctx(ctx)     # new_page 失败也要收浏览器，别把 profile 占死
+        raise
     out = {'submitted': 0, 'fail': 0, 'skip': 0, 'unverified': 0,
            'partial': 0, 'stopped': False, 'results': []}
     try:
@@ -4596,6 +5226,7 @@ def submit_items(cfg, items, progress=None, control=None, headless=None) -> dict
             else:
                 log('本地没有可用登录态，请先登录。', 'err')
                 raise NotLoggedIn('未登录')
+        _quiet_win(page, cfg, headless)
         courses, cpi = collect_courses(page, cfg)
         by_key = {course_key(c): c for c in courses}
         progress('开始正式交卷：共 %d 份。' % len(items))
@@ -4680,7 +5311,11 @@ def verify_items(cfg, items, progress=None, control=None, headless=None) -> dict
     control = control or (lambda: 'run')
     t0 = time.time()
     ctx = launch(cfg, headless=headless)
-    page = ctx.new_page()
+    try:
+        page = ctx.new_page()
+    except Exception:
+        close_ctx(ctx)     # new_page 失败也要收浏览器，别把 profile 占死
+        raise
     rounds = max(int(cfg.get('verify_rounds') or 3), 1)
     gap = max(int(cfg.get('verify_round_gap') or 120), 15)
     out = {'confirmed': 0, 'still': 0, 'stopped': False, 'results': []}
@@ -4692,6 +5327,7 @@ def verify_items(cfg, items, progress=None, control=None, headless=None) -> dict
             else:
                 log('本地没有可用登录态，请先登录。', 'err')
                 raise NotLoggedIn('未登录')
+        _quiet_win(page, cfg, headless)
         courses, cpi = collect_courses(page, cfg)
         by_key = {course_key(c): c for c in courses}
         # 初始就是 still：核实不中的项最后必须计入「仍未确认」。
@@ -4847,7 +5483,11 @@ def brush_videos(cfg, only, progress=None, control=None, headless=None) -> dict:
     control = control or (lambda: 'run')
     t0 = time.time()
     ctx = launch(cfg, headless=headless)
-    page = ctx.new_page()
+    try:
+        page = ctx.new_page()
+    except Exception:
+        close_ctx(ctx)     # new_page 失败也要收浏览器，别把 profile 占死
+        raise
     out = {'courses': [], 'done': 0, 'fail': 0, 'stopped': False}
     # 连刷歇息的小本子：见 brush_pace_rest 的说明（防零进度节点反复歇）
     rest_state = {'last': 0}
@@ -4868,8 +5508,10 @@ def brush_videos(cfg, only, progress=None, control=None, headless=None) -> dict:
         progress('共 %d 门课要刷：%s' % (
             len(picked), '、'.join(cut(c['name'], 16) for c in picked)))
         banner('逐门课刷视频（共 %d 门，%sx 静音）' % (len(picked), g_rate(cfg)))
-        # 登录确认后再收窗口：登录/验证码阶段必须可见，刷课阶段不需要
-        if cfg.get('brush_minimize', True) and not (headless is True):
+        # 登录确认后再收窗口：登录/验证码阶段必须可见，刷课阶段不需要。
+        # 桌面模式例外：窗口已屏外待坞/已入坞，最小化会把预览藏掉。
+        if (cfg.get('brush_minimize', True) and not (headless is True)
+                and not OFFSCREEN_LAUNCH):
             if minimize_window(page):
                 progress('浏览器已最小化到任务栏（后台刷课不影响进度，'
                          '点任务栏图标可随时查看）。')
@@ -4879,7 +5521,14 @@ def brush_videos(cfg, only, progress=None, control=None, headless=None) -> dict:
                 log('已停止。', 'warn')
                 break
             progress('【%d/%d】%s' % (i, len(picked), c['name']))
-            pd = fetch_progress_detail(page, c, cpi, cfg)
+            try:
+                pd = fetch_progress_detail(page, c, cpi, cfg)
+            except Exception as e:
+                # 单门课的页面故障（网络抖动 / goto 超时）不该炸掉整批
+                # 任务：scan() 对同一调用就是这么兜的。降级成 page_failed
+                # 走下面已有的「这门课先跳过」分支。
+                pd = {'page_failed': True,
+                      'reason': str(e).splitlines()[0][:120]}
             if pd.get('page_failed'):
                 progress('  ⚠ 页面没加载成功（%s），这门课先跳过，稍后重新刷。'
                          % pd.get('reason', ''), )
@@ -5212,7 +5861,7 @@ def doctor(cfg):
     except Exception as e:
         log('ddddocr  ：不可用（%s）' % e, 'warn')
     exe = _chrome_candidates(cfg)
-    log('浏览器内核：%s' % (exe if exe else '未找到（首次扫描会自动下载）'))
+    log('浏览器内核：%s' % (exe if exe else '未找到（将用系统 Edge/Chrome，仍没有才自动下载）'))
     log('登录会话：%s' % ('已保存 → %s' % STATE_FILE if STATE_FILE.exists()
                         else '还没有（请先运行 login）'))
     log('输出目录：%s' % OUT_DIR)
@@ -5539,6 +6188,9 @@ def main(argv=None):
     p = sub.add_parser('gui', help='打开本地网页控制台')
     p.add_argument('--port', type=int, default=8765)
 
+    p = sub.add_parser('desktop', help='桌面窗口（v4.0 起的默认入口）')
+    p.add_argument('--port', type=int, default=8765)
+
     args = ap.parse_args(argv)
     cfg = load_config()
 
@@ -5670,6 +6322,10 @@ def main(argv=None):
     if args.cmd == 'selftest':
         res = selftest(cfg)
         return 3 if res.get('verdict') == 'fail' else 0
+
+    if args.cmd == 'desktop':
+        import webui
+        return webui.serve_desktop(port=args.port)
 
     if args.cmd == 'gui':
         import webui

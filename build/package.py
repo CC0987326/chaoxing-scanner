@@ -21,14 +21,17 @@ OUT = HERE.parent / (ZIP_NAME + '.zip')
 EXCLUDE = {'runtime', '输出', '__pycache__', '.pytest_cache'}
 
 # 绝不能进分发包的文件后缀：运行期日志。
-# 内置 Chrome 每次在本机跑都会往自己目录写 debug.log（Chromium 的 crashpad
-# 初始化错误），它不含账号信息，但属于「本机运行痕迹」，不该跟着 240MB 的
+# 早先包里自带 Chrome 时，每次在本机跑都会往它目录写 debug.log（Chromium 的
+# crashpad 初始化错误），它不含账号信息，但属于「本机运行痕迹」，不该跟着
 # 分发包发给别人（实测第一次带内置 Chrome 出包时，就混进了一个 380B 的）。
+# v4.2 起包里已无 chrome/，这条留着守其它运行期日志。
 EXCLUDE_SUFFIX = {'.log'}
 
 # config.json 里跟「本机 + 本账号」绑定的字段，打包前必须清空
-# （llm_key 是用户的 API Key，随包发出去等于把付费接口送人）
-SENSITIVE_KEYS = ('cpi', 'chrome_path', 'llm_key')
+# （llm_key 是用户的 API Key，随包发出去等于把付费接口送人。
+#  v3.9 起视觉模型那把单独存 llm_vision_key —— DPAPI 不可用时它会回落成
+#  明文留在 config.json 里，所以必须一起清，不能只顾主模型那把）
+SENSITIVE_KEYS = ('cpi', 'chrome_path', 'llm_key', 'llm_vision_key')
 
 
 def _scrub_config():
@@ -115,7 +118,14 @@ def _scan_leaks():
         problems.append('config.json 读不出来（%s）' % type(e).__name__)
     for p in SRC.rglob('*'):
         rel = p.relative_to(SRC)
-        if any(part in EXCLUDE for part in rel.parts):
+        # 排除清单管的是「app 自己的运行期产物」（登录态/报告/缓存）：
+        # 只看顶层和 app/ 子树。别扫进 python/、chrome/ 这两个第三方运行时 ——
+        # pywebview 的依赖 pythonnet 自带 site-packages/pythonnet/runtime/
+        # （Python.Runtime.dll，删了桌面窗口起不来），同名的目录是合法依赖，
+        # 不是登录态（v4.0 出包时踩过这个假阳性）。
+        _top = rel.parts[0] if rel.parts else ''
+        if (_top in EXCLUDE
+                or (_top == 'app' and any(pt in EXCLUDE for pt in rel.parts))):
             problems.append('包内出现排除目录的内容：%s' % rel)
             continue
         if not p.is_file() or p.suffix.lower() not in _TEXT_SUFFIX:
@@ -171,9 +181,21 @@ def main():
     with zf as z:
         for p in sorted(SRC.rglob('*')):
             rel = p.relative_to(SRC)
-            if any(part in EXCLUDE for part in rel.parts):
+            # 与 _scan_leaks 同一把尺：排除清单只管顶层与 app/ 子树，
+            # 不扫 python/、chrome/ 内部（pythonnet 自带 runtime/ 目录是
+            # 合法依赖，误排会让桌面窗口缺 Python.Runtime.dll 起不来）。
+            _top = rel.parts[0] if rel.parts else ''
+            if (_top in EXCLUDE
+                    or (_top == 'app'
+                        and any(pt in EXCLUDE for pt in rel.parts))):
                 if rel.parts[0] not in skipped:
                     skipped.append(rel.parts[0])
+                continue
+            # 第三方运行时的字节码缓存（__pycache__/*.pyc）：只要在本机
+            # 跑过一次包内的 python，site-packages 下就会生成一堆。它们是
+            # 构建/运行痕迹，不该进分发包（实测出 v4.4 时混进了 51 个，把
+            # 包内条目数从 654 顶到 705）。这里全树排掉，不限于 app/。
+            if '__pycache__' in rel.parts or p.suffix.lower() == '.pyc':
                 continue
             if p.is_file():
                 if p.suffix.lower() in EXCLUDE_SUFFIX:

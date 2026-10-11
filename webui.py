@@ -11,15 +11,31 @@ from __future__ import annotations
 
 import json
 import os
+import queue
 import socket
 import subprocess
 import sys
 import threading
 import time
-import queue
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse, parse_qs, urlsplit
+
+
+class _StrictHTTPServer(ThreadingHTTPServer):
+    """禁用 SO_REUSEADDR 的 HTTP 服务器。
+
+    ThreadingHTTPServer 默认 allow_reuse_address=1，在 Windows 上会让
+    套接字**绑上一个已被别的进程监听的端口**（不像 Linux 那样要求端口
+    空闲）——于是 _open_server 那个「逐个试端口」形同虚设：端口被占时
+    它照样「绑成功」，之后连接被系统随机分给两个监听者，用户看到的是
+    别人的页面 / 半死不活的服务（真实踩到：本机残留的
+    `python -m http.server 8791` 占了端口，工具以为自己起在 8791 上，
+    实测请求却打到了那个 http.server）。
+    置 False 后端口被占即如实抛 OSError，逐个试端口才真正生效。
+    关闭后立即重绑不受影响（我们是主动 close，没有 TIME_WAIT 线程占用）。
+    """
+    allow_reuse_address = False
 
 # 便携版（Python embeddable）的 ._pth 会让解释器忽略脚本所在目录
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -41,6 +57,7 @@ STATE = {
     'result': None,
     'report': '',
     'courses': None,        # 「获取课程列表」的结果，供界面勾选
+    'courses_v': 0,         # courses 的版本号：变了才整份下发（机制同 result_v）
     'started': 0.0,
     'login_fail': None,     # 密码登录被平台明确回绝 → 'credential'，界面弹红字提示
     'result_v': 0,          # 结果的版本号：变了界面才重画，见 _set_result()
@@ -238,6 +255,31 @@ def _screen_off():
 # 两个进程同时占住。窗口期间任务互斥由 /api/open-work 的 busy 闸 +
 # 用户自觉（日志里已提示）兜底。
 _WORK = {'q': None}
+_WORK_CLOSE = object()      # 队列哨兵：让作业窗口线程自己优雅收尾
+
+
+def _close_work_window(timeout=10.0):
+    """开新任务前替用户关掉「去完成」的作业窗口。
+
+    作业窗口与任务共用同一个 profile（cookie 罐）：窗口开着时任何
+    launch 都会因 profile 被占而秒死——真机 2026-10-10「一键查询报
+    所有浏览器内核都无法启动」就是它（自带内核 / msedge 全部
+    Target page, context or browser has been closed）。窗口线程还
+    活着且持有 ctx，往队列投关闭哨兵让它自己走 finally 收尾最稳。
+    """
+    q = _WORK['q']
+    if q is None:
+        return True
+    try:
+        q.put(_WORK_CLOSE)
+    except Exception:
+        pass
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if _WORK['q'] is None:
+            return True
+        time.sleep(0.2)
+    return False
 
 
 def _open_work_async(url):
@@ -251,24 +293,32 @@ def _open_work_async(url):
 
     def run():
         ctx = None
+        pages = []          # 本线程开的作业页（v4.3：共享上下文里只认自己的）
         try:
             cfg = cs.load_config()
             ctx = cs.launch(cfg, headless=False)
             cs.restore_state(ctx)
             page = ctx.new_page()
+            pages.append(page)
             page.goto(url, wait_until='domcontentloaded', timeout=60000)
             cs.log('已用本机登录态打开作业窗口（不用重新登录）。'
-                   '做完关掉窗口即可；窗口开着时刷题/一键刷暂不可用。')
+                   '做完直接关掉窗口即可；开「一键查询 / 刷题」任务时'
+                   '工具也会自动关闭它。')
             while True:
                 try:
                     nxt = q.get(timeout=1.0)
                 except queue.Empty:
                     nxt = None
-                if not ctx.pages:          # 用户把窗口关了
+                if nxt is _WORK_CLOSE:   # 任务要开跑，替用户收掉窗口
+                    break
+                # v4.3：ctx 是全局共享的，ctx.pages 里还有别的线程（并发任务）
+                # 的页面——只能看**本线程**开的作业页是否都被用户关了。
+                if all(p.is_closed() for p in pages):
                     break
                 if nxt:
                     try:
                         p = ctx.new_page()
+                        pages.append(p)
                         p.goto(nxt, wait_until='domcontentloaded',
                                timeout=60000)
                         cs.log('已在作业窗口新开标签页。')
@@ -278,7 +328,7 @@ def _open_work_async(url):
             cs.log('作业窗口打开失败：%s' % e, 'warn')
         finally:
             if ctx is not None:
-                cs.close_ctx(ctx)
+                cs.close_ctx(ctx)   # 只关本线程的作业页 + 断连接，不关常驻浏览器
             _WORK['q'] = None
             cs.log('作业窗口已关闭，「去完成」下次点击会重新开窗。')
 
@@ -307,14 +357,31 @@ def _spawn(fn, *args):
                 if STATE['running']:
                     STATE.update(running=False, done=True,
                                  paused=False, phase='')
-                    cs.log('检测到任务异常收尾，已复位任务状态。', 'warn')
-    threading.Thread(target=run, daemon=True).start()
+                    _reset = True
+                else:
+                    _reset = False
+            # cs.log 绝不能放进上面的 with LOCK —— log 会走 _sink，而 _sink
+            # 自己也要拿 LOCK，Lock 又不可重入（见 ①b），当场自死锁：任务
+            # 线程永久挂死、LOCK 再也不释放，之后每次 poll 全卡（按钮全没
+            # 反应 + ×关不掉）。日志一律在锁外打。
+            if _reset:
+                cs.log('检测到任务异常收尾，已复位任务状态。', 'warn')
+    th = threading.Thread(target=run, daemon=True, name='ui-task')
+    with LOCK:
+        STATE['_thread'] = th    # 退出时要等它收尾，见 _wait_task
+    th.start()
 
 
 def _worker(action, opts):
     phone = (opts.get('phone') or '').strip()
     password = opts.get('password') or ''
-    limit = int(opts.get('limit') or 0)
+    try:
+        # 安全转换：opts 来自 HTTP 请求体，limit 可能是任意字符串。
+        # 裸 int() 会在 try 之前抛 ValueError，落到 _spawn 的兜底复位分支
+        # （以前那里还带一个锁内 log 的死锁，见 _spawn 注释）。
+        limit = max(int(opts.get('limit') or 0), 0)
+    except (TypeError, ValueError):
+        limit = 0
     deep = bool(opts.get('deep', True))
     only = [str(k) for k in (opts.get('only') or []) if k]
 
@@ -391,6 +458,7 @@ def _worker(action, opts):
             items = out.get('courses') or []
             with LOCK:
                 STATE['courses'] = items
+                STATE['courses_v'] = STATE.get('courses_v', 0) + 1
                 STATE['summary'] = {'课程总数': len(items)}
             if items:
                 cs.log('课程列表已就绪：勾选要查询的课程（勾上即生效），再点「一键查询」。', 'ok')
@@ -568,9 +636,9 @@ def _answer_worker(opts):
                                 progress=progress, control=control)
         with LOCK:
             STATE['summary'] = {'交卷': out.get('submitted', 0),
+                                '已暂存': out.get('saved', 0),
                                 '未确认': out.get('unverified', 0),
                                 '部分暂存': out.get('partial', 0),
-                                '已暂存': out.get('saved', 0),
                                 '需人工': out.get('report', 0)
                                           + out.get('skipped', 0),
                                 '失败': out.get('fail', 0)}
@@ -608,8 +676,8 @@ def _answer_single_worker(opts):
     answer_one）：附件题整份跳过、题干读不出跳过、多空填空按空序切分、
     同题干复用上次答案、含不支持题型跳过。
     """
-    cs.log('')
     draft = bool(opts.get('draft'))
+    cs.log('')
     cs.log('▶ 任务开始：刷题（%s）'
            % ('单份作业，答完暂存不交卷' if draft
               else '单份作业，答完直接交卷'))
@@ -644,13 +712,12 @@ def _answer_single_worker(opts):
         out = cs.answer_urls(cfg, [{'url': opts.get('url'),
                                     'course': opts.get('course'),
                                     'title': opts.get('title')}],
-                             submit=not draft, progress=progress,
-                             control=control)
+                             submit=not draft, progress=progress, control=control)
         with LOCK:
             STATE['summary'] = {'交卷': out.get('submitted', 0),
+                                '已暂存': out.get('saved', 0),
                                 '未确认': out.get('unverified', 0),
                                 '部分暂存': out.get('partial', 0),
-                                '已暂存': out.get('saved', 0),
                                 '需人工': out.get('report', 0),
                                 '此前已交': out.get('already', 0),
                                 '这份没做': out.get('fail', 0)}
@@ -1180,6 +1247,7 @@ PAGE = r"""<!DOCTYPE html>
   .mini:disabled{opacity:.38;cursor:not-allowed;}
   .mini.pri{background:var(--ac);border-color:var(--ac);color:#08110f;font-weight:600;}
   .mini.pri .ic{color:#08110f;}
+  .mini.pri:hover:not(:disabled){background:var(--ac-hi);border-color:var(--ac-hi);}
   .bmenu{
     position:fixed;z-index:90;min-width:250px;padding:4px;
     background:var(--raise);border:1px solid var(--line-2);border-radius:8px;
@@ -1192,10 +1260,13 @@ PAGE = r"""<!DOCTYPE html>
   }
   .bmenu-it:hover{background:#1c2b2e;}
   .bmenu-it .t{display:block;font-size:var(--fs-base);}
-  .bmenu-it .s{display:block;color:var(--mut);margin-top:2px;line-height:1.5;}
-  .mini.pri:hover:not(:disabled){background:var(--ac-hi);border-color:var(--ac-hi);}
+  .bmenu-it .s{display:block;color:var(--mut);font-size:var(--fs-xs);
+    margin-top:2px;}
   .mini.attn{animation:attn 1s var(--ease) 2;}
   @keyframes attn{50%{box-shadow:0 0 0 3px var(--ac-soft);}}
+  #dockpane{padding:0;position:relative;overflow:hidden;}
+  #dockpane .empty{margin:40px 20px;font-size:var(--fs-base);color:var(--mut);padding:7px 0;}
+  #docklive{color:var(--warn);font-size:inherit;}
 
   .pane{flex:1;overflow:auto;min-height:0;}
   #log{
@@ -1419,23 +1490,49 @@ PAGE = r"""<!DOCTYPE html>
   details.notes a{color:var(--ac);text-decoration:none;overflow-wrap:anywhere;}
   details.notes a:hover{text-decoration:underline;}
 
-  /* 视觉模型（可选）：默认折起。它只是主模型的补充，常驻展开会把「地址 /
-     模型名 / Key」这三样淹掉；沿用说明区那套 chev 折叠语言，展开时才亮主色。 */
+  /* 视觉模型（可选）：默认折起，但**做成一张有边框的卡**——旧版只是一行灰字，
+     容易被当成说明文字划过去（用户真机反馈「看不太明显」）。现在给它底色 +
+     边框 + 主色图标 + 状态徽标，一眼能看出「这里还能加一个模型」。展开后才亮主色。 */
   details.visbox{
-    margin-top:10px;padding-top:9px;border-top:1px solid var(--line);
+    margin-top:12px;border:1px solid var(--line);border-radius:8px;
+    background:var(--sunk);overflow:hidden;
   }
+  details.visbox[open]{border-color:var(--line-2);}
   details.visbox > summary{
-    display:flex;align-items:center;gap:7px;cursor:pointer;list-style:none;
-    font-size:var(--fs-xs);font-weight:600;color:var(--mut);padding:4px 0;
+    display:flex;align-items:center;gap:8px;cursor:pointer;list-style:none;
+    padding:9px 11px;color:var(--tx-2);
   }
   details.visbox > summary::-webkit-details-marker{display:none;}
-  details.visbox > summary:hover{color:var(--tx-2);}
+  details.visbox > summary:hover{background:var(--raise);}
   details.visbox > summary .chev{
-    width:13px;height:13px;flex:none;transition:transform var(--t) var(--ease);
+    width:13px;height:13px;flex:none;color:var(--mut);
+    transition:transform var(--t) var(--ease);
   }
-  details.visbox[open] > summary .chev{transform:rotate(90deg);}
-  details.visbox[open] > summary{color:var(--ac);}
-  details.visbox > .mstat{margin-top:9px;}
+  details.visbox[open] > summary .chev{transform:rotate(90deg);color:var(--ac);}
+  details.visbox .visic{width:15px;height:15px;flex:none;color:var(--ac);}
+  details.visbox .vistt{
+    flex:1 1 auto;min-width:0;display:flex;flex-direction:column;gap:1px;
+  }
+  details.visbox .vistt b{
+    font-size:var(--fs-sm);font-weight:600;color:var(--tx);line-height:1.4;
+  }
+  details.visbox > summary:hover .vistt b{color:var(--ac);}
+  details.visbox .vishint{font-size:var(--fs-xs);color:var(--mut);font-weight:400;}
+  details.visbox .vischip{
+    display:inline-block;margin-left:5px;padding:0 5px;border-radius:999px;
+    font-size:var(--fs-xs);font-weight:600;vertical-align:1px;
+    color:var(--ac);background:var(--ac-soft);border:1px solid rgba(63,182,168,.30);
+  }
+  details.visbox .visbadge{
+    flex:none;padding:1px 7px;border-radius:999px;font-size:var(--fs-xs);
+    font-weight:600;color:var(--mut);background:var(--raise);
+    border:1px solid var(--line);
+  }
+  details.visbox .visbadge.on{
+    color:var(--ok);border-color:rgba(111,192,141,.34);
+  }
+  details.visbox .visbody{padding:0 11px 11px;}
+  details.visbox > .visbody{margin-top:9px;}
   details.visbox .note{margin-top:8px;}
 
   /* 页脚：联系方式与下载地址。常驻可见（不折进说明区），
@@ -1505,7 +1602,9 @@ PAGE = r"""<!DOCTYPE html>
                 aria-label="显示或隐藏密码"></button>
       </div>
       <label class="chk"><input type="checkbox" id="remember">
-        记住账号（只记手机号，不记密码）</label>
+        记住账号</label>
+      <label class="chk"><input type="checkbox" id="rememberpwd">
+        记住密码（加密存在本机）</label>
       <label class="chk"><input type="checkbox" id="deep" checked>
         下钻到章节，列出未完成任务点</label>
       <button class="btn pri" id="bquery"><span class="ic" data-i="search"></span>
@@ -1587,37 +1686,52 @@ PAGE = r"""<!DOCTYPE html>
           不回显在页面上。做作业用你自己的 Key 按量计费，一份选择题通常几分钱。</p>
 
         <details class="visbox">
-          <summary><span class="chev" data-i="chev"></span>视觉模型（可选）—— 让模型「亲眼看」公式题 / 图表题</summary>
-          <div class="mstat" id="visstate">
-            <span class="ic" data-i="plug"></span><span>读取中…</span>
+          <summary>
+            <span class="chev" data-i="chev"></span>
+            <span class="visic" data-i="eye"></span>
+            <span class="vistt">
+              <b>视觉模型（可选）<span class="vischip">加强</span></b>
+              <span class="vishint">让模型「亲眼看」公式题 / 图表题</span>
+            </span>
+            <span class="visbadge" id="visbadge">未启用</span>
+          </summary>
+          <div class="visbody">
+            <div class="mstat" id="visstate">
+              <span class="ic" data-i="plug"></span><span>读取中…</span>
+            </div>
+            <div class="row" style="margin:9px 0 8px">
+              <button class="btn sm grow" id="bvisfrommain"
+                      title="把上面主模型的地址 / 模型名 / Key 原样搬到这一块">
+                <span class="ic" data-i="copy"></span>复制上面主模型的配置</button>
+            </div>
+            <div class="field">
+              <select id="vis_platform"></select>
+            </div>
+            <div class="field">
+              <input type="text" id="vis_url" placeholder="接口地址（填到 /v1 即可）">
+            </div>
+            <div class="field">
+              <input type="text" id="vis_model" placeholder="视觉模型名，如 qwen-vl-max">
+            </div>
+            <div class="field has-in">
+              <input type="password" id="vis_key" placeholder="API Key">
+              <button type="button" class="ic-in" id="bviskeyeye" data-for="vis_key"
+                      aria-pressed="false" title="显示 / 隐藏 API Key"
+                      aria-label="显示或隐藏 API Key"></button>
+            </div>
+            <div class="row" style="margin-bottom:8px">
+              <button class="btn sm pri grow" id="bvis">
+                <span class="ic" data-i="check"></span>保存</button>
+              <button class="btn sm grow" id="bvistest">
+                <span class="ic" data-i="bolt"></span>测试连接</button>
+              <button class="btn sm dgr" id="bvisclear" title="清除本机保存的视觉模型 Key">
+                <span class="ic" data-i="trash"></span></button>
+            </div>
+            <p class="note">题面是图片或公式的题（超星的数学公式常以图片 / MathML 渲染），
+              纯文字提取拿不到题面，交给它看图作答。留空 = 不启用，仍按纯文本答题；
+              只对主观题和带图 / 公式的题调用，客观选择题不花这份钱。
+              可以跟上面用同一家的同一个 Key —— 直接点「复制上面主模型的配置」即可。</p>
           </div>
-          <div class="field">
-            <select id="vis_platform"></select>
-          </div>
-          <div class="field">
-            <input type="text" id="vis_url" placeholder="接口地址（填到 /v1 即可）">
-          </div>
-          <div class="field">
-            <input type="text" id="vis_model" placeholder="视觉模型名，如 qwen-vl-max">
-          </div>
-          <div class="field has-in">
-            <input type="password" id="vis_key" placeholder="API Key">
-            <button type="button" class="ic-in" id="bviskeyeye" data-for="vis_key"
-                    aria-pressed="false" title="显示 / 隐藏 API Key"
-                    aria-label="显示或隐藏 API Key"></button>
-          </div>
-          <div class="row" style="margin-bottom:8px">
-            <button class="btn sm pri grow" id="bvis">
-              <span class="ic" data-i="check"></span>保存</button>
-            <button class="btn sm grow" id="bvistest">
-              <span class="ic" data-i="bolt"></span>测试连接</button>
-            <button class="btn sm dgr" id="bvisclear" title="清除本机保存的视觉模型 Key">
-              <span class="ic" data-i="trash"></span></button>
-          </div>
-          <p class="note">题面是图片或公式的题（超星的数学公式常以图片 / MathML 渲染），
-            纯文字提取拿不到题面，交给它看图作答。留空 = 不启用，仍按纯文本答题；
-            只对主观题和带图 / 公式的题调用，客观选择题不花这份钱。
-            可以跟上面用同一家的同一个 Key。</p>
         </details>
       </div>
     </section>
@@ -1668,6 +1782,8 @@ PAGE = r"""<!DOCTYPE html>
     <div class="tabs">
       <button class="tab on" data-t="res">查询结果</button>
       <button class="tab" data-t="log">运行日志</button>
+      <button class="tab" data-t="dock">预览<span id="docklive"
+        style="display:none">（进行中）</span></button>
     </div>
     <div class="bar">
       <span class="ttl" id="bartip">尚未查询</span>
@@ -1677,6 +1793,9 @@ PAGE = r"""<!DOCTYPE html>
     </div>
     <div class="pane" id="res"><div class="empty">还没有结果。填好账号密码后点左侧「一键查询未完成事项」。</div></div>
     <div class="pane" id="logpane" style="display:none"><pre id="log"></pre></div>
+    <div class="pane" id="dockpane" style="display:none">
+      <div class="empty" id="dockempty">无内容</div>
+    </div>
   </div>
 </div>
 <div class="toast" id="toast"></div>
@@ -1688,8 +1807,10 @@ let pollSeq = 0;        // 轮询代际令牌：按钮重启 poll 时使在途�
                         // 会把同一批日志追加 N 遍（实测出现过 ×2 / ×4）
 let rv = -1;            // 已经拿到的结果版本号（回传给服务端，避免重复下发整份报告）
 let av = -1;            // 交卷结果面板的版本号（机制同 rv）
+let cv = -1;            // 课程勾选清单的版本号（机制同 rv；变了才整份下发）
 let aitems = [];        // 交卷结果面板的数据（重新核实按钮要用）
 let cardFp = '';        // 左侧统计卡片的指纹：内容没变就不重建 DOM
+let lastDockN = 0;      // 预览页签：上一轮 poll 的浏览器窗口数（变了才动 DOM）
 // 刷题 / 刷课 / 答题这类任务在启动成功时置位；任务一结束就把界面收回到
 // 「查询结果」，并用左侧当前勾选自动重跑一次查询。不这样做的话，结果区会一直
 // 挂着启动时那句「正在后台刷这一份…」——因为单份刷题不产生交卷面板
@@ -1755,6 +1876,8 @@ const ICON_PATHS = {
   refresh:'<path d="M13.4 8A5.4 5.4 0 1 1 11.8 4.2"/><path d="M13.6 2.7v3.1h-3.1"/>',
   external:'<path d="M9.5 6.5 13.6 2.4"/><path d="M10.7 2.4h2.9v2.9"/>'
     +'<path d="M12.1 9.6v3.4a1 1 0 0 1-1 1H3.6a1 1 0 0 1-1-1V5.5a1 1 0 0 1 1-1h3.3"/>',
+  copy:'<rect x="5.4" y="5.4" width="8.2" height="8.2" rx="1.4"/>'
+    +'<path d="M2.4 10.2V3.8a1.4 1.4 0 0 1 1.4-1.4h6.4"/>',
 };
 function icon(name){
   return '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" '
@@ -1795,6 +1918,38 @@ function toast(msg, kind){
 try {
   const saved = localStorage.getItem('cx_phone');
   if (saved) { $('phone').value = saved; $('remember').checked = true; }
+
+  // 记住密码：勾上即存（后端 DPAPI 加密，本机本用户才解得开），
+  // 取消即删。勾选时密码框是空的 = 没东西可记，弹回去让先填。
+  $('rememberpwd').onchange = () => {
+    if (!$('rememberpwd').checked) {
+      fetch('/api/pwd-forget', {method:'POST',
+        headers:{'Content-Type':'application/json'}});
+      return;
+    }
+    const pw = $('pwd').value;
+    if (!pw) {
+      $('rememberpwd').checked = false;
+      alert('先填密码，再勾「记住密码」。');
+      return;
+    }
+    fetch('/api/pwd-save', {method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({password: pw})})
+      .then(r => r.json()).then(j => {
+        if (!j.ok) {
+          $('rememberpwd').checked = false;
+          alert('这台机器加密不可用，密码没有保存（仍需每次手输）。');
+        }
+      });
+  };
+  // 启动回填：存过密码就填回去并勾上（密码框已有输入时不打扰）。
+  fetch('/api/pwd-get').then(r => r.json()).then(j => {
+    if (j.has && j.pwd && !$('pwd').value) {
+      $('pwd').value = j.pwd;
+      $('rememberpwd').checked = true;
+    }
+  }).catch(() => {});
 } catch(e){}
 
 function append(lines){
@@ -1817,6 +1972,23 @@ function esc(s){
 // 抓来的 URL 只认 http(s)：javascript: 之类的伪协议点了就执行
 function safeUrl(u){
   return (/^https?:\/\//i).test(String(u || '')) ? esc(u) : '';
+}
+// 桌面窗口（v4.0）：页面里的外链都带 target="_blank"。在窗口内跳转会顶掉
+// 整个界面、而且没有后退键，所以桌面模式下拦住它，改让后端用系统默认浏览器
+// 打开（见 /api/open）。网页模式不拦 —— 那里开新标签页本来就是对的。
+// 排除 .go-work：「去完成」由下面自己的处理器走 /api/open-work（带登录态、
+// 开进预览），不能被这里抢去开系统浏览器——真机 2026-10-10 两个窗口齐飞的
+// 根因就是这个拦截器与 .go-work 处理器在同一张链接上同时命中。
+if (__DESKTOP__) {
+  document.addEventListener('click', function (ev) {
+    var a = ev.target && ev.target.closest
+      ? ev.target.closest('a[target="_blank"]:not(.go-work)') : null;
+    if (!a || !a.href) return;
+    ev.preventDefault();
+    fetch('/api/open', {method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({url: a.href})});
+  }, true);
 }
 
 // ---------- 课程勾选 ----------
@@ -1998,7 +2170,7 @@ function renderResult(r){
          + '</td><td><span class="st err">' + esc(it.state) + '</span></td>'
          + '<td class="num sub">' + esc(it.left || '—') + '</td>'
          + '<td class="col-act">'
-         + (u ? '<a href="' + u + '" class="go-work" target="_blank" rel="noopener">去完成</a>' : '')
+         + (u ? '<a href="' + u + '" class="go-work" rel="noopener">去完成</a>' : '')
          + (u ? ' <button class="mini" onclick="brushMenu(event,\'row\',' + i + ')"'
               + ' title="让大模型做这一份：点开选「暂存」（存平台草稿，人工审查后自己交）'
               + '或「提交」（直接正式交卷）。要上传附件的题整份跳过，不会乱填">'
@@ -2110,7 +2282,8 @@ async function poll(){
   if (closed) return;
   let busy = false;
   try{
-    const r = await fetch('/api/poll?since=' + since + '&rv=' + rv + '&av=' + av);
+    const r = await fetch('/api/poll?since=' + since + '&rv=' + rv
+      + '&av=' + av + '&cv=' + cv);
     if (me !== pollSeq) return;  // 等待期间又有新循环启动了 → 这轮作废
     const j = await r.json();
     busy = !!j.running;
@@ -2121,8 +2294,15 @@ async function poll(){
       dropped = j.dropped || 0;
       since = 0; logEl.innerHTML = '';
     }
+    // 新任务启动后服务端把 lines 清成 []：total < since 说明手里的游标
+    // 已指向不存在的区域，回到 0 重拉。只回游标不清 DOM —— 旧任务的
+    // 过程记录留在页面上，新任务的日志接在后面（自动刷新不清日志）。
+    if ((j.total || 0) < since) since = 0;
     if (j.lines && j.lines.length){ append(j.lines); since = j.total; }
-    if (j.courses && j.courses.length) renderCourses(j.courses);
+    if (j.courses_v !== undefined && j.courses_v !== cv){
+      cv = j.courses_v;
+      if (j.courses && j.courses.length) renderCourses(j.courses);
+    }
     $('dot').className = 'dot' + (j.running ? ' on' : '');
     const paused = !!j.paused;
     const finishing = j.phase === 'finishing';
@@ -2135,6 +2315,16 @@ async function poll(){
     // setText 内部做了「值没变就不写 DOM」，每轮轮询不会造成无谓重排。
     setText($('whotxt'), j.login_who ? ('本机会话：' + j.login_who) : '');
     $('who').style.display = j.login_who ? '' : 'none';
+    // 「预览」页签：有浏览器窗口嵌着就亮「（进行中）」，面板收起占位。
+    // 状态翻转才动 DOM；0→N 的第一下弹提示（不自动切页签，别打断用户）。
+    const dn = j.dock_n || 0;
+    $('docklive').style.display = dn ? '' : 'none';
+    if (dn !== lastDockN){
+      $('dockempty').style.display = dn ? 'none' : '';
+      if (dn > lastDockN)
+        toast('浏览器窗口已就绪：点「预览」页签查看与操作');
+      lastDockN = dn;
+    }
     ['bquery','blogin','blist'].forEach(i => $(i).disabled = j.running);
     $('bquery').title = j.running
       ? (finishing ? '正在收尾（生成报告），稍等几秒就能再次查询' : '任务进行中，请先暂停或停止')
@@ -2268,12 +2458,19 @@ async function run(action, opts){
     limit: nTop,             // 只查最近 N 门；勾选非空时后端以勾选为准
     deep: $('deep').checked
   };
+  // 勾着「记住密码」发起查询：顺手把当前输入的密码存上 ——
+  // 这样记住的永远是最近一次真正拿去登录的那把，而不是当初勾选时的。
+  if ($('rememberpwd').checked && body.password) {
+    fetch('/api/pwd-save', {method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({password: body.password})});
+  }
   let resp;
   try {
     resp = await fetch('/api/run', {method:'POST',
       headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
   } catch(e) {
-    toast('连不上本地程序，请确认那个黑色命令行窗口还在运行', 'err');
+    toast('连不上本地程序，请确认程序还在运行', 'err');
     return;
   }
   // 之前这里不看返回码：服务端回 409「忙」时前端照样切到「查询中」，
@@ -2322,7 +2519,33 @@ function switchTab(t){
   document.querySelectorAll('.tab').forEach(b => b.classList.toggle('on', b.dataset.t === t));
   $('res').style.display = t === 'res' ? '' : 'none';
   $('logpane').style.display = t === 'log' ? '' : 'none';
+  $('dockpane').style.display = t === 'dock' ? '' : 'none';
+  postDockRect();
 }
+
+// ---------- 预览页签（内嵌浏览器） ----------
+// 后端用 SetParent 把工具开出的 Chrome 挂成主窗口的子窗口，位置对齐
+// #dockpane。这里只负责把面板矩形（CSS 像素）实时报给后端：页签切换 /
+// 窗口缩放 / 面板自身布局变化（ResizeObserver 兜底）都触发一次推送，
+// 后端按窗口 DPI 换算成物理像素。60ms 防抖：拖窗口边缘别把请求打爆。
+let dockRectTimer = null;
+function postDockRect(){
+  const p = $('dockpane');
+  if (!p) return;
+  const r = p.getBoundingClientRect();
+  clearTimeout(dockRectTimer);
+  dockRectTimer = setTimeout(() => {
+    fetch('/api/dock-rect', {method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({l: r.left, t: r.top, w: r.width, h: r.height,
+                            on: p.style.display !== 'none' && r.width > 0
+                                && r.height > 0})}).catch(() => {});
+  }, 60);
+}
+window.addEventListener('resize', postDockRect);
+if (window.ResizeObserver)
+  new ResizeObserver(postDockRect).observe($('dockpane'));
+postDockRect();
 
 // ---------- 未完成作业每行的「刷题」 ----------
 // 只做点中的那一份。判别 / 答题 / 交卷与任务点的「做作业并交卷」共用同一条
@@ -2349,7 +2572,7 @@ function answerThis(ev, i, draft){
     switchTab('log');
     clearTimeout(timer);
     poll();
-  }).catch(() => toast('连不上本地程序，请确认那个黑色命令行窗口还在运行', 'err'));
+  }).catch(() => toast('连不上本地程序，请确认程序还在运行', 'err'));
 }
 
 // ---------- 刷题下拉菜单 ----------
@@ -2431,7 +2654,7 @@ function startBrush(ev){
     switchTab('log');
     clearTimeout(timer);
     poll();
-  }).catch(() => toast('连不上本地程序，请确认那个黑色命令行窗口还在运行', 'err'));
+  }).catch(() => toast('连不上本地程序，请确认程序还在运行', 'err'));
 }
 
 // 刷课+刷题：先刷选中范围的视频，再对同一批范围做作业并交卷。
@@ -2458,7 +2681,7 @@ function startCombo(ev){
     switchTab('log');
     clearTimeout(timer);
     poll();
-  }).catch(() => toast('连不上本地程序，请确认那个黑色命令行窗口还在运行', 'err'));
+  }).catch(() => toast('连不上本地程序，请确认程序还在运行', 'err'));
 }
 
 function toggleAllBrush(ev){
@@ -2473,7 +2696,8 @@ function toggleAllBrush(ev){
 // 万一黑屏唤不醒：按 Win+Ctrl+Shift+B 重置显卡驱动即可恢复。
 function screenOff(ev){
   if (ev) ev.stopPropagation();
-  fetch('/api/screen-off', {method:'POST'})
+  fetch('/api/screen-off', {method:'POST',
+    headers:{'Content-Type':'application/json'}})
     .then(r => { if (!r.ok) toast('熄屏请求失败（HTTP ' + r.status + '）', 'err'); })
     .catch(() => toast('连不上本地程序', 'err'));
 }
@@ -2502,7 +2726,7 @@ function startAnswer(ev, draft){
     switchTab('log');
     clearTimeout(timer);
     poll();
-  }).catch(() => toast('连不上本地程序，请确认那个黑色命令行窗口还在运行', 'err'));
+  }).catch(() => toast('连不上本地程序，请确认程序还在运行', 'err'));
 }
 
 // ---------- 交卷结果面板 ----------
@@ -2513,8 +2737,8 @@ function startAnswer(ev, draft){
 // 状态 → [文案, 记号类]。颜色交给盘色变量，不在这里写死色值。
 const AST = {
   done:       ['已交卷', 'ok'],
-  ok:         ['已暂存 · 待审查后交', 'ok'],
   already:    ['已交卷（此前已交）', 'ok'],
+  ok:         ['已暂存 · 待审查后交', 'ok'],
   fail:       ['交卷失败', 'err'],
   unverified: ['已发出 · 待平台确认', 'warn'],
   still:      ['仍未确认', 'warn'],
@@ -2556,7 +2780,7 @@ function renderAnswerResult(a){
        + '</td><td><span class="st ' + st[1] + '">' + esc(st[0]) + '</span></td>'
        + '<td class="col-act">'
        + (safeUrl(it.url) ? '<a href="' + safeUrl(it.url)
-                            + '" target="_blank" rel="noopener">打开作业</a>' : '')
+                            + '" class="go-work" rel="noopener">打开作业</a>' : '')
        + '</td></tr>';
   });
   h += '</tbody></table></div>';
@@ -2580,7 +2804,7 @@ async function verifyAnswer(ev){
     clearTimeout(timer);
     poll();
   }catch(e){
-    toast('连不上本地程序，请确认那个黑色命令行窗口还在运行', 'err');
+    toast('连不上本地程序，请确认程序还在运行', 'err');
   }
 }
 
@@ -2666,7 +2890,7 @@ $('bllm').onclick = () => {
       + '　·　以后打开这台电脑不用再填');
     toast('模型设置已保存', 'ok');
   }).catch(() => {
-    llmSetState('err', '连不上本地程序，请确认那个黑色命令行窗口还在运行');
+    llmSetState('err', '连不上本地程序，请确认程序还在运行');
     toast('连不上本地程序', 'err');
   }).finally(() => {
     b.disabled = false; b.innerHTML = old;
@@ -2679,7 +2903,13 @@ $('bllmtest').onclick = () => {
   b.innerHTML = '<span class="ic">' + icon('bolt') + '</span>连接中…';
   llmSetState('', '正在连接…（最长约 30 秒）');
   fetch('/api/llm-test', {method:'POST', headers:{'Content-Type':'application/json'},
-    body: JSON.stringify(llmForm())}).then(async r => {
+    // 后端主模型分支读的是 llm_url/llm_model（视觉分支同款）。以前发
+    // llmForm()（键名是 url/model）后端根本读不到 —— 界面填了也白填，
+    // 测的一直是磁盘上的旧地址（v4.0 二审发现）。
+    body: JSON.stringify({
+      llm_url: $('llm_url').value.trim(),
+      llm_model: $('llm_model').value.trim(),
+      llm_key: $('llm_key').value.trim()})}).then(async r => {
     const j = await r.json().catch(() => ({}));
     if (r.ok){
       llmSetState('ok', '连接正常，模型回了：' + (j.reply || '（空）'));
@@ -2690,7 +2920,7 @@ $('bllmtest').onclick = () => {
       toast('连接失败：' + (j.error || ('HTTP ' + r.status)), 'err');
     }
   }).catch(() => {
-    llmSetState('err', '连不上本地程序，请确认那个黑色命令行窗口还在运行');
+    llmSetState('err', '连不上本地程序，请确认程序还在运行');
     toast('连不上本地程序', 'err');
   }).finally(() => {
     b.disabled = false; b.innerHTML = old;
@@ -2732,6 +2962,13 @@ function visSetState(kind, text){
                 + '</span><span>' + esc(text) + '</span>';
 }
 
+function visBadge(on, text){
+  const el = $('visbadge');
+  if (!el) return;
+  el.textContent = text || (on ? '已启用' : '未启用');
+  el.className = 'visbadge' + (on ? ' on' : '');
+}
+
 function visRefreshState(){
   const url = $('vis_url').value.trim(), model = $('vis_model').value.trim();
   const typed = $('vis_key').value.trim();
@@ -2744,12 +2981,15 @@ function visRefreshState(){
   const noVisModel = (p && p.url && !p.vision_model && !model);
   if (!url && !model && !hasKey){
     visSetState('', '未启用 —— 题面是图片 / 公式的题会答不上，其余题不受影响。');
+    visBadge(false, '未启用');
   } else if (url && model && hasKey){
     visSetState('ok', '已配置 · ' + (p ? p.label : '自定义') + ' · ' + model
       + (typed ? '（Key 待保存）' : ''));
+    visBadge(!typed, typed ? '待保存' : '已启用');
   } else if (noVisModel){
     visSetState('warn', p.label + ' 目前没有视觉模型 —— 换一家'
       + '（通义千问 / 智谱 / OpenAI），或自己把模型名填进去。');
+    visBadge(false, '待配置');
   } else {
     const miss = [];
     if (!url) miss.push('接口地址');
@@ -2757,6 +2997,7 @@ function visRefreshState(){
     if (!hasKey) miss.push('API Key');
     visSetState('warn', '还差' + miss.join('、') + ' —— 三项都填上才生效。'
       + '不想用就保持全空。');
+    visBadge(false, '待配置');
   }
   $('vis_key').placeholder = visKeySet
     ? ('已保存 ' + (visStateMask || '') + '　留空表示不改动')
@@ -2793,7 +3034,7 @@ $('bvis').onclick = () => {
     visRefreshState();
     toast('视觉模型设置已保存', 'ok');
   }).catch(() => {
-    visSetState('err', '连不上本地程序，请确认那个黑色命令行窗口还在运行');
+    visSetState('err', '连不上本地程序，请确认程序还在运行');
     toast('连不上本地程序', 'err');
   }).finally(() => {
     b.disabled = false; b.innerHTML = old;
@@ -2819,7 +3060,7 @@ $('bvistest').onclick = () => {
       toast('视觉模型连接失败：' + (j.error || ('HTTP ' + r.status)), 'err');
     }
   }).catch(() => {
-    visSetState('err', '连不上本地程序，请确认那个黑色命令行窗口还在运行');
+    visSetState('err', '连不上本地程序，请确认程序还在运行');
     toast('连不上本地程序', 'err');
   }).finally(() => {
     b.disabled = false; b.innerHTML = old;
@@ -2838,6 +3079,45 @@ $('bvisclear').onclick = () => {
     visRefreshState();
     toast('已清除本机保存的视觉模型 Key', 'ok');
   }).catch(() => toast('连不上本地程序', 'err'));
+};
+
+// 「复制上面主模型的配置」：把主模型的平台 / 地址 / 模型名搬到视觉这一块，
+// Key 交给后端在服务端一起搬（页面拿不到主模型 Key 的明文，不回显是纪律）。
+// 搬完立刻保存，用户点一下就不用再手打一遍。
+$('bvisfrommain').onclick = () => {
+  const url = $('llm_url').value.trim(), model = $('llm_model').value.trim();
+  if (!url && !model){
+    toast('上面主模型还没填，先配好主模型再复制', 'warn');
+    return;
+  }
+  const plat = $('llm_platform').value;
+  if (plat) $('vis_platform').value = plat;
+  $('vis_url').value = url;
+  $('vis_model').value = model;
+  const b = $('bvisfrommain'), old = b.innerHTML;
+  b.disabled = true;
+  b.innerHTML = '<span class="ic">' + icon('copy') + '</span>复制中…';
+  fetch('/api/llm-config', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({vision: {copy_main: true}})}).then(async r => {
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok){
+      visSetState('err', '复制失败：' + (j.error || ('HTTP ' + r.status)));
+      toast('复制失败：' + (j.error || ('HTTP ' + r.status)), 'err');
+      return;
+    }
+    // Key 在服务端搬好了：本地记下「已保存」，占位符跟着更新，
+    // 输入框保持空白（不回显 Key）。
+    visKeySet = !!j.vision_key_set;
+    visStateMask = j.vision_key_mask || '';
+    $('vis_key').value = '';
+    visRefreshState();
+    toast('已把主模型的配置复制到视觉模型', 'ok');
+  }).catch(() => {
+    visSetState('err', '连不上本地程序，请确认程序还在运行');
+    toast('连不上本地程序', 'err');
+  }).finally(() => {
+    b.disabled = false; b.innerHTML = old;
+  });
 };
 
 // 打开页面就把已有配置带出来。**Key 不回显**：后端只给「有没有存」和脱敏串，
@@ -2929,7 +3209,8 @@ $('bclear').onclick = () => { logEl.innerHTML = ''; };
 // 显式 SC_MONITORPOWER），动下鼠标屏幕就亮，再点一下即可。
 // 万一黑屏唤不醒：按 Win+Ctrl+Shift+B 重置显卡驱动即可恢复，不必强制关机。
 $('boff').onclick = () => {
-  fetch('/api/screen-off', {method:'POST'})
+  fetch('/api/screen-off', {method:'POST',
+    headers:{'Content-Type':'application/json'}})
     .then(r => { if (!r.ok) toast('熄屏请求失败（HTTP ' + r.status + '）', 'err'); })
     .catch(() => toast('连不上本地程序', 'err'));
 };
@@ -2961,23 +3242,28 @@ document.addEventListener('click', function (ev) {
     .then(({ok, j}) => { if (!ok) alert(j.error || '打开失败'); })
     .catch(() => alert('打开失败：后台服务未响应'));
 });
-$('bopen').onclick  = () => fetch('/api/open-report', {method:'POST'});
-$('bdir').onclick   = () => fetch('/api/open-dir', {method:'POST'});
+$('bopen').onclick  = () => fetch('/api/open-report', {method:'POST',
+      headers:{'Content-Type':'application/json'}});
+$('bdir').onclick   = () => fetch('/api/open-dir', {method:'POST',
+      headers:{'Content-Type':'application/json'}});
 $('bpause').onclick = () => {
   const on = $('bpause').dataset.paused === '1';
-  fetch(on ? '/api/resume' : '/api/pause', {method:'POST'});
+  fetch(on ? '/api/resume' : '/api/pause', {method:'POST',
+      headers:{'Content-Type':'application/json'}});
 };
 $('bstop').onclick = () => {
   if (!confirm('停止当前任务？\n\n查询：已扫完的课程会照常出报告，只是标注为「中止扫描」。\n'
                + '刷视频：已刷完的不受影响，没刷完的保持原样。'
                + '\n停止后有几秒收尾时间，这几秒里不能开始新任务。')) return;
-  fetch('/api/cancel', {method:'POST'});
+  fetch('/api/cancel', {method:'POST',
+      headers:{'Content-Type':'application/json'}});
 };
 $('bquit').onclick  = async () => {
   if (!confirm('确定退出程序吗？\n\n后台进程会结束、端口释放；正在跑的查询会被中断。')) return;
   closed = true;
   clearTimeout(timer);
-  try { await fetch('/api/quit', {method:'POST'}); } catch(e){}
+  try { await fetch('/api/quit', {method:'POST',
+      headers:{'Content-Type':'application/json'}}); } catch(e){}
   document.body.innerHTML =
     '<div style="font-family:system-ui,-apple-system,\'Microsoft YaHei\',sans-serif;'
     + 'background:#141414;color:#ddd;height:100vh;display:flex;flex-direction:column;'
@@ -3029,18 +3315,26 @@ class Handler(BaseHTTPRequestHandler):
         if u.path in ('/', '/index.html'):
             # PAGE 是 raw 字符串，塞不进 f-string；版本号用占位符在这里替换，
             # 免得版本改了界面还挂着旧号（用户报问题时说不清自己用的哪版）
-            html = PAGE.replace('__VERSION__', cs.VERSION)
+            html = PAGE.replace('__VERSION__', cs.VERSION).replace(
+                '__DESKTOP__', 'true' if DESKTOP['mode'] else 'false')
             return self._send(200, html.encode('utf-8'), 'text/html; charset=utf-8')
+        if u.path == '/api/pwd-get':
+            # 启动回填用：有没有存过 + 明文一次（DPAPI 只认本机本用户，
+            # 且只走本机回环；界面拿到后只进密码框，不写日志）。
+            return self._send(200, json.dumps({
+                'has': cs.has_login_pwd(),
+                'pwd': cs.load_login_pwd()}).encode('utf-8'))
         if u.path == '/api/poll':
             q = parse_qs(u.query)
             try:
                 since = int((q.get('since') or ['0'])[0] or 0)
                 rv = int((q.get('rv') or ['-1'])[0] or -1)
                 av = int((q.get('av') or ['-1'])[0] or -1)
+                cvq = int((q.get('cv') or ['-1'])[0] or -1)
             except ValueError:
                 # 畸形参数按缺省处理：不给响应会让 socketserver 往
                 # 黑色控制台刷 traceback，可被脚本刷屏
-                since, rv, av = 0, -1, -1
+                since, rv, av, cvq = 0, -1, -1, -1
             # 本机这份会话属于哪个账号。以前界面对此只字不提，用户很容易
             # 「以为在查自己的号，其实查的是上一个登录过的号」（换号时最
             # 容易踩）。每次轮询现读文件，保证显示的和实际用的一致——读不
@@ -3049,6 +3343,10 @@ class Handler(BaseHTTPRequestHandler):
                 who = cs.session_label() if cs.STATE_FILE.exists() else ''
             except Exception:
                 who = ''
+            # dock_count() 自己也要拿 LOCK——绝不能在下面 with LOCK: 块里调，
+            # 否则 Lock 不可重入 = 每次 poll 自我死锁（真机「按钮全没反应」
+            # 与「× 关闭卡死」的根因，2026-10-09 真机抓到）。先在锁外算好。
+            dn_dock = dock_count()
             with LOCK:
                 payload = {'login_who': who,
                            'lines': STATE['lines'][since:],
@@ -3059,15 +3357,22 @@ class Handler(BaseHTTPRequestHandler):
                            'phase': STATE['phase'],
                            'done': STATE['done'], 'summary': STATE['summary'],
                            'report': STATE['report'],
-                           'courses': STATE['courses'],
+                           'courses_v': STATE['courses_v'],
                            'login_fail': STATE['login_fail'],
                            'started': STATE['started'],
                            'result_v': STATE['result_v'],
-                           'ares_v': STATE['ares_v']}
+                           'ares_v': STATE['ares_v'],
+                           'dock_n': dn_dock}
                 # 报告本体可能很大（几十门课的明细）。界面已经拿到这一版时就别再
                 # 重复下发 —— 否则每次轮询都要把整个报告序列化一遍送过去。
-                if rv != STATE['result_v']:
+                # 运行期不下发上一份 result：前端在 running 期间本来就不
+                # ack（不更新 rv），这份 dict 会每 400ms 重发一遍，一刷
+                # 几小时就是上万次无谓序列化。
+                if not STATE['running'] and rv != STATE['result_v']:
                     payload['result'] = STATE['result']
+                # courses 同理：客户端拿过这一版就不再整份重发
+                if cvq != STATE['courses_v']:
+                    payload['courses'] = STATE['courses']
                 if av != STATE['ares_v']:
                     payload['ares'] = STATE['ares']
             return self._send(200, json.dumps(payload, ensure_ascii=False).encode('utf-8'))
@@ -3104,28 +3409,75 @@ class Handler(BaseHTTPRequestHandler):
 
     # 解析请求体的 POST 接口：必须带 application/json 头。
     # HTML 表单发不出这个头 → 表单型 CSRF 无法伪造这些操作。
-    _JSON_PATHS = ('/api/run', '/api/brush', '/api/answer', '/api/answer-one',
-                   '/api/combo', '/api/answer-verify', '/api/llm-config',
-                   '/api/llm-test', '/api/open-work')
+    # v4.0 审查后这道闸升级成「所有 /api POST 都要 JSON 头」（见 do_POST）。
+    # 清单保留作对照：曾经只对这里列的端点设闸，/api/answer-one 恰好
+    # 漏在名单外 —— 按端点挑名单的维护方式本身就是缺陷。
+    _JSON_PATHS = ('/api/run', '/api/brush', '/api/answer', '/api/combo',
+                   '/api/answer-one', '/api/answer-verify',
+                   '/api/llm-config', '/api/llm-test',
+                   # /api/open 带外部可控的 url，必须挡掉无预检的跨源 POST
+                   '/api/open')
+
+    def _drain_body(self):
+        """把还没读走的请求体读干净，然后再回包。
+
+        403 / 415 这些「还没读 body 就拒」的分支如果直接回包头就关连接，
+        Windows 看到 socket 里仍压着没读走的请求体，关闭时会发 RST，客户端
+        收到的就不是我们精心写好的 403/415，而是 ConnectionAbortedError
+        （CSRF 防线自测里就是这种偶发：同一个用例时过时不过）。先读干净
+        再回，状态码才稳定送达，也不再往控制台漏 RST 噪音。上限同正文读取。
+        """
+        try:
+            n = int(self.headers.get('Content-Length') or 0)
+        except ValueError:
+            n = 0
+        if n > 0:
+            try:
+                self.rfile.read(min(n, 1 << 20))
+            except Exception:
+                pass
 
     def do_POST(self):
         if not self._local_only():
+            self._drain_body()
             return self._send(403, b'{"error":"forbidden"}')
         u = urlparse(self.path)
-        if u.path in self._JSON_PATHS and 'application/json' not in (
+        # CSRF 第二道闸：跨源 no-cors POST（text/plain，不触发预检）
+        # 也带 Origin，但对不上本机 Host —— 直接拒。同源 fetch 与
+        # 不带 Origin 的本机脚本不受影响。没有这道闸，/api/quit 这类
+        # 无 body 写端点能被任意网页一条 fetch 杀掉正在跑的任务。
+        origin = self.headers.get('Origin') or ''
+        if origin and urlsplit(origin).netloc != (
+                self.headers.get('Host') or ''):
+            self._drain_body()
+            return self._send(403, b'{"error":"cross origin"}')
+        # 统一闸：所有 /api 的 POST 都必须带 application/json 头
+        # （HTML 表单发不出这个头 → 表单型 CSRF 全部失效）。
+        if u.path.startswith('/api/') and 'application/json' not in (
                 self.headers.get('Content-Type') or '').lower():
+            self._drain_body()
             return self._send(415, b'{"error":"json required"}')
         try:
             n = int(self.headers.get('Content-Length') or 0)
         except ValueError:
             n = 0
-        raw = self.rfile.read(n) if n else b'{}'
+        if n <= 0:
+            raw = b'{}'            # 无长度/非正数：按空请求体处理
+        elif n > (1 << 20):        # 1MB 上限：本机界面用不到更大的
+            return self._send(413, b'{"error":"too large"}')
+        else:
+            raw = self.rfile.read(n)
         if u.path == '/api/run':
             try:
                 data = json.loads(raw.decode('utf-8') or '{}')
             except Exception:
                 data = {}
-            action = data.get('action') or 'scan'
+            action = data.get('action')
+            if not isinstance(action, str) or not action:
+                # 空 body / 坏 JSON / 缺 action：回 400 而不是默认起
+                # 「全量扫描」—— 那是所有动作里最重的一个，不该被兜底触发
+                return self._send(400, b'{"error":"action required"}')
+            _close_work_window()       # 作业窗口开着会占 profile，先替用户关掉
             with LOCK:
                 if STATE['running']:
                     return self._send(409, b'{"error":"busy"}')
@@ -3150,6 +3502,7 @@ class Handler(BaseHTTPRequestHandler):
             if not only:
                 return self._send(400, json.dumps(
                     {'error': '没有勾选要刷的课程'}).encode('utf-8'))
+            _close_work_window()       # 作业窗口开着会占 profile，先替用户关掉
             with LOCK:
                 if STATE['running']:
                     return self._send(409, b'{"error":"busy"}')
@@ -3171,6 +3524,7 @@ class Handler(BaseHTTPRequestHandler):
             if not only:
                 return self._send(400, json.dumps(
                     {'error': '没有勾选要做作业的课程'}).encode('utf-8'))
+            _close_work_window()       # 作业窗口开着会占 profile，先替用户关掉
             with LOCK:
                 if STATE['running']:
                     return self._send(409, b'{"error":"busy"}')
@@ -3192,6 +3546,7 @@ class Handler(BaseHTTPRequestHandler):
             if not url.lower().startswith('http'):
                 return self._send(400, json.dumps(
                     {'error': '这份作业没有可用的直达链接'}).encode('utf-8'))
+            _close_work_window()       # 作业窗口开着会占 profile，先替用户关掉
             with LOCK:
                 if STATE['running']:
                     return self._send(409, b'{"error":"busy"}')
@@ -3225,6 +3580,7 @@ class Handler(BaseHTTPRequestHandler):
                                   '等任务结束再点'}).encode('utf-8'))
             _open_work_async(url)
             return self._send(200, b'{"ok":true}')
+
         if u.path == '/api/combo':
             # 「刷课+刷题」：先刷选中范围的视频，再对同一批范围做作业并交卷。
             try:
@@ -3235,6 +3591,7 @@ class Handler(BaseHTTPRequestHandler):
             if not only:
                 return self._send(400, json.dumps(
                     {'error': '没有勾选要刷的课程/章节'}).encode('utf-8'))
+            _close_work_window()       # 作业窗口开着会占 profile，先替用户关掉
             with LOCK:
                 if STATE['running']:
                     return self._send(409, b'{"error":"busy"}')
@@ -3256,6 +3613,7 @@ class Handler(BaseHTTPRequestHandler):
             if not items:
                 return self._send(400, json.dumps(
                     {'error': '没有待核实的作业'}).encode('utf-8'))
+            _close_work_window()       # 作业窗口开着会占 profile，先替用户关掉
             with LOCK:
                 if STATE['running']:
                     return self._send(409, b'{"error":"busy"}')
@@ -3306,6 +3664,24 @@ class Handler(BaseHTTPRequestHandler):
             # ---- 视觉模型（可选）：字段独立成一节，与主模型互不影响 ----
             # 界面只在动视觉那一块时才带 vision，所以保存主模型不会误清视觉配置。
             vis = data.get('vision')
+            if isinstance(vis, dict) and vis.get('copy_main'):
+                # 「复制上面主模型的配置」：把主模型的地址 / 模型名 / 平台 / Key
+                # 原样搬到视觉这一套字段。Key 在服务端也一起搬——否则用户还得
+                # 重新手打一遍（他点这个按钮就是为了「不用再填一遍」）。
+                mk = cs.llm_key_of(cfg)
+                vpatch = {
+                    'llm_vision_platform': (cfg.get('llm_platform') or ''),
+                    'llm_vision_url': (cfg.get('llm_url') or ''),
+                    'llm_vision_model': (cfg.get('llm_model') or ''),
+                }
+                if mk:
+                    if cs.save_llm_key(mk, 'vision'):
+                        vpatch['llm_vision_key'] = ''
+                    else:
+                        vpatch['llm_vision_key'] = mk
+                patch.update(vpatch)
+                cfg.update(vpatch)
+                vis = None            # 已处理，别再走下面按字段覆盖那条路
             if isinstance(vis, dict):
                 vpatch = {}
                 vplat = str(vis.get('platform') or '').strip()
@@ -3470,6 +3846,59 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, b'{"ok":true}')
             except Exception as e:
                 return self._send(500, json.dumps({'error': str(e)}).encode())
+        if u.path == '/api/focus':
+            # 用户又双击了一次启动器：把窗口从最小化提出来（单实例的收尾动作）
+            ok = focus_window()
+            return self._send(200, json.dumps({'ok': ok}).encode('utf-8'))
+        if u.path == '/api/dock-rect':
+            # 预览页签的面板矩形。前端在页签切换 / 窗口缩放 / 布局变化时
+            # 推送，布局线程拿它对齐 Chrome 子窗口。坏值按「没有矩形」处理
+            # （布局线程会把子窗口全部藏起来，不会乱摆）。
+            try:
+                d = json.loads(raw.decode('utf-8') or '{}')
+            except Exception:
+                d = {}
+            try:
+                rect = {'l': float(d.get('l') or 0),
+                        't': float(d.get('t') or 0),
+                        'w': float(d.get('w') or 0),
+                        'h': float(d.get('h') or 0)}
+            except (TypeError, ValueError):
+                rect = None
+            with LOCK:
+                DESKTOP['dock_rect'] = rect
+                DESKTOP['dock_on'] = bool(rect and d.get('on'))
+            return self._send(200, b'{"ok":true}')
+        if u.path == '/api/pwd-save':
+            # 「记住密码」：加密落 runtime/，config 与 localStorage 不碰。
+            # 日志绝不提内容 —— 这里自始至终不 log 密码本身。
+            try:
+                d = json.loads(raw.decode('utf-8') or '{}')
+            except Exception:
+                d = {}
+            ok = cs.save_login_pwd(str(d.get('password') or ''))
+            return self._send(200, json.dumps(
+                {'ok': ok}).encode('utf-8'))
+        if u.path == '/api/pwd-forget':
+            cs.forget_login_pwd()
+            return self._send(200, b'{"ok":true}')
+        if u.path == '/api/open':
+            # 桌面窗口里点 target="_blank" 的外链（打开作业 / 去完成 / 项目主页）：
+            # 在窗口内跳转会顶掉整个界面、而且没有后退键，所以改交系统默认浏览器。
+            # 只放行 http(s) —— 这个接口只在本机监听，但没必要给它开 file:// 之类。
+            try:
+                d = json.loads(raw.decode('utf-8') or '{}')
+            except Exception:
+                d = {}
+            target = str(d.get('url') or '')
+            if not target.lower().startswith(('http://', 'https://')):
+                return self._send(400, b'{"error":"bad url"}')
+            try:
+                webbrowser.open(target)
+                return self._send(200, b'{"ok":true}')
+            except Exception as e:
+                return self._send(
+                    500, json.dumps({'error': str(e)}).encode('utf-8'))
         if u.path == '/api/quit':
             # 退出前先置停止信号：让任务线程的收尾逻辑（保存进度/报告）
             # 有机会跑，也避免浏览器进程被硬杀后残留
@@ -3480,6 +3909,551 @@ class Handler(BaseHTTPRequestHandler):
             _shutdown_async()
             return
         return self._send(404, b'{"error":"not found"}')
+
+
+# =====================================================================
+# 桌面窗口（v4.0）
+#
+# 以前界面是「起本地服务 + 用系统默认浏览器打开」：用户看到的是一个浏览器
+# 标签页，反复双击还会叠出好几个，关掉标签页后台也不退出。v4.0 起默认走
+# 桌面窗口 —— 用 Windows 自带的 WebView2 开一个真正的应用窗口（没有地址栏、
+# 没有标签页、任务栏一个图标），并保证同一时刻只有一个实例。
+#
+# 三条纪律（都是实测踩出来的）：
+#   1. pywebview 的 start() 必须在主线程，所以 HTTP 服务得挪到后台线程；
+#   2. WebView2 的用户数据目录必须显式落在 runtime/ 下：默认位置是临时目录，
+#      实测直接报 WebView2 E_ABORT 起不来；而且它属于本机运行痕迹，
+#      不能进分发包（runtime/ 本来就在排除清单里）；
+#   3. 网页模式（gui 命令）保持原样不动 —— 它是排障时的备用入口。
+# =====================================================================
+
+WIN_TITLE = '学习通巡检工具'
+WIN_MUTEX = 'Local\\chaoxing-scanner-desktop-v4'
+
+# 桌面窗口的运行时状态。网页模式下 win 恒为 None。
+# docked = 已嵌进「预览」页签的浏览器窗口句柄（最新在后）；
+# styles = 入坞前各窗口的原样式（留档）；
+# dock_rect/dock_on = 前端推送的预览面板矩形与显隐。
+# （v4.3 起不再用 tabs_base 基线快照——改用「属主 PID == 常驻浏览器」判据。）
+DESKTOP = {'win': None, 'url': '', 'mode': False, 'mutex': None,
+           'force': False, 'docked': [], 'styles': {},
+           'dock_rect': None, 'dock_on': False, 'quit': False}
+
+
+def _ui_record():
+    """本机界面的端口记录（写端口与 pid，供第二个实例找到它）。
+
+    路径每次现读 cs.RUNTIME：测试沙箱是在 import 之后改道这些常量的，
+    预先算成模块级路径会指向真实 runtime（这个坑踩过一次）。
+    """
+    return cs.RUNTIME / 'ui.json'
+
+
+def _write_ui_record(port):
+    try:
+        _ui_record().parent.mkdir(parents=True, exist_ok=True)
+        _ui_record().write_text(
+            json.dumps({'port': port, 'pid': os.getpid(), 't': time.time()}),
+            encoding='utf-8')
+    except Exception as e:
+        cs.log('写会话记录失败（不影响使用）：%s' % e, 'warn')
+
+
+def _read_ui_record():
+    try:
+        d = json.loads(_ui_record().read_text(encoding='utf-8'))
+        return int(d.get('port') or 0)
+    except Exception:
+        return 0
+
+
+def _read_ui_pid():
+    try:
+        d = json.loads(_ui_record().read_text(encoding='utf-8'))
+        return int(d.get('pid') or 0)
+    except Exception:
+        return 0
+
+
+def _pid_alive(pid):
+    """pid 是否还活着。探测不了就按活着处理：宁可多试一次唤起。"""
+    try:
+        import ctypes
+        k32 = ctypes.WinDLL('kernel32', use_last_error=True)
+        k32.OpenProcess.restype = ctypes.c_void_p
+        k32.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int,
+                                    ctypes.c_uint32]
+        h = k32.OpenProcess(0x1000, 0, int(pid))
+        if not h:
+            return False        # PROCESS_QUERY_LIMITED_INFORMATION
+        k32.CloseHandle(h)
+        return True
+    except Exception:
+        return True
+
+
+def _drop_ui_record():
+    try:
+        _ui_record().unlink()
+    except Exception:
+        pass
+
+
+def _post_local(port, path, timeout=2.0):
+    """给本机界面发一个空 POST，只关心通不通。"""
+    try:
+        import urllib.request
+        req = urllib.request.Request(
+            'http://127.0.0.1:%d%s' % (port, path), data=b'{}',
+            headers={'Content-Type': 'application/json'})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return 200 <= r.status < 300
+    except Exception:
+        return False
+
+
+def _claim_single_instance():
+    """抢「本机唯一界面」的所有权。True = 该由本进程起窗口。
+
+    用命名互斥体而不是「端口是否被占」：进程怎么死，互斥体都会随之释放；
+    端口却可能残留在 TIME_WAIT，或被杀软/代理临时占住，据此判断会误拒。
+    拿不到互斥体（受限环境）时按「可以起」处理 —— 宁可多开一个，
+    也不能让用户点不开程序。
+    """
+    try:
+        import ctypes
+        k32 = ctypes.WinDLL('kernel32', use_last_error=True)
+        k32.CreateMutexW.restype = ctypes.c_void_p
+        k32.CreateMutexW.argtypes = [ctypes.c_void_p, ctypes.c_int,
+                                     ctypes.c_wchar_p]
+        h = k32.CreateMutexW(None, 0, WIN_MUTEX)
+        if not h:
+            return True
+        if ctypes.get_last_error() == 183:   # 已有实例：句柄不占为己有
+            k32.CloseHandle(h)
+            return False
+        DESKTOP['mutex'] = h
+        return True
+    except Exception:
+        return True
+
+
+def _set_foreground():
+    """按窗口标题把本工具的窗口提到最前。"""
+    try:
+        import ctypes
+        u32 = ctypes.WinDLL('user32', use_last_error=True)
+        u32.FindWindowW.restype = ctypes.c_void_p
+        u32.FindWindowW.argtypes = [ctypes.c_wchar_p, ctypes.c_wchar_p]
+        hwnd = u32.FindWindowW(None, WIN_TITLE)
+        if not hwnd:
+            return False
+        u32.ShowWindow(hwnd, 9)          # SW_RESTORE：最小化/最大化都还原
+        u32.SetForegroundWindow(hwnd)
+        return True
+    except Exception:
+        return False
+
+
+def _wake_existing(timeout=4.0):
+    """把已经开着的窗口叫到前面，成功返回 True。
+
+    两件事缺一不可：
+      · POST /api/focus 让**窗口的拥有者**把窗口从最小化恢复出来 ——
+        只有它手上有那个窗口对象；
+      · 本进程再抢一次前台：此刻的前台进程是被用户刚双击起来的本进程，
+        只有前台进程才有把别的窗口提到最前的权限。
+    """
+    end = time.time() + timeout
+    while time.time() < end:
+        port = _read_ui_record()
+        # 记录里的 pid 已经不在了 = 上次进程被硬杀、没来得及删记录。
+        # 端口可能已被无关服务占住，别把陌生的 2xx 当「唤起成功」。
+        pid = _read_ui_pid()
+        if port and pid and not _pid_alive(pid):
+            _drop_ui_record()
+            port = 0
+        if port and _post_local(port, '/api/focus'):
+            _set_foreground()
+            return True
+        time.sleep(0.25)
+    return _set_foreground()     # 记录没读到，也按标题试一次
+
+
+def focus_window():
+    """/api/focus 的实现：把桌面窗口从最小化唤醒并置前。"""
+    w = DESKTOP.get('win')
+    if w is None:
+        return False
+    for call in ('restore', 'show'):
+        try:
+            getattr(w, call)()
+        except Exception:
+            pass
+    return _set_foreground()
+
+
+def _on_window_closing():
+    """点窗口的 × 时：任务还在跑就先别关。
+
+    返回 False 会让 pywebview 取消这次关闭。任务收尾涉及保存进度、关浏览器，
+    直接退会把平台侧刷到一半的状态丢在那儿，用户还得从头再来。
+    这里**不能**用 evaluate_js 去弹提示：closing 是在 UI 线程同步跑的，
+    而 evaluate_js 要等 JS 返回结果，会当场死锁。所以只写日志 + 把窗口唤起。
+    """
+    if DESKTOP.get('force'):
+        return None
+    with LOCK:
+        running = bool(STATE.get('running'))
+    if not running:
+        return None
+    _set_foreground()
+    cs.log('窗口没有关闭：任务还在运行。要退出请先在界面上点「停止」，'
+           '或用「退出程序」按钮（它会先把任务收尾）。', 'warn')
+    return False
+
+
+def _wait_task(delay=0.6, timeout=10.0):
+    """退出前给正在跑的任务一点收尾时间。
+
+    不等就走，主线程一退，playwright 的 driver 进程会被留在系统里（实测会挂
+    一堆 node.exe），下次启动还可能因为 profile 目录被占而起不来。
+    """
+    time.sleep(delay)
+    with LOCK:
+        th = STATE.get('_thread')
+    if th is not None and th.is_alive():
+        cs.log('正在停止后台任务并收尾，请稍候…')
+        th.join(timeout=timeout)
+
+
+def _teardown_ui():
+    """「关窗口」和「点退出程序」两条路都汇到这里：停服务、清记录。"""
+    DESKTOP['win'] = None
+    DESKTOP['quit'] = True
+    h = DESKTOP.get('mutex')
+    if h:
+        # 互斥体随进程退出本来也会释放；这里主动关，同进程二次
+        # serve_desktop 才能重新抢到所有权。
+        try:
+            import ctypes
+            ctypes.WinDLL('kernel32').CloseHandle(h)
+        except Exception:
+            pass
+        DESKTOP['mutex'] = None
+    with LOCK:
+        srv = STATE.get('_server')
+        STATE['_server'] = None
+    if srv is not None:
+        try:
+            srv.shutdown()
+        except Exception:
+            pass
+        try:
+            srv.server_close()
+        except Exception:
+            pass
+    _drop_ui_record()
+    cs.log('界面已关闭。')
+
+
+# ------------------------------------------------ 浏览器窗口收纳（预览页签，v4.1）
+# 用户预期（2026-10-09 拍板）：浏览器不另开窗口——工具跑任务/登录/
+# 「去完成」开出来的 Chrome 一律嵌进主窗口的「预览」页签里。
+# 判据（v4.3 收紧）——**只认本工具常驻浏览器进程开的窗口**：
+#   ① 类名是 Chrome 顶层窗口（Chrome_WidgetWin_1）；
+#   ② 属主进程 PID == 常驻浏览器主进程 PID（cs.browser_proc_pid()）。
+#      旧版靠「启动基线快照差分」，挡不住用户**运行中**才点开的自己浏览器
+#      （2026-10-11 真机：桌面端点开自己的 Edge → 类名一样、又不在基线里、
+#      还不是子窗口 → 被误嵌进预览，且重父后输入法上下文丢失、打不了字）。
+#      按 PID 一刀切从根上杜绝（真机探针实测工具窗口 pid 与常驻主进程一致）。
+#   ③ 还不是任何窗口的子窗口（GetParent 为空，双保险）。
+CHROME_WIN_CLASS = 'Chrome_WidgetWin_1'
+
+# 入坞用到的 Win32 常量（_dock_style_apply / _dock_layout 只在这一处用；
+# v4.1 首版漏了这组定义，守夜线程 NameError 被静默吞掉、从不入坞——教训：
+# 新增模块级名字的补丁必须连带定义一起落，且活体测试要真调一次）。
+GWL_STYLE = -16                 # 窗口样式索引
+WS_CHILD = 0x40000000           # 子窗口
+WS_POPUP = 0x80000000           # 弹出窗（Chrome 顶层窗口自带）
+WS_CAPTION = 0x00C00000         # 标题栏
+WS_THICKFRAME = 0x00040000      # 可调边框
+HWND_TOP = 0                    # SetWindowPos：置顶（Z 序，不抢焦点靠 SWP_NOACTIVATE）
+SWP_NOSIZE = 0x0001
+SWP_NOMOVE = 0x0002
+SWP_NOACTIVATE = 0x0010
+
+
+def _u32():
+    import ctypes
+    return ctypes.windll.user32
+
+
+def _window_pid(hwnd):
+    """窗口所属进程的 PID（GetWindowThreadProcessId）。"""
+    import ctypes
+    u32 = _u32()
+    pid = ctypes.c_ulong()
+    u32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+    return pid.value
+
+
+def _enum_chrome_windows(own_pid=None):
+    """列出当前可见的 Chrome 顶层窗口句柄。
+
+    own_pid 给定（= cs.browser_proc_pid()）时**只返回该进程开出来的窗口**——
+    这是本工具自己的常驻浏览器。用户自己开着/运行中点开的 Edge/Chrome 与其
+    窗口类名完全相同，但属主 PID 不同，据此精确排除（v4.3，见顶注 ②）。
+    own_pid 为 None（未传）时退回「全部 Chrome 窗口」，仅用于启动时的兼容。
+    """
+    import ctypes
+    u32 = _u32()
+    out = []
+    CB = ctypes.WINFUNCTYPE(ctypes.c_int, ctypes.c_void_p,
+                            ctypes.c_void_p)
+
+    def _on(hwnd, _lparam):
+        if u32.IsWindowVisible(hwnd):
+            buf = ctypes.create_unicode_buffer(32)
+            u32.GetClassNameW(hwnd, buf, 32)
+            if buf.value == CHROME_WIN_CLASS:
+                if own_pid is None or _window_pid(hwnd) == own_pid:
+                    out.append(hwnd)
+        return 1
+
+    try:
+        u32.EnumWindows(CB(_on), None)
+    except Exception:
+        pass
+    return out
+
+
+def _main_hwnd():
+    """主窗口句柄（找不到返回 0）。"""
+    import ctypes
+    u32 = _u32()
+    u32.FindWindowW.restype = ctypes.c_void_p
+    u32.FindWindowW.argtypes = [ctypes.c_wchar_p, ctypes.c_wchar_p]
+    return u32.FindWindowW(None, WIN_TITLE) or 0
+
+
+def dock_count():
+    """/api/poll 用：当前嵌在预览里的浏览器窗口数（顺带清掉死句柄）。"""
+    if not DESKTOP.get('mode'):
+        return 0
+    u32 = _u32()
+    with LOCK:
+        alive = [h for h in DESKTOP['docked'] if u32.IsWindow(h)]
+        if len(alive) != len(DESKTOP['docked']):
+            for h in list(DESKTOP['docked']):
+                if h not in alive:
+                    DESKTOP['docked'].remove(h)
+                    DESKTOP['styles'].pop(h, None)
+        return len(alive)
+
+
+def _dpi_scale(hwnd):
+    """主窗口的 DPI 缩放比（前端矩形是 CSS 像素，乘它才是物理像素）。"""
+    try:
+        import ctypes
+        u32 = ctypes.windll.user32
+        try:
+            dpi = u32.GetDpiForWindow(hwnd)      # Win10 1607+
+            if dpi:
+                return dpi / 96.0
+        except Exception:
+            pass
+        hdc = u32.GetDC(hwnd)
+        try:
+            dpi = ctypes.windll.gdi32.GetDeviceCaps(hdc, 88)   # LOGPIXELSX
+            return (dpi or 96) / 96.0
+        finally:
+            u32.ReleaseDC(hwnd, hdc)
+    except Exception:
+        return 1.0
+
+
+def _dock_style_apply(hwnd):
+    """嵌为子窗口前的样式改造：去标题栏/可调边框，WS_POPUP 换 WS_CHILD。
+
+    返回旧样式留档（窗口随任务结束关闭，当前版本不做「弹出」）。
+    """
+    u32 = _u32()
+    old = u32.GetWindowLongW(hwnd, GWL_STYLE)
+    new = (old & ~(WS_POPUP | WS_CAPTION | WS_THICKFRAME)) | WS_CHILD
+    u32.SetWindowLongW(hwnd, GWL_STYLE, new)
+    return old
+
+
+def _dock_new_windows():
+    """发现新的**工具浏览器**窗口（属主 PID == 常驻浏览器 + 尚非子窗口）就嵌进预览面板。
+
+    登录/扫码窗口也是这一只：用户预期「一切要弹浏览器的界面都在预览」。
+    嵌入时去掉标题栏（预览页签里不需要浏览器自己的框），Chrome 的标签条
+    保留——任务开出的多个页面靠它切换。用户自己开的浏览器属主 PID 不同，
+    不会命中（v4.3）。
+    """
+    import ctypes
+    u32 = _u32()
+    main = _main_hwnd()
+    if not main:
+        return
+    # 只认常驻浏览器主进程开的窗口。进程没起来 = 还没有「工具自己的窗口」，
+    # 直接返回（**绝不能**退回枚举全部 Chrome 窗口——那会把用户自己的浏览器
+    # 卷进来，正是 2026-10-11 真机那个 bug）。
+    own = cs.browser_proc_pid()
+    if own is None:
+        return
+    u32.SetParent.restype = ctypes.c_void_p
+    u32.SetParent.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+    with LOCK:
+        have = set(DESKTOP['docked'])
+    for hwnd in _enum_chrome_windows(own):
+        if hwnd in have:
+            continue
+        if u32.GetParent(hwnd):
+            continue                      # 已经是子窗口（不会发生，双保险）
+        u32.ShowWindow(hwnd, 9)           # SW_RESTORE：最小化的先还原
+        old = _dock_style_apply(hwnd)
+        if not u32.SetParent(hwnd, main):
+            # 入坞失败就还原样式，别把用户的浏览器搞成无框孤儿；
+            # 屏外启动的窗口还要退回屏上有窗（否则用户面对一个隐形浏览器）
+            u32.SetWindowLongW(hwnd, GWL_STYLE, old)
+            u32.MoveWindow(hwnd, 60, 60, 1200, 800, True)
+            continue
+        with LOCK:
+            DESKTOP['docked'].append(hwnd)
+            DESKTOP['styles'][hwnd] = old
+        cs.log('浏览器窗口已嵌进「预览」页签，点「预览」即可查看与操作。')
+
+
+def _dock_layout():
+    """把该显示的 Chrome 子窗口对齐到预览面板矩形，其余的隐藏。
+
+    子窗口坐标相对主窗口客户区——用户拖动主窗口时子窗口跟着走，不需要
+    重排；要重排的只有面板矩形变化（前端推送）与 DPI 变化。这里每轮兜底
+    重排一次（MoveWindow 幂等，代价可忽略），保证极端情况下预览也不错位。
+    """
+    import ctypes
+    u32 = _u32()
+    main = _main_hwnd()
+    if not main:
+        return
+    with LOCK:
+        docked = [h for h in DESKTOP['docked'] if u32.IsWindow(h)]
+        rect = DESKTOP['dock_rect']
+        on = bool(DESKTOP['dock_on'])
+    if not docked:
+        return
+    cur = docked[-1]                      # 最新入坞的显示在最前
+    if not (on and rect and rect.get('w', 0) > 4 and rect.get('h', 0) > 4):
+        for h in docked:
+            u32.ShowWindow(h, 0)          # 面板没开/没矩形：全部隐藏
+        return
+    s = _dpi_scale(main)
+    x = int(rect['l'] * s)
+    y = int(rect['t'] * s)
+    w = int(rect['w'] * s)
+    hgt = int(rect['h'] * s)
+    for h in docked:
+        if h == cur:
+            u32.ShowWindow(h, 8)          # SW_SHOWNA：显示但不抢前台
+            u32.MoveWindow(h, x, y, w, hgt, True)
+            u32.SetWindowPos(h, HWND_TOP, 0, 0, 0, 0,
+                             SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE)
+        else:
+            u32.ShowWindow(h, 0)
+
+
+def _browser_keeper():
+    """守夜线程：发现新窗口就入坞，顺带做布局兜底同步。
+
+    任务跑不跑都收（「去完成」的作业窗口、登录窗口都算）；用户自己开的
+    Chrome/Edge 由 _dock_new_windows 里的「属主 PID == 常驻浏览器」判据天然
+    排除，永远不会进这里。页面/窗口关闭后句柄失效，由 IsWindow 自然清出，
+    不需要专门清理。
+    """
+    import time
+    while not DESKTOP.get('quit'):
+        time.sleep(1.0)
+        try:
+            _dock_new_windows()
+            _dock_layout()
+        except Exception:
+            pass
+
+
+def serve_desktop(port=8765):
+    """桌面模式入口：原生窗口装界面，HTTP 服务跑在后台线程。"""
+    if not _claim_single_instance():
+        cs.log('本工具已经在运行了，正在把它的窗口叫到前面…')
+        if _wake_existing():
+            cs.log('已唤起已有窗口，本次不重复启动。')
+        else:
+            cs.log('已有实例在运行但没能唤起，请在任务栏里找「%s」。' % WIN_TITLE,
+                   'warn')
+        return 0
+
+    try:
+        import webview            # 延迟导入：网页模式与命令行不依赖它
+    except Exception as e:
+        cs.log('缺 pywebview（%s），桌面窗口用不了。' % type(e).__name__, 'err')
+        cs.log('退路：python chaoxing_scanner.py gui', 'warn')
+        return 1
+
+    # 上一轮（同进程二次启动的潜伏场景）留下的 force 会让关窗守卫
+    # 失效，这里统一复位再开张。
+    DESKTOP['force'] = False
+    # 浏览器收纳：同进程二次启动也要复位。v4.3 起改用「属主 PID == 常驻浏览器」
+    # 判据（不再需要启动基线快照——用户运行中点开的浏览器靠 PID 天然排除）。
+    with LOCK:
+        DESKTOP['quit'] = False
+        DESKTOP['docked'] = []
+        DESKTOP['styles'] = {}
+        DESKTOP['dock_rect'] = None
+        DESKTOP['dock_on'] = False
+    httpd, port = _open_server(port)
+    cs.RUNTIME.mkdir(parents=True, exist_ok=True)
+    with LOCK:
+        STATE['_server'] = httpd
+    threading.Thread(target=httpd.serve_forever, name='ui-http',
+                     daemon=True).start()
+    url = 'http://127.0.0.1:%d/' % port
+    DESKTOP['url'] = url
+    DESKTOP['mode'] = True
+    # 浏览器一律屏外启动（见 cs.OFFSCREEN_LAUNCH 注释）：有头启动会先在
+    # 桌面正中闪一下、再被守夜线程收进预览——真机 2026-10-10「点查询
+    # 弹个窗口又秒没」。屏外启动后由守夜线程直接入坞，桌面不再闪窗。
+    cs.OFFSCREEN_LAUNCH = True
+    _write_ui_record(port)
+    threading.Thread(target=_browser_keeper, name='browser-keeper',
+                     daemon=True).start()
+    cs.log('')
+    cs.log('界面已就绪（%s，只监听本机）' % url)
+    cs.log('用完退出：在窗口里点「退出程序」，或直接关掉这个窗口。')
+
+    storage = cs.RUNTIME / 'webview'
+    storage.mkdir(parents=True, exist_ok=True)
+    code = 0
+    try:
+        # create_window 也罩进 try：此时服务已起、ui.json 已写，
+        # 它若抛异常，finally 的 _teardown_ui 必须照样跑（清理记录）。
+        win = webview.create_window(WIN_TITLE, url, width=1280, height=820,
+                                    min_size=(980, 640))
+        win.events.closing += _on_window_closing
+        DESKTOP['win'] = win
+        webview.start(gui='edgechromium', private_mode=False,
+                      storage_path=str(storage))
+    except Exception as e:
+        # 例如系统缺 WebView2 运行时。说清退路，别让用户对着黑窗口猜。
+        cs.log('桌面窗口起不来（%s）。' % type(e).__name__, 'err')
+        cs.log(str(e)[:400], 'err')
+        cs.log('退路：改用命令  python chaoxing_scanner.py gui  打开网页界面。',
+               'warn')
+        code = 1
+    finally:
+        _teardown_ui()
+    return code
 
 
 def _pick_port(start: int, tries: int = 20) -> int:
@@ -3493,6 +4467,20 @@ def _pick_port(start: int, tries: int = 20) -> int:
     raise RuntimeError('找不到可用端口')
 
 
+def _open_server(start: int, tries: int = 20):
+    """直接试绑：探测与正式绑定之间没有可被抢的窗口（_pick_port 的
+    「bind 后关闭再重绑」留了 TOCTOU 窗口，端口可能被别的进程抢走，
+    让用户对着裸 traceback）。返回 (httpd, port)。"""
+    last = None
+    for p in range(start, start + tries):
+        try:
+            return _StrictHTTPServer(('127.0.0.1', p), Handler), p
+        except OSError as e:
+            last = e
+    raise RuntimeError('找不到可用端口（%s…%s）：%s'
+                       % (start, start + tries - 1, last))
+
+
 def _shutdown_async(delay: float = 0.35):
     """稍等片刻再关停，让 /api/quit 的响应先发出去。
 
@@ -3500,6 +4488,26 @@ def _shutdown_async(delay: float = 0.35):
     """
     def _bye():
         time.sleep(delay)
+        # 桌面模式：先关原生窗口。置 force 是因为「退出程序」是明确意图，
+        # 不该再被 _on_window_closing 那条「任务在跑就别关」拦住
+        # —— 拦住的后果是窗口关不掉、服务已停，用户对着一个死窗口。
+        # CANCEL 在 /api/quit 里已经置过了，任务这边很快就能收尾。
+        if DESKTOP.get('win') is not None:
+            DESKTOP['force'] = True
+        # 网页模式也要等任务收尾：主线程一退，daemon 任务线程被硬杀，
+        # playwright 的 driver 进程会留在系统里（见 _wait_task 的说明）。
+        _wait_task(delay=0.2)
+        # v4.3：浏览器是全局常驻的，退出时必须显式收掉，否则那只 chrome
+        # 会一直留在系统里（用户以为「关了工具」，其实还有个进程占着内存）。
+        try:
+            cs.stop_browser()
+        except Exception:
+            pass
+        if DESKTOP.get('win') is not None:
+            try:
+                DESKTOP['win'].destroy()
+            except Exception:
+                pass
         with LOCK:
             srv = STATE.get('_server')
         if srv is not None:
@@ -3511,9 +4519,8 @@ def _shutdown_async(delay: float = 0.35):
 
 
 def serve(port=8765, open_browser=True):
-    port = _pick_port(port)
+    httpd, port = _open_server(port)
     cs.RUNTIME.mkdir(parents=True, exist_ok=True)
-    httpd = ThreadingHTTPServer(('127.0.0.1', port), Handler)
     with LOCK:
         STATE['_server'] = httpd
     url = 'http://127.0.0.1:%d/' % port
@@ -3532,6 +4539,9 @@ def serve(port=8765, open_browser=True):
     except KeyboardInterrupt:
         cs.log('收到 Ctrl+C，正在退出…')
     finally:
+        # Ctrl+C 直接退出也要给任务线程收尾时间（与 /api/quit 同一套
+        # 纪律）：不等就走，playwright 的 driver 会留在系统里。
+        _wait_task(delay=0.1, timeout=10.0)
         try:
             httpd.server_close()
         except Exception:

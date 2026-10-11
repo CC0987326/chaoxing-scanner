@@ -1,0 +1,27 @@
+# ============================================================
+# 运行期产物：内含登录态与个人数据，**绝不要提交**
+#   runtime/state.json  登录 cookie
+#   runtime/profile/    浏览器用户目录（同样带登录态）
+#   runtime/run.log     运行日志（含课程页 URL）
+#   输出/                真实课程与作业清单
+# ============================================================
+runtime/
+输出/
+*.log
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+_ui.js
+
+# ---- 打包产物（体积大，用 build/package.py 现场生成即可）----
+build/pkg/
+build/get-pip.py
+*.zip
+学习通巡检工具*/
+
+# ---- 编辑器 / 系统 ----
+.vscode/
+.idea/
+Thumbs.db
+Desktop.ini
