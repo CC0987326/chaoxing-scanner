@@ -1,3 +1,4 @@
 playwright>=1.40
 ddddocr>=1.5
 pillow>=10.0
+pywebview>=5.0
