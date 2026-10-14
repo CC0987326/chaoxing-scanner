@@ -102,6 +102,13 @@ def _control_hook(stage: str) -> bool:
             STATE['phase'] = 'finishing'
         cs.log('扫描结束，正在收尾：生成报告 …')
         return True
+    # 登录等待没有「进度」可暂停——它本身就是在等你操作浏览器。若在这里尊重
+    # 暂停，会卡住 while 的 480s 截止期、把 running 永远留 True（所有任务按钮
+    # 409 锁死），还念一句「点继续接着扫」的扫描专用台词（登录没有「扫」）。
+    # 所以登录阶段**只认停止**，暂停对它等于没点（界面也会把暂停键禁用）。
+    # 真机审查 2026-10-14 逮到：把控制钩子接进登录等待时漏了这一条。
+    if stage.startswith('login'):
+        return not CANCEL.is_set()
     if CANCEL.is_set():
         return False
     if PAUSE.is_set():
@@ -141,6 +148,12 @@ TASK_NAME = {
     'combo': '刷课 + 刷题（先刷视频再做作业交卷）',
     'verify': '重新核实未确认的作业',
     'answer_one': '刷题（单份作业）',
+    'brush_urls': '上传链接刷课',
+    'answer_urls': '上传链接刷题',
+    'combo_urls': '上传链接刷课+刷题',
+    'brush_act': '课堂活动刷课',
+    'answer_act': '课堂活动作答',
+    'combo_act': '课堂活动刷课+刷题',
 }
 
 
@@ -393,7 +406,14 @@ def _worker(action, opts):
         STATE['paused'] = False
         # 读课程名录是十来秒的只读操作，不参与暂停/停止，单独标一个阶段
         # 兼容性体检同理：它是只读探针，内部没有检查点，所以也不能被暂停
-        STATE['phase'] = 'listing' if action in ('list', 'selftest') else 'scanning'
+        # 登录也单标一个阶段：它只认「停止」不认「暂停」（见 _control_hook），
+        # 前端据 phase=='login' 把暂停键置灰，别给用户一个点了没用的按钮。
+        if action in ('list', 'selftest'):
+            STATE['phase'] = 'listing'
+        elif action == 'login':
+            STATE['phase'] = 'login'
+        else:
+            STATE['phase'] = 'scanning'
     cs.set_control_hook(_control_hook)
     try:
         cfg = cs.load_config()
@@ -434,6 +454,15 @@ def _worker(action, opts):
             if phone and password:
                 cs.log('使用账号密码登录 …')
                 if not cs.do_login_password(cfg, phone, password):
+                    if cs.last_login_fail() == 'stopped':
+                        # 用户自己点的「停止」：不是失败，别报成密码错误。
+                        # 之前这条会落进下面的 RuntimeError，弹「请核对手机号与密码 /
+                        # 密码连续输错可能触发账号保护」——把主动停止说成账号有问题，
+                        # 白白吓用户一跳（v6.10 加了等待期可停止后才可能出现）。
+                        with LOCK:
+                            STATE['summary'] = {'登录': '已停止'}
+                        cs.log('已按你的要求停止登录（未登录成功）。', 'warn')
+                        return
                     if cs.last_login_fail() == 'credential':
                         # 平台明确回绝了这组账号密码。这种失败在界面上用红字讲清楚就够了，
                         # 不必再抛异常打一堆堆栈（那样用户只会看到「任务失败」+ traceback）。
@@ -923,6 +952,532 @@ def _combo_worker(opts):
             _shutdown_pc()
 
 
+# ================================================================ 上传链接刷课刷题
+# 用户把「页面链接」粘进来直接刷，不依赖先做一遍全量查询。两种链接：
+#   · 作业链接（mooc2/work/task…）→ 刷题（复用 answer_urls 的完整判别 / 交卷链）
+#   · 课程链接（courseid=..&clazzid=..）→ 刷课：回课程页找待完成章节再刷视频
+#     （课程页链接没有 kid，刷课本来就要逐节点下钻；用户给哪个链接都行）
+_HW_HOSTS = ('chaoxing.com', 'edu.cn')
+
+
+def _parse_links(text):
+    """把用户粘贴的多行文本拆成 [{'url','course','title'}]。
+
+    支持：纯 URL 行；或「课程名 | 标题 | URL」「标题 | URL」这类带标签的单行。
+    去重、按出现顺序保留。
+    """
+    import re as _re
+    out, seen = [], set()
+    for raw in (text or '').splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        # 行里可能有多段被空白 / 竖线 / Tab 分隔；取第一个像 URL 的
+        parts = [p.strip() for p in _re.split(r'[|\t]', line) if p.strip()]
+        url = next((p for p in parts if p.lower().startswith(('http://', 'https://'))), '')
+        if not url:
+            # 兜底：整行里正则抠一个 http(s) 链接
+            m = _re.search(r'https?://\S+', line)
+            url = m.group(0) if m else ''
+        if not url:
+            continue
+        url = url.rstrip('),.;')
+        if url in seen:
+            continue
+        seen.add(url)
+        labels = [p for p in parts if p != url]
+        course = labels[0] if len(labels) >= 2 else ''
+        title = labels[1] if len(labels) >= 2 else (labels[0] if labels else '')
+        out.append({'url': url, 'course': course, 'title': title})
+    return out
+
+
+def _link_query(url):
+    """解析链接的 query 参数（大小写不敏感）。"""
+    try:
+        return {k.lower(): (v[0] if v else '')
+                for k, v in parse_qs(urlsplit(url).query).items()}
+    except Exception:
+        return {}
+
+
+def _link_host_ok(url):
+    host = (urlparse(url).netloc or '').lower().split(':')[0]
+    return (host == 'chaoxing.com' or host.endswith('.chaoxing.com')
+            or host.endswith('.edu.cn'))
+
+
+def _classify_link(url):
+    """返回 'exam' | 'work'(new) | 'dowork'(old) | 'cards'(chapter) | 'course' | 'other'。"""
+    u = (url or '').lower()
+    if '/exam-ans/' in u or '/exam/test' in u or '/exam/exam' in u:
+        return 'exam'
+    if 'mooc2/work/task' in u or '/work/task' in u:
+        return 'work'
+    if 'dohomeworknew' in u or '/work/do' in u:
+        return 'dowork'
+    if 'knowledge/cards' in u or 'knowledgeid=' in u:
+        return 'cards'
+    if 'stucoursemiddle' in u or 'mycourse/stu' in u:
+        return 'course'
+    if 'courseid=' in u and 'clazzid=' in u:
+        return 'course'
+    return 'other'
+
+
+def _link_course(url):
+    """从课程 / 作业链接里抠出 cid/clsid，用于回课程页找待完成章节。"""
+    q = _link_query(url)
+    cid = q.get('courseid') or ''
+    clsid = q.get('clazzid') or q.get('classid') or ''
+    return cid, clsid
+
+
+def _brush_link_worker(opts):
+    """「上传链接 → 刷课」：每条课程链接回课程页找待完成章节刷视频。"""
+    links = opts.get('links') or []
+    cs.log('')
+    cs.log('▶ 任务开始：上传链接刷课（共 %d 条链接）' % len(links))
+    PAUSE.clear()
+    CANCEL.clear()
+    with LOCK:
+        STATE['paused'] = False
+        STATE['phase'] = 'brushing'
+    try:
+        cfg = cs.load_config()
+        if _apply_rate(opts, cfg):
+            cs.patch_config({'brush_rate': cfg['brush_rate']})
+        rate = cs.g_rate(cfg)
+        cs.log('播放方式：%sx 倍速 + 静音，真实播放到片尾。' % rate)
+
+        def progress(msg, *a):
+            cs.log(msg, a[0] if a else 'info')
+            with LOCK:
+                STATE['task'] = '刷课 · ' + (msg[:54] if msg else '')
+
+        def control():
+            if CANCEL.is_set():
+                return 'stop'
+            if PAUSE.is_set():
+                return 'pause'
+            return 'run'
+
+        out = cs.brush_by_urls(cfg, [l['url'] for l in links],
+                               progress=progress, control=control)
+        with LOCK:
+            STATE['summary'] = {'刷完视频': out.get('done', 0),
+                                '未完成': out.get('fail', 0)}
+            if out.get('stopped'):
+                STATE['summary']['状态'] = '已停止'
+        all_done = not out.get('stopped')
+        cs.log('上传链接刷课完成：视频完成 %d 个，未完成 %d 个。'
+               % (out.get('done', 0), out.get('fail', 0)), 'ok')
+    except cs.NotLoggedIn as e:
+        cs.log('%s' % e, 'err')
+        with LOCK:
+            STATE['summary'] = {'提示': '未登录，请先登录'}
+    except Exception as e:
+        cs.log('任务失败：%s' % e, 'err')
+        import traceback
+        cs.log(traceback.format_exc()[-900:], 'err')
+        _set_result({'error': str(e)[:200] or type(e).__name__})
+    finally:
+        cs.set_control_hook(None)
+        PAUSE.clear()
+        CANCEL.clear()
+        with LOCK:
+            STATE['running'] = False
+            STATE['done'] = True
+            STATE['paused'] = False
+            STATE['phase'] = ''
+        cs.log('■ 任务结束')
+        if locals().get('all_done') and opts.get('shutdown'):
+            _shutdown_pc()
+
+
+def _answer_links_worker(opts):
+    """「上传链接 → 刷题」：每条作业链接走 answer_urls 的完整判别 / 交卷链。"""
+    links = opts.get('links') or []
+    draft = bool(opts.get('draft'))
+    cs.log('')
+    cs.log('▶ 任务开始：上传链接刷题（共 %d 条，%s）'
+           % (len(links), '答完暂存不交卷' if draft else '答完直接交卷'))
+    PAUSE.clear()
+    CANCEL.clear()
+    with LOCK:
+        STATE['paused'] = False
+        STATE['phase'] = 'answering'
+    try:
+        cfg = cs.load_config()
+        if not cs.llm_ready(cfg):
+            cs.log('还没有配置大模型：请在左侧「模型」里选平台、填 API Key 并保存。', 'err')
+            with LOCK:
+                STATE['summary'] = {'提示': '先配置大模型接口'}
+            return
+        cs.log('模型：%s ｜ 要上传附件的题会整份跳过并提示。' % cfg['llm_model'])
+
+        def progress(msg, *a):
+            cs.log(msg, a[0] if a else 'info')
+            with LOCK:
+                STATE['task'] = '刷题 · ' + (msg[:54] if msg else '')
+
+        def control():
+            if CANCEL.is_set():
+                return 'stop'
+            if PAUSE.is_set():
+                return 'pause'
+            return 'run'
+
+        out = cs.answer_urls(cfg, links, submit=not draft,
+                             progress=progress, control=control)
+        with LOCK:
+            STATE['summary'] = {'交卷': out.get('submitted', 0),
+                                '已暂存': out.get('saved', 0),
+                                '未确认': out.get('unverified', 0),
+                                '部分暂存': out.get('partial', 0),
+                                '需人工': out.get('report', 0) + out.get('skipped', 0),
+                                '失败': out.get('fail', 0)}
+            if out.get('stopped'):
+                STATE['summary']['状态'] = '已停止'
+        if out.get('items'):
+            _set_ares({'time': time.strftime('%H:%M'), 'items': out['items']})
+    except cs.NotLoggedIn as e:
+        cs.log('%s' % e, 'err')
+        with LOCK:
+            STATE['summary'] = {'提示': '未登录，请先登录'}
+    except Exception as e:
+        cs.log('任务失败：%s' % e, 'err')
+        import traceback
+        cs.log(traceback.format_exc()[-900:], 'err')
+        _set_result({'error': str(e)[:200] or type(e).__name__})
+    finally:
+        cs.set_control_hook(None)
+        PAUSE.clear()
+        CANCEL.clear()
+        with LOCK:
+            STATE['running'] = False
+            STATE['done'] = True
+            STATE['paused'] = False
+            STATE['phase'] = ''
+        cs.log('■ 任务结束')
+
+
+def _link_combo_worker(opts):
+    """「上传链接 → 刷课+刷题」：先刷课程链接的视频，再对作业链接交卷。"""
+    links = opts.get('links') or []
+    cs.log('')
+    cs.log('▶ 任务开始：上传链接刷课+刷题（共 %d 条链接）' % len(links))
+    PAUSE.clear()
+    CANCEL.clear()
+    with LOCK:
+        STATE['paused'] = False
+        STATE['phase'] = 'brushing'
+    # 按类型分流：课程链接去刷课，作业链接去刷题（两条都跑完才算完）
+    course_links = [l for l in links if _classify_link(l['url'])
+                    in ('course', 'cards', 'other')]
+    work_links = [l for l in links if _classify_link(l['url'])
+                  in ('work', 'dowork', 'exam')]
+    try:
+        cfg = cs.load_config()
+        if _apply_rate(opts, cfg):
+            cs.patch_config({'brush_rate': cfg['brush_rate']})
+
+        def progress(msg, *a):
+            cs.log(msg, a[0] if a else 'info')
+            with LOCK:
+                STATE['task'] = (msg[:54] if msg else '')
+
+        def control():
+            if CANCEL.is_set():
+                return 'stop'
+            if PAUSE.is_set():
+                return 'pause'
+            return 'run'
+
+        vdone = vfail = 0
+        if course_links:
+            cs.log('【第 1 步】刷课：%d 条课程链接。' % len(course_links))
+            out = cs.brush_by_urls(cfg, [l['url'] for l in course_links],
+                                   progress=progress, control=control)
+            vdone, vfail = out.get('done', 0), out.get('fail', 0)
+            if out.get('stopped'):
+                with LOCK:
+                    STATE['summary'] = {'刷完视频': vdone, '未完成': vfail,
+                                        '状态': '已停止（未进入刷题）'}
+                cs.log('刷课被停止，按约定不进入刷题。', 'warn')
+                return
+        else:
+            cs.log('（没有课程链接，跳过刷课）')
+
+        if work_links:
+            cs.log('')
+            cs.log('【第 2 步】刷题：%d 条作业链接，答完直接交卷。' % len(work_links))
+            with LOCK:
+                STATE['phase'] = 'answering'
+            if not cs.llm_ready(cfg):
+                cs.log('没有配置大模型，刷题跳过（刷课不受影响）。', 'err')
+                out2 = {'submitted': 0, 'unverified': 0, 'partial': 0,
+                        'report': 0, 'skipped': 0, 'fail': 0, 'items': []}
+            else:
+                out2 = cs.answer_urls(cfg, work_links, submit=True,
+                                      progress=progress, control=control)
+                if out2.get('items'):
+                    _set_ares({'time': time.strftime('%H:%M'), 'items': out2['items']})
+            with LOCK:
+                STATE['summary'] = {'刷完视频': vdone, '交卷': out2.get('submitted', 0),
+                                    '未确认': out2.get('unverified', 0),
+                                    '部分暂存': out2.get('partial', 0),
+                                    '需人工': out2.get('report', 0) + out2.get('skipped', 0),
+                                    '失败': (vfail + out2.get('fail', 0))}
+        else:
+            cs.log('（没有作业链接，跳过刷题）')
+            with LOCK:
+                STATE['summary'] = {'刷完视频': vdone, '未完成': vfail}
+        all_done = True
+        cs.log('上传链接刷课+刷题完成。', 'ok')
+    except cs.NotLoggedIn as e:
+        cs.log('%s' % e, 'err')
+        with LOCK:
+            STATE['summary'] = {'提示': '未登录，请先登录'}
+    except Exception as e:
+        cs.log('任务失败：%s' % e, 'err')
+        import traceback
+        cs.log(traceback.format_exc()[-900:], 'err')
+        _set_result({'error': str(e)[:200] or type(e).__name__})
+    finally:
+        cs.set_control_hook(None)
+        PAUSE.clear()
+        CANCEL.clear()
+        with LOCK:
+            STATE['running'] = False
+            STATE['done'] = True
+            STATE['paused'] = False
+            STATE['phase'] = ''
+        cs.log('■ 任务结束')
+        if locals().get('all_done') and opts.get('shutdown'):
+            _shutdown_pc()
+
+
+# ================================================================ 课堂活动：刷课 / 刷题 / 刷课+刷题
+# 「进行中的课堂活动」那一节的动作列。刷课 = 刷该活动所在课程的待完成章节视频
+# （复用 cs.brush_activities → brush_by_urls）；刷题 = 大模型作答这条活动
+# （复用 cs.answer_activities，提交 / 暂存两模式）。三者与任务点那节的
+# 刷视频 / 做作业共用同一套 PAUSE/CANCEL 控制、summary、交卷结果面板。
+def _brush_act_worker(opts):
+    """「课堂活动 → 刷课」：把活动所在课程的待完成视频刷掉。"""
+    targets = opts.get('targets') or []
+    cs.log('')
+    cs.log('▶ 任务开始：课堂活动刷课（涉及 %d 条活动）' % len(targets))
+    PAUSE.clear()
+    CANCEL.clear()
+    with LOCK:
+        STATE['paused'] = False
+        STATE['phase'] = 'brushing'
+    try:
+        cfg = cs.load_config()
+        if _apply_rate(opts, cfg):
+            cs.patch_config({'brush_rate': cfg['brush_rate']})
+        cs.log('播放方式：%sx 倍速 + 静音，真实播放到片尾。' % cs.g_rate(cfg))
+
+        def progress(msg, *a):
+            cs.log(msg, a[0] if a else 'info')
+            with LOCK:
+                STATE['task'] = '刷课 · ' + (msg[:54] if msg else '')
+
+        def control():
+            if CANCEL.is_set():
+                return 'stop'
+            if PAUSE.is_set():
+                return 'pause'
+            return 'run'
+
+        out = cs.brush_activities(cfg, targets, progress=progress, control=control)
+        with LOCK:
+            STATE['summary'] = {'刷完视频': out.get('done', 0),
+                                '未完成': out.get('fail', 0)}
+            if out.get('stopped'):
+                STATE['summary']['状态'] = '已停止'
+        all_done = not out.get('stopped')
+        cs.log('课堂活动刷课完成：视频完成 %d 个，未完成 %d 个。'
+               % (out.get('done', 0), out.get('fail', 0)), 'ok')
+    except cs.NotLoggedIn as e:
+        cs.log('%s' % e, 'err')
+        with LOCK:
+            STATE['summary'] = {'提示': '未登录，请先登录'}
+    except Exception as e:
+        cs.log('任务失败：%s' % e, 'err')
+        import traceback
+        cs.log(traceback.format_exc()[-900:], 'err')
+        _set_result({'error': str(e)[:200] or type(e).__name__})
+    finally:
+        cs.set_control_hook(None)
+        PAUSE.clear()
+        CANCEL.clear()
+        with LOCK:
+            STATE['running'] = False
+            STATE['done'] = True
+            STATE['paused'] = False
+            STATE['phase'] = ''
+        cs.log('■ 任务结束')
+        if locals().get('all_done') and opts.get('shutdown'):
+            _shutdown_pc()
+
+
+def _answer_act_worker(opts):
+    """「课堂活动 → 作答」：逐条大模型作答（提交 / 暂存）。"""
+    targets = opts.get('targets') or []
+    draft = bool(opts.get('draft'))
+    cs.log('')
+    cs.log('▶ 任务开始：课堂活动作答（共 %d 条，%s）'
+           % (len(targets), '答完暂存不交卷' if draft else '答完直接提交'))
+    PAUSE.clear()
+    CANCEL.clear()
+    with LOCK:
+        STATE['paused'] = False
+        STATE['phase'] = 'answering'
+    try:
+        cfg = cs.load_config()
+        if not cs.llm_ready(cfg):
+            cs.log('还没有配置大模型：请在左侧「模型」里选平台、填 API Key 并保存。', 'err')
+            with LOCK:
+                STATE['summary'] = {'提示': '先配置大模型接口'}
+            return
+        cs.log('模型：%s ｜ 要上传附件的题会整条跳过并提示；'
+               '题干带公式图片的题走视觉模型（若已配置）。' % cfg['llm_model'])
+
+        def progress(msg, *a):
+            cs.log(msg, a[0] if a else 'info')
+            with LOCK:
+                STATE['task'] = '作答 · ' + (msg[:54] if msg else '')
+
+        def control():
+            if CANCEL.is_set():
+                return 'stop'
+            if PAUSE.is_set():
+                return 'pause'
+            return 'run'
+
+        out = cs.answer_activities(cfg, targets, submit=not draft,
+                                   progress=progress, control=control)
+        with LOCK:
+            STATE['summary'] = {'提交': out.get('submitted', 0),
+                                '已暂存': out.get('saved', 0),
+                                '未确认': out.get('unverified', 0),
+                                '部分暂存': out.get('partial', 0),
+                                '需人工': out.get('report', 0),
+                                '失败': out.get('fail', 0)}
+            if out.get('stopped'):
+                STATE['summary']['状态'] = '已停止'
+        if out.get('items'):
+            _set_ares({'time': time.strftime('%H:%M'), 'items': out['items']})
+    except cs.NotLoggedIn as e:
+        cs.log('%s' % e, 'err')
+        with LOCK:
+            STATE['summary'] = {'提示': '未登录，请先登录'}
+    except Exception as e:
+        cs.log('任务失败：%s' % e, 'err')
+        import traceback
+        cs.log(traceback.format_exc()[-900:], 'err')
+        _set_result({'error': str(e)[:200] or type(e).__name__})
+    finally:
+        cs.set_control_hook(None)
+        PAUSE.clear()
+        CANCEL.clear()
+        with LOCK:
+            STATE['running'] = False
+            STATE['done'] = True
+            STATE['paused'] = False
+            STATE['phase'] = ''
+        cs.log('■ 任务结束')
+
+
+def _combo_act_worker(opts):
+    """「课堂活动 → 刷课+刷题」：先刷活动所在课程的视频，再逐条作答。"""
+    targets = opts.get('targets') or []
+    draft = bool(opts.get('draft'))
+    cs.log('')
+    cs.log('▶ 任务开始：课堂活动刷课+刷题（共 %d 条活动）' % len(targets))
+    PAUSE.clear()
+    CANCEL.clear()
+    with LOCK:
+        STATE['paused'] = False
+        STATE['phase'] = 'brushing'
+    try:
+        cfg = cs.load_config()
+        if _apply_rate(opts, cfg):
+            cs.patch_config({'brush_rate': cfg['brush_rate']})
+
+        def progress(msg, *a):
+            cs.log(msg, a[0] if a else 'info')
+            with LOCK:
+                STATE['task'] = (msg[:54] if msg else '')
+
+        def control():
+            if CANCEL.is_set():
+                return 'stop'
+            if PAUSE.is_set():
+                return 'pause'
+            return 'run'
+
+        vdone = vfail = 0
+        cs.log('【第 1 步】刷课：%d 条活动所在课程的视频。' % len(targets))
+        out = cs.brush_activities(cfg, targets, progress=progress, control=control)
+        vdone, vfail = out.get('done', 0), out.get('fail', 0)
+        if out.get('stopped'):
+            with LOCK:
+                STATE['summary'] = {'刷完视频': vdone, '未完成': vfail,
+                                    '状态': '已停止（未进入作答）'}
+            cs.log('刷课被停止，按约定不进入作答。', 'warn')
+            return
+
+        cs.log('')
+        cs.log('【第 2 步】作答：%d 条活动，%s。'
+               % (len(targets), '答完暂存' if draft else '答完直接提交'))
+        with LOCK:
+            STATE['phase'] = 'answering'
+        if not cs.llm_ready(cfg):
+            cs.log('没有配置大模型，作答跳过（刷课不受影响）。', 'err')
+            out2 = {'submitted': 0, 'saved': 0, 'unverified': 0, 'report': 0,
+                    'fail': 0, 'items': []}
+        else:
+            out2 = cs.answer_activities(cfg, targets, submit=not draft,
+                                        progress=progress, control=control)
+            if out2.get('items'):
+                _set_ares({'time': time.strftime('%H:%M'), 'items': out2['items']})
+        with LOCK:
+            STATE['summary'] = {'刷完视频': vdone,
+                                '提交': out2.get('submitted', 0),
+                                '已暂存': out2.get('saved', 0),
+                                '未确认': out2.get('unverified', 0),
+                                '部分暂存': out2.get('partial', 0),
+                                '需人工': out2.get('report', 0),
+                                '失败': (vfail + out2.get('fail', 0))}
+        # 跟别的 combo 一样：作答被停止就不算「全跑完」，不触发自动关机。
+        all_done = not out2.get('stopped')
+        cs.log('课堂活动刷课+刷题完成。', 'ok')
+    except cs.NotLoggedIn as e:
+        cs.log('%s' % e, 'err')
+        with LOCK:
+            STATE['summary'] = {'提示': '未登录，请先登录'}
+    except Exception as e:
+        cs.log('任务失败：%s' % e, 'err')
+        import traceback
+        cs.log(traceback.format_exc()[-900:], 'err')
+        _set_result({'error': str(e)[:200] or type(e).__name__})
+    finally:
+        cs.set_control_hook(None)
+        PAUSE.clear()
+        CANCEL.clear()
+        with LOCK:
+            STATE['running'] = False
+            STATE['done'] = True
+            STATE['paused'] = False
+            STATE['phase'] = ''
+        cs.log('■ 任务结束')
+        if locals().get('all_done') and opts.get('shutdown'):
+            _shutdown_pc()
+
+
 PAGE = r"""<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -1113,16 +1668,19 @@ PAGE = r"""<!DOCTYPE html>
   .row > .btn.grow{flex:1 1 auto;min-width:0;}
   .grow{flex:1;min-width:0;}
 
-  input[type=text],input[type=password],input[type=number],select{
+  input[type=text],input[type=password],input[type=number],select,textarea{
     width:100%;padding:8px 10px;
     background:var(--sunk);color:var(--tx);
     border:1px solid var(--line);border-radius:6px;
     font:inherit;font-size:var(--fs-base);
     transition:border-color var(--t) var(--ease),background var(--t) var(--ease);
   }
-  input::placeholder{color:var(--mut);}
-  input:hover,select:hover{border-color:var(--line-2);}
-  input:focus,select:focus{border-color:var(--ac);background:#0b1113;}
+  textarea{resize:vertical;min-height:64px;line-height:1.45;
+    font-family:var(--mono,ui-monospace,SFMono-Regular,Menlo,Consolas,monospace);
+    font-size:var(--fs-sm,0.86rem);}
+  input::placeholder,textarea::placeholder{color:var(--mut);}
+  input:hover,select:hover,textarea:hover{border-color:var(--line-2);}
+  input:focus,select:focus,textarea:focus{border-color:var(--ac);background:#0b1113;}
   select{
     cursor:pointer;appearance:none;-webkit-appearance:none;
     padding-right:28px;
@@ -1333,6 +1891,10 @@ PAGE = r"""<!DOCTYPE html>
   #res tbody tr:last-child td{border-bottom-color:transparent;}
   #res .num{font-variant-numeric:tabular-nums;white-space:nowrap;}
   #res .col-act{width:1%;white-space:nowrap;}
+  /* 暂存答案列：逐题「题号 + 答案」，窄列可换行，核对时一目十行 */
+  #res .anscell{max-width:320px;font-size:var(--fs-xs);color:var(--mut);}
+  #res .ansrow{display:flex;gap:6px;line-height:1.5;}
+  #res .ansrow b{color:var(--ac);font-weight:600;min-width:1.6em;}
   /* 行内按钮压紧：它的高度撑着整行，高密度台账不该被按钮撑成 44px */
   #res tbody .mini{padding:3px 8px;font-size:var(--fs-xs);gap:4px;}
   #res a{color:var(--ac);text-decoration:none;}
@@ -1650,6 +2212,28 @@ PAGE = r"""<!DOCTYPE html>
       </div>
       <p class="note">暂停 / 停止都在当前这门课抓完后生效（一般几秒内）。
         停止不丢结果：已扫完的照常出报告，只是标注为「中止扫描」。</p>
+    </section>
+
+    <section class="blk">
+      <h2 class="blk-t">上传链接刷课刷题</h2>
+      <div class="field">
+        <textarea id="linkbox" rows="4" spellcheck="false"
+          placeholder="把学习通页面链接粘进来，一行一个：&#10;课程页 / 任务页链接 → 刷课&#10;作业链接 → 刷题"></textarea>
+      </div>
+      <div class="row" style="margin-bottom:8px">
+        <button class="btn sm pri grow" id="blinkbrush">
+          <span class="ic" data-i="play"></span>刷课</button>
+        <button class="btn sm grow" id="blinkanswer">
+          <span class="ic" data-i="play"></span>刷题</button>
+        <button class="btn sm grow" id="blinkcombo">
+          <span class="ic" data-i="play"></span>刷课+刷题</button>
+      </div>
+      <label class="chk"><input type="checkbox" id="linkdraft">
+        刷题时只暂存、不交卷（人工审查后再自己交）</label>
+      <p class="note">不依赖上面的查询结果，直接按你贴的链接干活。刷课认课程页 /
+        任务页链接（读 courseid + clazzid，回课程页找未完成章节刷视频）；
+        刷题认作业链接（答完交卷，附件 / 报告题整份跳过）；刷课+刷题按链接类型
+        自动分流。只接受超星 / 高校域名。刷题要先在「模型」里配好大模型。</p>
     </section>
 
     <section class="blk">
@@ -2100,6 +2684,16 @@ function rateOpts(){
 // 未完成作业清单。「刷题」按钮按索引取用——结果区每 900ms 整个重绘一次，
 // 索引比把对象塞进 onclick 更抗重绘（重绘时 lastHw 同步刷新为同一份数据）。
 let lastHw = [];
+// 「进行中的课堂活动」清单，同理按索引取用（活动行的「作答」按钮）。
+let lastAct = [];
+// 活动节的「刷题只暂存」勾选（重绘要保回），以及刷题是否可做（只看能否定位）。
+var actDraftOn = false;
+function actLocatable(it){ return !!(it && it.cid && it.clsid && it.id); }
+// 「作答」只对随堂练习/测验(42)、问卷(14)这类走 answerQuestion 答题面的活动出现
+// ——别的类型（主题讨论/AI实践/签到…）平台跳的是完全不同的页面，大模型替不了
+// （以前对它们也拼 answerQuestion，平台回「非法请求」，用户点进去就报错）。
+// 报告里每条带 answerable；老报告没这个字段时按「有定位就当能做」兜底。
+function actAnswerable(it){ return actLocatable(it) && it.answerable !== false; }
 
 // 提示条：中止扫描 / 范围受限 / 页面没加载成功。都是「这份报告你不能全信」
 // 的边界说明，所以放在台账最上面，用状态色而不是装饰色。
@@ -2129,6 +2723,8 @@ function renderResult(r){
   if (sda) sdAfterOn = sda.checked;
   const bsl = document.getElementById('brate');
   if (bsl) brateVal = bsl.value;
+  const ad = document.getElementById('actdraft');
+  if (ad) actDraftOn = ad.checked;
   const openIdx = new Set();
   document.querySelectorAll('#res details.cbox').forEach(d => {
     if (d.open) openIdx.add(d.getAttribute('data-idx'));
@@ -2157,6 +2753,58 @@ function renderResult(r){
           ? ((r.scope_kind === 'recent' ? '已查最近 ' : '已勾选 ')
              + (r.course_total||0) + ' 门（账号共 ' + (r.account_total||0) + ' 门）')
           : ('共扫描 ' + (r.course_total||0) + ' 门课程'))) + '</div>';
+
+  // 进行中的课堂活动放最上面：老师刚发、有时限，最该先处理。
+  const ac = r.undone_act || [];
+  lastAct = ac;
+  h += '<div class="sec"><h2>进行中的课堂活动 <span class="n">' + ac.length
+     + '</span> 项</h2>';
+  if (ac.length){
+    h += '<div class="note" style="margin:-2px 0 10px 2px">这些是老师发的'
+       + '课堂活动，只在课程首页的「任务」页里，作业和章节任务点都不含它。'
+       + '每条的「去完成」按类型打开对的页面（测验 / 问卷 / 主题讨论 / AI实践'
+       + '各有各的页）。刷课 = 把该课任务点的视频刷掉；'
+       + '刷题 = 大模型答这条活动（暂存 = 答完存草稿不交，提交 = 直接交）——'
+       + '只有「随堂练习/测验」「问卷」这两种大模型能替；主题讨论、AI实践、签到'
+       + '那些答题面不一样，只给「去完成」，要你本人做。</div>';
+    // 只要有一条活动能定位到课程，就给一排「刷课 / 刷课+刷题」按钮
+    const anyAct = ac.some(it => it.cid && it.clsid && it.id);
+    if (anyAct){
+      h += '<div class="brushbar">'
+         + '<button class="mini pri" onclick="startActBrush(event)">'
+         + '<span class="ic">' + icon('play') + '</span>刷这些课的视频</button>'
+         + '<button class="mini" onclick="startActCombo(event)">'
+         + '<span class="ic">' + icon('play') + '</span>刷课+刷题</button>'
+         + '<label class="chk inline"><input type="checkbox" id="actdraft"'
+         + (actDraftOn ? ' checked' : '') + '> 刷题只暂存（不交卷）</label>'
+         + '<span class="note">刷题逐条在右侧「作答」按钮上做；'
+         + '勾「只暂存」后这里两个按钮的刷题环节也改成暂存。'
+         + '「刷这些课的视频」把这一节里每门课的待完成章节视频刷掉，'
+         + '已经刷完的课会跳过。</span>'
+         + '</div>';
+    }
+    h += '<table><thead><tr><th>课程</th><th>类型</th><th>名称</th>'
+       + '<th>剩余时间</th><th class="col-act"></th></tr></thead><tbody>';
+    for (let i = 0; i < ac.length; i++){
+      const it = ac[i], uu = safeUrl(it.url);
+      h += '<tr><td>' + esc(it.course) + '</td>'
+         + '<td><span class="st warn">' + esc(it.kind || '活动') + '</span></td>'
+         + '<td>' + esc(it.name || '（无标题）') + '</td>'
+         + '<td class="num sub">' + esc(it.time || '—') + '</td>'
+         + '<td class="col-act">'
+         + (uu ? '<a href="' + uu + '" class="go-work" rel="noopener">去完成</a>' : '')
+         + (actAnswerable(it)
+            ? (uu ? ' ' : '')
+              + '<button class="mini" onclick="brushMenu(event,\'act\',' + i + ')"'
+              + ' title="让大模型答这一条：点开选「暂存」（存平台草稿，人工审查后自己交）'
+              + '或「提交」（直接正式交）。要上传附件的题整条跳过，不会乱填">'
+              + '<span class="ic">' + icon('chev') + '</span>作答</button>'
+            : '')
+         + '</td></tr>';
+    }
+    h += '</tbody></table>';
+  } else { h += '<div class="empty">没有进行中的课堂活动。</div>'; }
+  h += '</div>';
 
   h += '<div class="sec"><h2>未完成作业 <span class="n">' + hw.length
      + '</span> 项</h2>';
@@ -2325,14 +2973,17 @@ async function poll(){
         toast('浏览器窗口已就绪：点「预览」页签查看与操作');
       lastDockN = dn;
     }
-    ['bquery','blogin','blist'].forEach(i => $(i).disabled = j.running);
+    ['bquery','blogin','blist','blinkbrush','blinkanswer','blinkcombo']
+      .forEach(i => { if ($(i)) $(i).disabled = j.running; });
     $('bquery').title = j.running
       ? (finishing ? '正在收尾（生成报告），稍等几秒就能再次查询' : '任务进行中，请先暂停或停止')
       : '';
     $('blist').title = j.running ? '任务进行中' : '只读取课程名单（约 10 秒，不抓作业）';
     if (j.running && finishing) $('bartip').textContent = '收尾中：正在生成报告…';
-    // 读课程名录是十来秒的只读操作，暂停/停止对它无效，就别让按钮看起来能用
-    $('bpause').disabled = !j.running || listing;
+    // 读课程名录是十来秒的只读操作，暂停/停止对它无效，就别让按钮看起来能用。
+    // 登录只认「停止」不认「暂停」（暂停会把任务挂死，见后端 _control_hook），
+    // 所以登录期间也把暂停键置灰——留一个点了没用的按钮只会误导。
+    $('bpause').disabled = !j.running || listing || j.phase === 'login';
     $('bstop').disabled  = !j.running || listing;
     const wasPaused = $('bpause').dataset.paused === '1';
     $('bpause').dataset.paused = paused ? '1' : '0';
@@ -2438,6 +3089,12 @@ async function run(action, opts){
   // 不动用户偏好（手机号记不记）、不弹提示、不清空日志区、不收起本次统计、
   // 不把结果面板换成占位（失败也留着用户正看的那份清单）。
   const auto = !!(opts && opts.auto);
+  if (!auto && __DESKTOP__ && action === 'login'){
+    // 扫码 / 短信登录：直接切到「预览」页签——登录窗口会嵌在这里。
+    // 入坞那一刻后端就会把键盘焦点交给它，用户在登录页里打字才进得去
+    // （真机 2026-10-14：不切过来、焦点不接管，字都落在侧栏账号框）。
+    switchTab('dock');
+  }
   if (!auto){
     if ($('remember').checked) {
       try { localStorage.setItem('cx_phone', $('phone').value.trim()); } catch(e){}
@@ -2507,7 +3164,11 @@ async function run(action, opts){
     $('res').innerHTML = '<div class="empty">正在读取课程列表…（约 10 秒，不抓作业）</div>';
     $('bartip').textContent = '读取课程列表…';
     switchTab('log');
-  } else {
+  } else if (!(__DESKTOP__ && action === 'login')) {
+    // 兜底的「切到日志页」。**扫码/短信登录例外**：上方已经为它切到「预览」
+    // 看登录页，这里若再切回日志，刚嵌进预览的登录窗口会被 _dock_layout
+    // 当成「面板没开」而隐藏——用户还是看不见登录页、键盘焦点也拿不到
+    // （真机 2026-10-14：光加切换、被这里盖掉，等于没切）。
     switchTab('log');
   }
   // 先掐掉旧轮询链，否则每点一次按钮就多一条并行的轮询，日志会重复
@@ -2516,12 +3177,30 @@ async function run(action, opts){
 }
 
 function switchTab(t){
+  const wasDock = $('dockpane').style.display !== 'none';
   document.querySelectorAll('.tab').forEach(b => b.classList.toggle('on', b.dataset.t === t));
   $('res').style.display = t === 'res' ? '' : 'none';
   $('logpane').style.display = t === 'log' ? '' : 'none';
   $('dockpane').style.display = t === 'dock' ? '' : 'none';
   postDockRect();
+  // 切到「预览」（或已在预览里点了别处又切回来）就把键盘焦点交给内嵌浏览器：
+  // 否则在预览里的登录页打字会落到工具侧栏的账号框（真机 2026-10-14）。
+  // 焦点接管是「尽力而为」，面板还没矩形/还没入坞时后端会安静返回 false。
+  if (t === 'dock' && !wasDock) focusDockSoon();
 }
+// 请后端把键盘焦点交给预览里的浏览器窗口。跨进程 WS_CHILD 不 AttachThreadInput
+// 就设不了焦点，所以这件事只能在原生层做（后端 /api/focus-dock）。
+function focusDockSoon(){
+  setTimeout(() => {
+    fetch('/api/focus-dock', {method:'POST',
+      headers:{'Content-Type':'application/json'}, body:'{}'}).catch(() => {});
+  }, 80);   // 让面板矩形先到后端（postDockRect 有 60ms 防抖）
+}
+// 在预览面板上按下鼠标 → 再要一次焦点。用户切页签后可能先点了面板空白、
+// 焦点又回到工具界面；这一次点击就顺手把键盘交还给内嵌浏览器。
+if ($('dockpane')) $('dockpane').addEventListener('mousedown', () => {
+  if ($('dockpane').style.display !== 'none') focusDockSoon();
+});
 
 // ---------- 预览页签（内嵌浏览器） ----------
 // 后端用 SetParent 把工具开出的 Chrome 挂成主窗口的子窗口，位置对齐
@@ -2575,6 +3254,76 @@ function answerThis(ev, i, draft){
   }).catch(() => toast('连不上本地程序，请确认程序还在运行', 'err'));
 }
 
+// ---------- 课堂活动：行级作答 / 批刷课 / 刷课+刷题 ----------
+// targets 用「活动 key」（cid:clsid#id），后端据此定位活动与所在课程。
+// 刷课只认「能定位到课程」（cid/clsid）——任何类型都能刷它所在课的视频；
+// 作答那一步后端再按类型挑（只有 42/14 能自动答，其余报「需人工」）。
+function actTargets(){
+  return (lastAct || []).filter(actLocatable).map(it =>
+    ({cid: String(it.cid), clsid: String(it.clsid), id: String(it.id),
+      type: it.type, kind: it.kind, name: it.name, course: it.course,
+      cpi: it.cpi, url: it.url}));
+}
+function answerThisAct(ev, i, draft){
+  if (ev) ev.stopPropagation();
+  const it = (lastAct || [])[i];
+  if (!actAnswerable(it)){
+    toast(it && it.kind
+      ? ('「' + it.kind + '」不是随堂练习/测验或问卷，大模型答不了，'
+         + '点「去完成」自己做')
+      : '这条活动定位不到作答页', 'warn');
+    return;
+  }
+  if (!draft && !confirm('让大模型答这一条并提交？\n\n' + (it.name || '') + '\n（'
+      + it.course + ' · ' + (it.kind || '活动') + '）'
+      + '\n\n答完直接正式提交、记录成绩。要求上传附件的题整条跳过，不会乱填。')) return;
+  startActJob('/api/answer-act', draft ? '作答并暂存' : '作答并提交',
+    {targets: [it].map(x => ({cid: String(x.cid), clsid: String(x.clsid),
+       id: String(x.id), type: x.type, kind: x.kind, name: x.name,
+       course: x.course, cpi: x.cpi, url: x.url})), draft: !!draft}, true);
+}
+function startActBrush(ev){
+  if (ev) ev.stopPropagation();
+  const ts = actTargets();
+  if (!ts.length){ toast('没有可刷的课堂活动（活动定位不到课程）', 'warn'); return; }
+  const shut = !!($('sdafter') && $('sdafter').checked);
+  startActJob('/api/brush-act', '刷课', {targets: ts, shutdown: shut,
+    rate: brateVal}, !shut);
+}
+function startActCombo(ev){
+  if (ev) ev.stopPropagation();
+  const ts = actTargets();
+  if (!ts.length){ toast('没有可刷的课堂活动（活动定位不到课程）', 'warn'); return; }
+  const shut = !!($('sdafter') && $('sdafter').checked);
+  // 「只暂存」必须**当场读 DOM**，不能读缓存的 actDraftOn —— 那份只有到下一次
+  // 900ms 重绘才刷新；用户勾完立刻点，会拿到旧值，结果本该暂存的刷成了提交。
+  // 同文件的 startActBrush 读 sdafter 也是当场读 DOM，这里对齐。
+  const ad = document.getElementById('actdraft');
+  const draft = ad ? !!ad.checked : !!actDraftOn;
+  startActJob('/api/combo-act', '刷课+刷题',
+    {targets: ts, shutdown: shut, rate: brateVal, draft: draft}, !shut);
+}
+// 统一的「课堂活动任务」启动：跟刷视频 / 做作业同一套收口（autoBack/brushLike、
+// 交卷面板、poll 接管状态行）。back=true 时才自动回到全量查询。
+function startActJob(path, label, body, back){
+  fetch(path, {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify(body)}).then(r => {
+    if (r.status === 409){ toast('当前有任务在跑，等它结束再做', 'warn'); return; }
+    if (!r.ok){ toast(label + '没能启动（HTTP ' + r.status + '）', 'err'); return; }
+    since = 0; logEl.innerHTML = '';
+    setCardsShown(false); cardFp = '';
+    autoBack = !!back; brushLike = true;
+    if (back){
+      $('res').innerHTML = '<div class="empty">正在后台' + esc(label)
+        + '…（进度看「运行日志」，可以随时暂停 / 停止）</div>';
+    }
+    $('bartip').textContent = label + '中…';
+    switchTab('log');
+    clearTimeout(timer);
+    poll();
+  }).catch(() => toast('连不上本地程序，请确认程序还在运行', 'err'));
+}
+
 // ---------- 刷题下拉菜单 ----------
 // 「刷题」「做作业」都只留一个按钮，点开浮层二选一：暂存（答完存平台草稿，
 // 人工审查后自己交）或提交（答完直接正式交卷）。菜单挂在 body 上，
@@ -2592,8 +3341,11 @@ function brushMenu(ev, kind, i){
   const items = kind === 'row'
     ? [['draft', '刷题并暂存', '答完存平台草稿，不交卷；人工审查后自己交'],
        ['submit', '刷题并提交', '答完直接正式提交并记录成绩']]
+    : (kind === 'act'
+    ? [['draft', '作答并暂存', '答完存平台草稿，不交卷；答案列出来供你核对'],
+       ['submit', '作答并提交', '答完直接正式提交并记录成绩']]
     : [['draft', '做作业并暂存', '答完存平台草稿，不交卷；人工审查后自己交'],
-       ['submit', '做作业并提交', '答完直接正式提交并记录成绩']];
+       ['submit', '做作业并提交', '答完直接正式提交并记录成绩']]);
   for (const mi of items){
     const b = document.createElement('button');
     b.className = 'bmenu-it';
@@ -2602,6 +3354,7 @@ function brushMenu(ev, kind, i){
     b.addEventListener('click', function(e2){
       closeBrushMenu();
       if (kind === 'row') answerThis(e2, i, mi[0] === 'draft');
+      else if (kind === 'act') answerThisAct(e2, i, mi[0] === 'draft');
       else startAnswer(e2, mi[0] === 'draft');
     });
     m.appendChild(b);
@@ -2745,16 +3498,27 @@ const AST = {
   report:     ['需人工 · 要传附件', 'warn'],
   unsupported:['需人工 · 题型不支持', 'warn'],
   unsolved:   ['需人工 · 模型没把握', 'warn'],
+  norender:   ['需人工 · 打开没渲染出题目', 'warn'],
   partial:    ['已暂存 · 待补完再交', 'warn'],
   skip:       ['已跳过', 'mut'],
 };
 
+// 课堂活动行由后端打 kind:'act'（它的 kid 是活动 activeId，不是作业 knowledgeid）：
+// 「重新核实」按作业卡查，对活动永远核实不到，所以只对作业行生效。
+function isActItem(it){ return !!(it && it.kind === 'act'); }
+
 function renderAnswerResult(a){
   if (!a || !a.items) return;
   aitems = a.items;
-  const uv = aitems.filter(it => it.status === 'unverified' || it.status === 'still');
+  // 待核实的行：未确认的（unverified/still）+ 已暂存的课堂活动（ok）——
+  // 暂存是平台草稿，你在平台上自己交了之后点「重新核实」就能翻案成已交卷。
+  const uv = aitems.filter(it =>
+    it.status === 'unverified' || it.status === 'still'
+    || (it.status === 'ok' && isActItem(it)));
+  const uvHw = uv;   // 活动/作业现在都能核（活动走答题页，作业走作业卡）
   const need = aitems.filter(it =>
-    ['report','unsupported','unsolved','partial','ok'].includes(it.status));
+    ['report','unsupported','unsolved','norender','partial','ok']
+      .includes(it.status));
   const tags = [[aitems.length, '', '份']];
   if (uv.length) tags.push([uv.length, 'warn', '份待核实']);
   if (need.length) tags.push([need.length, 'warn', '份需人工']);
@@ -2764,23 +3528,38 @@ function renderAnswerResult(a){
        + '</h2>'
        + '<div class="meta">生成时间 ' + esc(a.time)
        + '　·　「待平台确认」= 提交已发出、平台还没翻转状态（可能延迟几分钟到十几分钟），'
-       + '点「重新核实」自动翻案；也可以点开作业网址自己确认。</div>';
-  if (uv.length){
+       + '点「重新核实」自动翻案；也可以点开网址自己确认。</div>';
+  if (uvHw.length){
     h += '<div class="brushbar"><button class="mini pri"'
        + ' onclick="verifyAnswer(event)"><span class="ic">' + icon('refresh')
-       + '</span>重新核实未确认的（' + uv.length + ' 份）</button>'
-       + '<span class="note">逐份重开作业卡查「已批阅」，隔一分钟一轮，'
-       + '最多三轮，可随时停止。</span></div>';
+       + '</span>重新核实未确认的（' + uvHw.length + ' 份）</button>'
+       + '<span class="note">逐份重开查平台状态（作业查「已批阅」卡、'
+       + '课堂活动查答题页），隔一分钟一轮，最多三轮，可随时停止。</span></div>';
   }
-  h += '<table><thead><tr><th>课程</th><th>作业（章节）</th><th>状态</th>'
+  // 有任一条带「逐题答案」就补一列把答案列出来——「暂存」的意义就是答完
+  // 给你看、你核对后再自己交（作业交卷结果同样带上，一并供核对）。
+  const hasAns = aitems.some(it => it.answers && Object.keys(it.answers).length);
+  h += '<table><thead><tr><th>课程</th><th>项目 / 名称</th><th>状态</th>'
+     + (hasAns ? '<th>逐题答案（供核对）</th>' : '')
      + '<th class="col-act">操作</th></tr></thead><tbody>';
   aitems.forEach((it) => {
     const st = AST[it.status] || [it.status, 'mut'];
+    // 用显式 kind 判，别拿 kid 里有没有冒号猜：课堂活动行的 kid 就是活动
+    // activeId（不含冒号），猜的话活动永远被判成作业 → 文案写成「打开作业」。
+    const isAct = isActItem(it);
+    let ans = '';
+    if (hasAns && it.answers && Object.keys(it.answers).length){
+      ans = Object.keys(it.answers).map(k =>
+        '<div class="ansrow"><b>' + esc(k) + '</b>'
+        + '<span>' + esc(String(it.answers[k])) + '</span></div>').join('');
+    }
     h += '<tr><td>' + esc(it.course) + '</td><td>' + esc(it.node)
        + '</td><td><span class="st ' + st[1] + '">' + esc(st[0]) + '</span></td>'
+       + (hasAns ? '<td class="anscell">' + (ans || '—') + '</td>' : '')
        + '<td class="col-act">'
        + (safeUrl(it.url) ? '<a href="' + safeUrl(it.url)
-                            + '" class="go-work" rel="noopener">打开作业</a>' : '')
+                            + '" class="go-work" rel="noopener">'
+                            + (isAct ? '打开活动' : '打开作业') + '</a>' : '')
        + '</td></tr>';
   });
   h += '</tbody></table></div>';
@@ -2789,13 +3568,18 @@ function renderAnswerResult(a){
 
 async function verifyAnswer(ev){
   if (ev) ev.stopPropagation();
-  const list = aitems.filter(it => it.status === 'unverified' || it.status === 'still');
+  // 活动行（kind='act'）也核：后端 verify_items 对活动走答题页判「结果页=已交」。
+  // 必须把 cid/clsid 一并传——活动答题页 URL 靠它们拼。
+  const list = aitems.filter(it =>
+    it.status === 'unverified' || it.status === 'still'
+    || (it.status === 'ok' && isActItem(it)));
   if (!list.length){ toast('没有待核实的作业', 'warn'); return; }
   try{
     const r = await fetch('/api/answer-verify', {method:'POST',
       headers:{'Content-Type':'application/json'},
       body: JSON.stringify({items: list.map(it => ({
-        key: it.key, kid: it.kid, course: it.course, node: it.node}))})});
+        key: it.key, kid: it.kid, course: it.course, node: it.node,
+        kind: it.kind, cid: it.cid, clsid: it.clsid}))})});
     if (r.status === 409){ toast('当前有任务在跑，等它结束再核实', 'warn'); return; }
     if (!r.ok){ toast('核实没能启动（HTTP ' + r.status + '）', 'err'); return; }
     since = 0; logEl.innerHTML = '';
@@ -3179,6 +3963,40 @@ $('blist').onclick  = () => {
   if (!ph && !pw) toast('没填账号密码，将尝试使用本机已保存的登录会话', 'warn');
   run('list');
 };
+
+// ---------- 上传链接刷课刷题 ----------
+// 把粘贴框里的链接直接发给后端；后端按类型分流到 brush_by_urls /
+// answer_urls。不写占位文案到结果区（任务结束会自动刷新结果），
+// 但日志页签切过去让用户看到进度。
+function startLinkJob(path, label){
+  const raw = ($('linkbox') && $('linkbox').value || '').trim();
+  if (!raw){ toast('先把学习通页面链接粘到上面的框里', 'warn'); return; }
+  const shut = !!($('sdafter') && $('sdafter').checked);
+  const draft = !!($('linkdraft') && $('linkdraft').checked);
+  if (path === '/api/answer-urls' && !draft &&
+      !confirm('确定要「上传链接刷题」吗？\n\n作业链接会答完直接正式提交并记录成绩，'
+             + '交卷后一般不能再改。要只暂存就勾上下面的「只暂存」再点。')) return;
+  fetch(path, {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({links: raw, shutdown: shut, draft: draft})}).then(r => {
+    if (r.status === 409){ toast('当前有任务在跑，等它结束再做', 'warn'); return; }
+    if (!r.ok){
+      return r.json().then(j => toast(j.error || ('没能启动（HTTP ' + r.status + '）'), 'err'))
+              .catch(() => toast('没能启动（HTTP ' + r.status + '）', 'err'));
+    }
+    since = 0; logEl.innerHTML = '';
+    setCardsShown(false); cardFp = '';
+    autoBack = !shut; brushLike = true;
+    $('bartip').textContent = label + '中…';
+    switchTab('log');
+    clearTimeout(timer);
+    poll();
+  }).catch(() => toast('连不上本地程序，请确认程序还在运行', 'err'));
+}
+if ($('blinkbrush')){
+  $('blinkbrush').onclick = () => startLinkJob('/api/brush-urls', '刷课');
+  $('blinkanswer').onclick = () => startLinkJob('/api/answer-urls', '刷题');
+  $('blinkcombo').onclick = () => startLinkJob('/api/combo-urls', '刷课+刷题');
+}
 $('call').onclick = () => {
   // 只作用于「当前显示出来」的项，配合筛选就能批量选中某一类课
   document.querySelectorAll('#clist label').forEach(lb => {
@@ -3414,6 +4232,7 @@ class Handler(BaseHTTPRequestHandler):
     # 漏在名单外 —— 按端点挑名单的维护方式本身就是缺陷。
     _JSON_PATHS = ('/api/run', '/api/brush', '/api/answer', '/api/combo',
                    '/api/answer-one', '/api/answer-verify',
+                   '/api/brush-act', '/api/answer-act', '/api/combo-act',
                    '/api/llm-config', '/api/llm-test',
                    # /api/open 带外部可控的 url，必须挡掉无预检的跨源 POST
                    '/api/open')
@@ -3601,6 +4420,81 @@ class Handler(BaseHTTPRequestHandler):
             _spawn(_combo_worker, {'only': only,
                                    'shutdown': bool(data.get('shutdown')),
                                    'rate': data.get('rate')})
+            return self._send(200, b'{"ok":true}')
+        if u.path in ('/api/brush-urls', '/api/answer-urls', '/api/combo-urls'):
+            # 「上传链接刷课刷题」：用户把页面链接粘进来直接刷，不依赖先查询。
+            #   brush-urls  = 刷课（每条课程链接回课程页找待完成章节刷视频）
+            #   answer-urls = 刷题（每条作业链接走答题交卷链；draft=True 暂存）
+            #   combo-urls  = 先刷课再刷题（按链接类型自动分流）
+            # 只放行超星 / 高校域名，避免变成任意网址的跳板。
+            try:
+                data = json.loads(raw.decode('utf-8') or '{}')
+            except Exception:
+                data = {}
+            links = _parse_links(str(data.get('links') or ''))
+            bad = [l['url'] for l in links if not _link_host_ok(l['url'])]
+            links = [l for l in links if _link_host_ok(l['url'])]
+            if not links:
+                return self._send(400, json.dumps(
+                    {'error': ('没解析到可用的超星 / 高校链接'
+                               + ('（有 %d 条不是超星链接，已忽略）' % len(bad)
+                                  if bad else ''))},
+                    ensure_ascii=False).encode('utf-8'))
+            _close_work_window()       # 作业窗口开着会占 profile，先替用户关掉
+            action = {('/api/brush-urls'): 'brush_urls',
+                      ('/api/answer-urls'): 'answer_urls',
+                      ('/api/combo-urls'): 'combo_urls'}[u.path]
+            with LOCK:
+                if STATE['running']:
+                    return self._send(409, b'{"error":"busy"}')
+                STATE.update(running=True, task=TASK_NAME[action],
+                             lines=[], done=False, summary=None,
+                             started=time.time(), login_fail=None)
+            worker = {'brush_urls': _brush_link_worker,
+                      'answer_urls': _answer_links_worker,
+                      'combo_urls': _link_combo_worker}[action]
+            _spawn(worker, {'links': links,
+                            'shutdown': bool(data.get('shutdown')),
+                            'rate': data.get('rate'),
+                            'draft': bool(data.get('draft'))})
+            return self._send(200, b'{"ok":true}')
+        if u.path in ('/api/brush-act', '/api/answer-act', '/api/combo-act'):
+            # 「进行中的课堂活动」那一节的动作列：
+            #   brush-act  = 刷课（活动所在课程的待完成视频）
+            #   answer-act = 作答（大模型答活动本身；draft=True 暂存草稿）
+            #   combo-act  = 先刷课再作答
+            # targets 是查询产物（每条含 cid/clsid/id）；只收数字定位参数，
+            # 不给任意东西留可乘之机。
+            try:
+                data = json.loads(raw.decode('utf-8') or '{}')
+            except Exception:
+                data = {}
+            targets = [t for t in (data.get('targets') or [])
+                       if isinstance(t, dict)
+                       and str(t.get('cid') or '').isdigit()
+                       and str(t.get('clsid') or '').isdigit()
+                       and str(t.get('id') or '').isdigit()]
+            if not targets:
+                return self._send(400, json.dumps(
+                    {'error': '没有可用的课堂活动（缺少活动 / 课程定位参数）'},
+                    ensure_ascii=False).encode('utf-8'))
+            _close_work_window()       # 作业窗口开着会占 profile，先替用户关掉
+            action = {'/api/brush-act': 'brush_act',
+                      '/api/answer-act': 'answer_act',
+                      '/api/combo-act': 'combo_act'}[u.path]
+            with LOCK:
+                if STATE['running']:
+                    return self._send(409, b'{"error":"busy"}')
+                STATE.update(running=True, task=TASK_NAME[action],
+                             lines=[], done=False, summary=None,
+                             started=time.time(), login_fail=None)
+            worker = {'brush_act': _brush_act_worker,
+                      'answer_act': _answer_act_worker,
+                      'combo_act': _combo_act_worker}[action]
+            _spawn(worker, {'targets': targets,
+                            'shutdown': bool(data.get('shutdown')),
+                            'rate': data.get('rate'),
+                            'draft': bool(data.get('draft'))})
             return self._send(200, b'{"ok":true}')
         if u.path == '/api/answer-verify':
             # 「重新核实」：把未确认的作业逐份重开，翻案或继续等平台翻转。
@@ -3869,6 +4763,11 @@ class Handler(BaseHTTPRequestHandler):
                 DESKTOP['dock_rect'] = rect
                 DESKTOP['dock_on'] = bool(rect and d.get('on'))
             return self._send(200, b'{"ok":true}')
+        if u.path == '/api/focus-dock':
+            # 用户切到「预览」页签、点回预览区时，把键盘焦点交给内嵌浏览器。
+            # 跨进程 WS_CHILD 不 AttachThreadInput 就设不了焦点，见 _focus_child。
+            ok = focus_docked()
+            return self._send(200, json.dumps({'ok': ok}).encode('utf-8'))
         if u.path == '/api/pwd-save':
             # 「记住密码」：加密落 runtime/，config 与 localStorage 不碰。
             # 日志绝不提内容 —— 这里自始至终不 log 密码本身。
@@ -4237,6 +5136,14 @@ def _main_hwnd():
     return u32.FindWindowW(None, WIN_TITLE) or 0
 
 
+def _is_foreground(hwnd):
+    """本工具的窗口此刻是不是前台窗（用户就在它上面）。"""
+    import ctypes
+    u32 = _u32()
+    u32.GetForegroundWindow.restype = ctypes.c_void_p
+    return u32.GetForegroundWindow() == hwnd
+
+
 def dock_count():
     """/api/poll 用：当前嵌在预览里的浏览器窗口数（顺带清掉死句柄）。"""
     if not DESKTOP.get('mode'):
@@ -4285,6 +5192,92 @@ def _dock_style_apply(hwnd):
     return old
 
 
+def _focus_child(hwnd):
+    """把**键盘焦点**真正交给入坞的 chrome 子窗口（真机 2026-10-14）。
+
+    为什么必须显式做：chrome 被 SetParent 成**跨进程**的 WS_CHILD 后，主窗口
+    那个线程根本管不到 chrome 那个线程的输入队列——`SetFocus(chrome)` 会直接
+    失败、`GetFocus()` 停在 0，于是用户在「预览」里的登录页打字，按键全落在
+    WebView2（默认聚焦的工具侧栏账号框），页面收不到（真机探针 _probe_dock_focus3
+    实测：不 Attach 时 GetFocus=0，Attach 后 GetFocus=chrome）。
+    跨线程设焦点的官方做法就是先把两个线程的输入队列 Attach 起来，SetFocus
+    完再解除。
+
+    返回 True 表示焦点确实落到了这个窗口。任何一步失败都安静返回 False，
+    绝不影响窗口本身的显示/布局。
+    """
+    import ctypes
+    u32 = _u32()
+    try:
+        main = _main_hwnd()
+        if not main:
+            return False
+        u32.SetFocus.restype = ctypes.c_void_p
+        u32.SetFocus.argtypes = [ctypes.c_void_p]
+        u32.GetFocus.restype = ctypes.c_void_p
+        u32.SetForegroundWindow.restype = ctypes.c_int
+        u32.SetForegroundWindow.argtypes = [ctypes.c_void_p]
+        u32.AttachThreadInput.restype = ctypes.c_int
+        u32.AttachThreadInput.argtypes = [ctypes.c_ulong, ctypes.c_ulong,
+                                          ctypes.c_int]
+        # GetWindowThreadProcessId 默认 restype 是有符号 int，tid 超过 2^31
+        # 会变负数、送进 AttachThreadInput 直接失败 —— 显式当无符号读。
+        u32.GetWindowThreadProcessId.restype = ctypes.c_ulong
+        u32.GetWindowThreadProcessId.argtypes = [ctypes.c_void_p,
+                                                 ctypes.c_void_p]
+        cur = ctypes.windll.kernel32.GetCurrentThreadId()
+        main_th = u32.GetWindowThreadProcessId(main, None)
+        tgt_th = u32.GetWindowThreadProcessId(hwnd, None)
+        # 主窗得是前台窗，焦点才有意义（用户刚点过按钮/页签，通常本就是）
+        try:
+            u32.SetForegroundWindow(main)
+        except Exception:
+            pass
+        att = []
+        # 自己的线程 → 目标线程；主窗线程 → 目标线程（前台窗必须是焦点窗的祖先）
+        for src in (cur, main_th):
+            if src and src != tgt_th:
+                try:
+                    if u32.AttachThreadInput(src, tgt_th, True):
+                        att.append(src)
+                except Exception:
+                    pass
+        try:
+            u32.SetFocus(hwnd)
+            return u32.GetFocus() == hwnd
+        finally:
+            for src in att:
+                try:
+                    u32.AttachThreadInput(src, tgt_th, False)
+                except Exception:
+                    pass
+    except Exception:
+        return False
+
+
+def focus_docked():
+    """/api/focus-dock 用：把键盘焦点交给预览里当前显示的浏览器窗口。
+
+    只处理**正在显示**的那一个（判据与 _dock_layout 完全一致：面板开着、
+    矩形够大——否则该窗在 _dock_layout 里是被 ShowWindow(0) 隐藏的，给它
+    设焦点没有意义），没有就不动。
+    """
+    u32 = _u32()
+    with LOCK:
+        if not DESKTOP.get('mode'):
+            return False
+        _rect = DESKTOP.get('dock_rect') or {}
+        # 与 _dock_layout 同款判据：宽高都要 > 4 才算「真的显示出来了」，
+        # 折叠成不到 5px 的面板下 _dock_layout 会隐藏窗口，这里也别去设焦点。
+        on = bool(DESKTOP.get('dock_on') and _rect
+                  and _rect.get('w', 0) > 4 and _rect.get('h', 0) > 4)
+        docked = [h for h in DESKTOP['docked'] if u32.IsWindow(h)]
+    if not (on and docked):
+        return False
+    return _focus_child(docked[-1])
+
+
+
 def _dock_new_windows():
     """发现新的**工具浏览器**窗口（属主 PID == 常驻浏览器 + 尚非子窗口）就嵌进预览面板。
 
@@ -4324,6 +5317,17 @@ def _dock_new_windows():
         with LOCK:
             DESKTOP['docked'].append(hwnd)
             DESKTOP['styles'][hwnd] = old
+        # 用户此刻正开着「预览」页签、**而且人就在本工具上** → 立即把键盘
+        # 焦点交给这个新窗口，否则他在预览里打字会落到工具侧栏的账号框里
+        # （真机 2026-10-14）。加「本工具是前台窗」这一条：dock_on 只反映
+        # 「上一次上报时预览是开着的」，用户 Alt-Tab 去别的程序后它是陈旧的
+        # True——不能据此把用户从别的程序里抢回来（后台 SetForegroundWindow
+        # 通常被系统前台锁挡下，但别去赌这个）。人不在本工具上就不抢焦点，
+        # 等他切回预览（switchTab/mousedown）时前端会再要一次。
+        with LOCK:
+            _show = bool(DESKTOP.get('dock_on') and DESKTOP.get('dock_rect'))
+        if _show and _is_foreground(main):
+            _focus_child(hwnd)
         cs.log('浏览器窗口已嵌进「预览」页签，点「预览」即可查看与操作。')
 
 

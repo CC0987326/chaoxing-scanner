@@ -91,7 +91,11 @@ def _check_fresh():
 # sk- 开头跟一长串字母数字（OpenAI/DeepSeek 等家的 key 都这个形）。
 # 限长度防误伤普通单词；扫描的是将要进包的文件（已排除 EXCLUDE 目录）。
 import re
-_KEY_RE = re.compile(r'sk-[A-Za-z0-9_-]{16,}')
+# sk- 前**不能是字母数字**（词边界）：pip 自带许可证库 _spdx.py 里的
+# 'asterisk-linking-protocols-exception' 词中含子串 sk-linking-protocols-…，
+# 旧正则会把它当 key 误报——2026-10-14 出包实测踩到。真 key（sk-abc…、
+# sk-proj-…）的 sk- 前面都是引号/空白，不受影响。
+_KEY_RE = re.compile(r'(?<![A-Za-z0-9])sk-[A-Za-z0-9_-]{16,}')
 _TEXT_SUFFIX = {'.py', '.json', '.txt', '.md', '.js', '.html', '.css',
                 '.cfg', '.ini', '.csv', '.xml', '.bat', '.sh'}
 
