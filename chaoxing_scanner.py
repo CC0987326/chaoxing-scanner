@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-学习通（超星）未完成事项巡检工具  v6.12
+学习通（超星）未完成事项巡检工具  v6.13
 ================================================================
 把「登录 → 逐门课翻作业/考试/任务点/课堂活动 → 汇总成清单」这套流程固化成本地程序。
 
@@ -26,6 +26,11 @@ v6.12 要点：LLM 答案「显示保真」——简答/填空答案里的 LaTeX
 \\frac、$…$）与 Markdown（**、`、#）在解析层统一洗成可正常显示的纯文本
 （矩阵 →「[ a, b; c, d ]」式），提示词同时明令禁止；顺带修「答案带花括号
 LaTeX 时候选 JSON 被切碎、整题丢失」的老盲区。
+
+v6.13 要点：①简答题答案带过程——先写关键步骤/公式代入，最后一行给结论
+（「答：…」），不再只给一个光秃秃的结果。
+②手写/纸上书写题自动跳过交人工——「在纸上书写…拍照上传」这类要求写在
+题目富文本里的也能认出（stem + li_html 双扫），Python/JS/提示词三层一致。
 """
 from __future__ import annotations
 
@@ -118,7 +123,7 @@ ACTIVITY_TYPES = {
 # 的「进行中 / 已结束」分桶完全一致（Vue: activeList1=进行中 activeList2=已结束）。
 
 # 版本号：界面侧栏、启动日志、使用说明都引它，别再各处手写一份
-VERSION = 'v6.12'
+VERSION = 'v6.13'
 
 # 平台自身算「已完成」的状态；除此之外都视为未完成
 DONE_STATES = ('已完成', '已互评', '待批阅', '已提交', '待互评', '已结束', '已过期')
@@ -3070,6 +3075,7 @@ STYPES = {'2': '填空', '4': '简答'}                # 主观题：LLM 写文�
 #   规则放宽是有意的——漏判=乱填一个答案拿 0 分，误判=整份跳过让用户自己做。
 _ATTACH_STEM_RE = re.compile(
     r'上传附件|提交附件|附件上传|附件提交|以附件|附件形式|拍照上传'
+    r'|手写|纸上书写|纸上作答|在纸上|书写后拍照|拍照.{0,8}(发送|回传)'
     r'|上传.{0,8}(报告|文件|文档|图片|视频|音频|压缩包|作品|附件)'
     r'|提交.{0,8}(报告|文件|文档|压缩包|作品|附件)'
     r'|(报告|文件|作品|附件).{0,6}(上传|提交)')
@@ -3252,7 +3258,10 @@ JS_PARSE_TIMUS = r"""
     const hasUploader = !!li.querySelector('input[type=file]')
       || [...li.querySelectorAll('[class*=upload],[id*=upload]')].some(
            e => !e.closest('.edui-default, .edui-editor, .edui-toolbar'));
-    const stemUpload = /上传附件|提交附件|附件上传|附件提交|以附件|附件形式|拍照上传|上传.{0,8}(报告|文件|文档|图片|视频|音频|压缩包|作品|附件)|提交.{0,8}(报告|文件|文档|压缩包|作品|附件)|(报告|文件|作品|附件).{0,6}(上传|提交)/.test(stem);
+    // v6.13：手写/纸上书写题（真机实测：「粘贴答案要求：在纸上书写ok()函数，
+    // 拍照上传」——要求写在题目富文本里而非纯题干，所以 stem 和 li_html 都要扫）
+    const ATTACH_RE = /上传附件|提交附件|附件上传|附件提交|以附件|附件形式|拍照上传|手写|纸上书写|纸上作答|在纸上|书写后拍照|拍照.{0,8}(发送|回传)|上传.{0,8}(报告|文件|文档|图片|视频|音频|压缩包|作品|附件)|提交.{0,8}(报告|文件|文档|压缩包|作品|附件)|(报告|文件|作品|附件).{0,6}(上传|提交)/;
+    const stemUpload = ATTACH_RE.test(stem) || ATTACH_RE.test(li_html);
     const upload = hasUploader || stemUpload;
     // 题干里是否带图/公式：这类题靠纯文本拿不到题面——超星的数学公式常以图片或
     // MathML 渲染，提取出来是空白或乱码。命中就标记，交给视觉模型「亲眼看」
@@ -4279,7 +4288,8 @@ def _ask_one_vision(cfg, t):
     elif t['atype'] == '2':
         hint = '填空题：只输出空里应填的内容本身。'
     elif t['atype'] == '4':
-        hint = '简答题：150 字以内直接作答，不要客套话。'
+        hint = ('简答题：200 字内，先写关键步骤/公式代入，最后一行给结论'
+                '（如「答：1.1×10^8 J」），不要只给一个数。')
     else:
         hint = '选择题：只输出所选选项的大写字母，多选连写（如 AC）。'
     stem = (t.get('stem') or '').strip()
@@ -4386,7 +4396,8 @@ def llm_solve(cfg, timus, progress):
                 else:
                     line += '（填空：只输出空里应填的内容本身）'
             elif t['atype'] == '4':
-                line += '（简答：150 字以内直接作答，不要客套话）'
+                line += ('（简答：200 字内，先写关键步骤/公式代入，'
+                         '最后一行给结论，如「答：1.1×10^8 J」）')
             else:
                 for o in t['opts']:
                     line += '\n   %s' % o['label']
@@ -4395,12 +4406,14 @@ def llm_solve(cfg, timus, progress):
                   '输出要求：只输出一个 JSON 对象，键为题号（字符串），值为答案。\n'
                   '单选/多选输出大写字母（多选如 "AC"）；判断题输出 "对" 或 "错"；\n'
                   '填空只输出应填内容本身，多空题按空序用 "|" 分隔；'
-                  '简答输出答案文本（150 字内）。\n'
+                  '简答输出答案文本（200 字内）：先写关键步骤/公式代入，'
+                  '最后一行给结论（形如「答：…」）；只给一个光秃秃的结果不行。\n'
                   '【显示保真，铁律】答案会被原样填进网页输入框：禁止任何 '
                   'LaTeX（\\frac、\\begin{pmatrix}、$…$ 等）、Markdown '
                   '（**、#、`）、代码块——数学式直接用普通字符写，'
                   '如 x^2、√2、≤、矩阵写成 (1,2; 3,4)。\n'
-                  '凡题干要求上传附件/文件/报告、或需要粘贴外部资料的题，输出 "?"。\n'
+                  '凡题干要求上传附件/文件/报告、要求手写/在纸上书写后拍照、'
+                  '或需要粘贴外部资料的题，输出 "?"。\n'
                   '没有把握的题输出 "?"。不要输出 JSON 以外的任何文字。\n\n'
                   + '\n\n'.join(lines))
         txtresp = llm_chat(cfg, prompt)
@@ -5963,7 +5976,7 @@ JS_QUIZ_SETTLE = r"""
 # _attach_shots）。每题容器打 data-cx-idx 供 _shot_timu 定位截图。
 JS_PARSE_QUIZ = r"""
 () => {
-  const ATTACH = /上传附件|提交附件|附件上传|附件提交|以附件|附件形式|拍照上传|上传.{0,8}(报告|文件|文档|图片|视频|音频|压缩包|作品|附件)|提交.{0,8}(报告|文件|文档|压缩包|作品|附件)|(报告|文件|作品|附件).{0,6}(上传|提交)/;
+  const ATTACH = /上传附件|提交附件|附件上传|附件提交|以附件|附件形式|拍照上传|手写|纸上书写|纸上作答|在纸上|书写后拍照|拍照.{0,8}(发送|回传)|上传.{0,8}(报告|文件|文档|图片|视频|音频|压缩包|作品|附件)|提交.{0,8}(报告|文件|文档|压缩包|作品|附件)|(报告|文件|作品|附件).{0,6}(上传|提交)/;
   const out = [];
   const boxes = [...document.querySelectorAll('.question-item')];
   boxes.forEach((qi, idx) => {
@@ -5999,7 +6012,8 @@ JS_PARSE_QUIZ = r"""
     const hasMedia = !!qi.querySelector(
       'img, svg, math, .MathJax, .MathJax_Preview, [class*=formula], [class*=math], canvas');
     const hasUploader = !!qi.querySelector('input[type=file]');
-    const upload = hasUploader || ATTACH.test(stem);
+    const upload = hasUploader || ATTACH.test(stem)
+      || ATTACH.test(qi.outerHTML.replace(/\s+/g, ' ').slice(0, 6000));
     qi.setAttribute('data-cx-idx', idx);
     out.push({no: idx + 1, stem: stem.slice(0, 500), atype: qtype,
               opts, fills, upload, hasMedia});
