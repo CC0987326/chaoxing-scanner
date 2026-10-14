@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-学习通（超星）未完成事项巡检工具  v6.13
+学习通（超星）未完成事项巡检工具  v6.14
 ================================================================
 把「登录 → 逐门课翻作业/考试/任务点/课堂活动 → 汇总成清单」这套流程固化成本地程序。
 
@@ -31,6 +31,11 @@ v6.13 要点：①简答题答案带过程——先写关键步骤/公式代入�
 （「答：…」），不再只给一个光秃秃的结果。
 ②手写/纸上书写题自动跳过交人工——「在纸上书写…拍照上传」这类要求写在
 题目富文本里的也能认出（stem + li_html 双扫），Python/JS/提示词三层一致。
+
+v6.14 要点：修课堂活动简答题「有答案却填不上去、暂存存不上」——简答正文是
+UEditor 富文本编辑器，textarea 只是壳，直接写 value 平台读不到；改走 UE.instants
+API（与作业侧 JS_FILL_TEXT 同一套判据），编辑器 iframe 兜底、走不到就计 miss
+（安全阀拦下不把空简答存上去）。
 """
 from __future__ import annotations
 
@@ -123,7 +128,7 @@ ACTIVITY_TYPES = {
 # 的「进行中 / 已结束」分桶完全一致（Vue: activeList1=进行中 activeList2=已结束）。
 
 # 版本号：界面侧栏、启动日志、使用说明都引它，别再各处手写一份
-VERSION = 'v6.13'
+VERSION = 'v6.14'
 
 # 平台自身算「已完成」的状态；除此之外都视为未完成
 DONE_STATES = ('已完成', '已互评', '待批阅', '已提交', '待互评', '已结束', '已过期')
@@ -6007,7 +6012,7 @@ JS_PARSE_QUIZ = r"""
       }
     });
     qi.querySelectorAll('textarea').forEach(x => {
-      if (x.name) fills.push({name: x.name});
+      if (x.name) fills.push({name: x.name, tag: 'textarea'});
     });
     const hasMedia = !!qi.querySelector(
       'img, svg, math, .MathJax, .MathJax_Preview, [class*=formula], [class*=math], canvas');
@@ -6037,6 +6042,8 @@ JS_FILL_QUIZ = r"""
     el.dispatchEvent(new Event('input', {bubbles: true}));
     el.dispatchEvent(new Event('change', {bubbles: true}));
   };
+  const escHtml = (s) => String(s)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
   let ok = 0, miss = 0;
   // 多空填空：同一题的 N 个空是**同名** input/textarea（出现顺序=空序）。
   // 不能用 querySelector（永远拿第一个）——Python 按空序发 N 条同名 item，
@@ -6069,7 +6076,44 @@ JS_FILL_QUIZ = r"""
     } else if (a.val !== undefined) {
       const pool = poolFor(a.name);
       const ta = pool.length ? pool.shift() : null;
-      if (ta) { setNative(ta, a.val); ok++; } else { miss++; }
+      if (!ta) { miss++; return; }
+      // 简答题正文是 **UEditor 富文本编辑器**，textarea 只是壳——直接写
+      // value 平台 serialize 读不到（=用户看到的「有答案却填不上去、暂存存不上」）。
+      // 必须优先走 UE API（UE.instants 的 key = textarea 的 name），与作业侧
+      // JS_FILL_TEXT 同一套判据。
+      const wrap = ta.closest('.question-item, .TiMu') || document;
+      const edFrame = wrap.querySelector(
+        '.edui-editor iframe, .edui-editor-body iframe, .eui-editor iframe');
+      let done = false;
+      try {
+        if (window.UE && UE.instants) {
+          for (const k in UE.instants) {
+            const e = UE.instants[k];
+            if ((e.key || k) === a.name) {
+              e.setContent('<p>' + escHtml(a.val).replace(/\n/g, '<br>') + '</p>');
+              done = !!e.getContent();
+              break;
+            }
+          }
+        }
+      } catch (e) { /* 编辑器未就绪 → 走下面的兜底 */ }
+      if (done) { ok++; return; }
+      // 兜底：同容器编辑器 iframe 正文直写（UE 实例拿不到时）。有编辑器壳
+      // 却没能写进去 → 计 miss，交卷/暂存侧的安全阀会提醒「文本没写进页面」，
+      // 绝不把空简答当成功悄悄存下去。
+      if (edFrame) {
+        try {
+          if (edFrame.contentDocument && edFrame.contentDocument.body) {
+            edFrame.contentDocument.body.innerHTML = escHtml(a.val)
+              .replace(/\n/g, '<br>');
+            ok++; return;
+          }
+        } catch (e) { /* 跨域/未就绪则放弃 */ }
+        miss++; return;
+      }
+      // 纯 textarea / input[type=text]（普通填空、无编辑器）：原生 setter 有效
+      setNative(ta, a.val);
+      ok++;
     }
   });
   return {ok, miss};
