@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-学习通（超星）未完成事项巡检工具  v6.16
+学习通（超星）未完成事项巡检工具  v6.17
 ================================================================
 把「登录 → 逐门课翻作业/考试/任务点/课堂活动 → 汇总成清单」这套流程固化成本地程序。
 
@@ -51,6 +51,16 @@ v6.16 要点（效率向）：①**单门刷新**——以前点「刷新」每�
 （复用常驻登录态、不重读课程列表、不碰其它课），再把结果并回当前清单重建报告，
 约 3~4 秒。②「刷新清单」这个全局按钮改为**重新读取课程列表**（课程有增删时的
 兜底），全量重查不再占用它。
+
+v6.17 要点：修 v6.16「单门刷新」的四处隐患——①**刷新撞风控不再静默丢
+数据**：以前单门刷新失败时，报告里「页面未加载」用的是整轮扫描算的旧
+清单，重抓的这一门既没加也没减，于是撞上平台安全验证时，那门课的未完成
+项会**从清单里凭空消失、还不报警**（跟工具「页面未加载 ≠ 没有」的铁律
+相悖）；现在按合并后的结果重算这个清单，与整轮扫描同一口径。②**单门
+刷新增节流**：整轮扫描两门课之间有间隔，单门刷新若一点就来（连点清单
+= 几秒内十几次整页导航）等于自己撞风控；现在补上同等间隔，偶尔点一下
+仍是秒级。③**刷新的失败不再被当「后台静默」吞掉**：失败时结果面板一定
+收口（有旧清单就留着、没有就明确报错），不会停在「正在刷新…」。
 """
 from __future__ import annotations
 
@@ -143,7 +153,7 @@ ACTIVITY_TYPES = {
 # 的「进行中 / 已结束」分桶完全一致（Vue: activeList1=进行中 activeList2=已结束）。
 
 # 版本号：界面侧栏、启动日志、使用说明都引它，别再各处手写一份
-VERSION = 'v6.16'
+VERSION = 'v6.17'
 
 # 平台自身算「已完成」的状态；除此之外都视为未完成
 DONE_STATES = ('已完成', '已互评', '待批阅', '已提交', '待互评', '已结束', '已过期')
@@ -2534,6 +2544,29 @@ def _course_wait(cfg_base, risky):
     return max(base, 0.6)
 
 
+_LAST_FETCH_TS = [0.0]     # 上次单门刷新的取数时刻（节流用）
+
+
+def _throttle_course_fetch(cfg, risky=False) -> bool:
+    """单门刷新取数前的节流与边界检查。
+
+    整轮扫描两门课之间有 course_delay（见 scan 的逐门循环）；单门刷新若「一点
+    就发、连着点清单几秒内十几次整页导航」，等于自己撞平台风控（scan 里的
+    45/90 秒冷却就是为这个设的）。这里补上同等间隔：距上次取数不足 base 秒就
+    补足；偶尔点一下（间隔早已超过 base）则零等待，仍是秒级。顺带在边界把控制
+    权交出去一瞬。返回 False = 用户要求中止。
+    """
+    if not checkpoint('refresh_course'):
+        return False
+    base = _course_wait(cfg.get('course_delay'), risky)
+    gap = time.time() - _LAST_FETCH_TS[0]
+    if base > gap:
+        time.sleep(base - gap)
+    _LAST_FETCH_TS[0] = time.time()
+    return True
+
+
+
 def _fetch_course_row(ctx, page, c, cpi, cfg, fid, deep) -> dict:
     """抓一门课的四类数据（作业 / 考试 / 课堂活动 / 任务点明细），返回 row。
 
@@ -2595,6 +2628,10 @@ def refresh_course(cfg, cid, clsid, name='', prog='', deep=True) -> dict:
                 log('本地没有可用登录态，请先登录。', 'err')
                 raise NotLoggedIn('未登录')
         _quiet_win(page, cfg, None)
+        # 单门刷新的节流：距上次取数不足一个课间间隔就补足（连点清单
+        # = 几秒内十几次整页导航，等于自己撞平台风控）；偶尔点一下零等待。
+        if not _throttle_course_fetch(cfg):
+            raise RuntimeError('已中止单门刷新')
         c = {'cid': cid, 'clsid': clsid,
              'name': name or ('课程%s' % cid), 'prog': prog or ''}
         cpi = cfg.get('cpi') or ''
@@ -2605,6 +2642,32 @@ def refresh_course(cfg, cid, clsid, name='', prog='', deep=True) -> dict:
         close_ctx(ctx)
     log('已重抓「%s」，用时 %.1f 秒' % (cut(name or cid, 24), time.time() - t0))
     return {'row': row}
+
+
+def _failed_courses_from_results(results) -> list:
+    """从逐课结果提炼「页面没加载成功」的课程清单（报告里要显式警告）。
+
+    整轮 scan 与单门刷新 rebuild 共用这一段，保证两条路对同一份 results 算出
+    同一份 page_failed——否则单门刷新撞风控时，报告仍用旧清单，那门课的未完成
+    项会静默消失（scan 里这类失败一定会挂红横幅，refresh 不能把这道保护丢了）。
+    """
+    return [
+        {'course': r['name'],
+         'what': '、'.join(w for w, d in (('作业', r['hw']), ('考试', r['exam']),
+                                          ('章节明细', r.get('prog_detail') or {}),
+                                          ('任务页', r.get('act') or {}))
+                           if d.get('page_failed')),
+         'reason': ((r['hw'].get('page_failed') and r['hw'].get('reason'))
+                    or (r['exam'].get('page_failed') and r['exam'].get('reason'))
+                    or ((r.get('prog_detail') or {}).get('page_failed')
+                        and (r.get('prog_detail') or {}).get('reason'))
+                    or ((r.get('act') or {}).get('page_failed')
+                        and (r.get('act') or {}).get('reason'))
+                    or '页面未加载成功')}
+        for r in results
+        if r['hw'].get('page_failed') or r['exam'].get('page_failed')
+        or (r.get('prog_detail') or {}).get('page_failed')
+        or (r.get('act') or {}).get('page_failed')]
 
 
 def rebuild_with_row(internal, cid, clsid, new_row):
@@ -2634,7 +2697,7 @@ def rebuild_with_row(internal, cid, clsid, new_row):
                           stopped_at=internal.get('stopped_at'),
                           scope_total=internal.get('scope_total'),
                           scope_kind=internal.get('scope_kind') or 'selected',
-                          failed_courses=internal.get('failed_courses'),
+                          failed_courses=_failed_courses_from_results(results),
                           fid=internal.get('fid', '2339'))
     internal['courses'] = courses
     internal['results'] = results
@@ -2794,23 +2857,7 @@ def scan(cfg, limit=0, headless=None, open_report=None, deep=True, only=None) ->
             base = cfg.get('course_delay', 3.0)
             time.sleep(_course_wait(base, bad or seen_risk))
 
-        failed_courses = [
-            {'course': r['name'],
-             'what': '、'.join(w for w, d in (('作业', r['hw']), ('考试', r['exam']),
-                                              ('章节明细', r.get('prog_detail') or {}),
-                                              ('任务页', r.get('act') or {}))
-                               if d.get('page_failed')),
-             'reason': ((r['hw'].get('page_failed') and r['hw'].get('reason'))
-                        or (r['exam'].get('page_failed') and r['exam'].get('reason'))
-                        or ((r.get('prog_detail') or {}).get('page_failed')
-                            and (r.get('prog_detail') or {}).get('reason'))
-                        or ((r.get('act') or {}).get('page_failed')
-                            and (r.get('act') or {}).get('reason'))
-                        or '页面未加载成功')}
-            for r in results
-            if r['hw'].get('page_failed') or r['exam'].get('page_failed')
-            or (r.get('prog_detail') or {}).get('page_failed')
-            or (r.get('act') or {}).get('page_failed')]
+        failed_courses = _failed_courses_from_results(results)
         if failed_courses:
             log('')
             log('⚠ 有 %d 门课的页面没有加载成功（%s），这些课的作业/考试结果不可信，'

@@ -515,6 +515,9 @@ def _worker(action, opts):
                     STATE['summary'] = {'提示': '请先完整查询一次，再单门刷新'}
                 if last is not None:
                     _set_result(last)
+                else:
+                    _set_result({'error': '还没有可刷新的结果，'
+                                 '请先点「一键查询」完整查询一次'})
                 return
             # 课程名与任务点进度从上次扫描的缓存里取（前端只传定位键）
             name, prog = '', ''
@@ -550,6 +553,10 @@ def _worker(action, opts):
                     STATE['summary'] = {'提示': '刷新失败：%s' % str(e)[:60]}
                 if last is not None:
                     _set_result(last)   # 重发原报告：收回「正在刷新…」、恢复 ↻ 可用
+                else:
+                    # 连旧报告都没有（如凭据被拒后 result 被清空）：也得发一版，
+                    # 否则 result_v 不涨、poll 不重画，界面停在「正在刷新…」永不收口
+                    _set_result({'error': '刷新失败：%s' % str(e)[:120]})
             return
 
         out = cs.scan(cfg, limit=limit, only=only,
@@ -3063,7 +3070,7 @@ function refreshCourse(ev, btn){
   if (!cid){ toast('这门课缺少定位信息，无法单独刷新', 'warn'); return; }
   if ($('brefresh').disabled){ toast('有任务正在跑，等状态变「已完成」再刷新这一门', 'warn'); return; }
   btn.classList.add('attn');
-  run('refresh_one', {auto: true, cid: cid,
+  run('refresh_one', {auto: true, user: true, cid: cid,
     clsid: btn.getAttribute('data-clsid') || '',
     name: btn.getAttribute('data-name') || '这一门'});
 }
@@ -3273,6 +3280,9 @@ async function run(action, opts){
   // 不动用户偏好（手机号记不记）、不弹提示、不清空日志区、不收起本次统计、
   // 不把结果面板换成占位（失败也留着用户正看的那份清单）。
   const auto = !!(opts && opts.auto);
+  // user：这次是不是「用户亲手点的」。#brefresh/↻ 这类是用户在动，失败
+  // 必须让用户看见（哪怕也走 auto 的静默偏好）；后台自动刷新则不是。
+  const user = !!(opts && opts.user);
   if (!auto && __DESKTOP__ && action === 'login'){
     // 扫码 / 短信登录：直接切到「预览」页签——登录窗口会嵌在这里。
     // 入坞那一刻后端就会把键盘焦点交给它，用户在登录页里打字才进得去
@@ -3323,7 +3333,7 @@ async function run(action, opts){
   // 实际什么也没跑，用户看到的就只是「点了没反应」。
   if (!resp.ok){
     if (resp.status === 409){
-      if (!auto) toast('上一个任务还在收尾（正在生成报告），等状态变成「已完成」再点一次', 'warn');
+      if (!auto || user) toast('上一个任务还在收尾（正在生成报告），等状态变成「已完成」再点一次', 'warn');
     } else if (!auto){
       toast('任务没能启动（HTTP ' + resp.status + '）', 'err');
     }
@@ -3336,7 +3346,7 @@ async function run(action, opts){
   // （指纹不同 → 重画）。
   // 非自动时连指纹一起清掉：卡片已隐藏，不清指纹的话同样的统计出来时不会重新展开。
   if (!auto){ setCardsShown(false); cardFp = ''; }
-  autoRun = auto;
+  autoRun = auto && !user;
   if (action === 'query') {
     const n = picked().length;
     // 自动刷新**不换掉结果面板**：那里面是用户刚拿到的那份清单，刷新失败时
@@ -3360,7 +3370,7 @@ async function run(action, opts){
     $('resTaskBody').innerHTML = '<div class="empty">正在读取课程列表…（约 10 秒，不抓作业）</div>';
     $('bartip').textContent = '读取课程列表…';
     switchTab('log');
-  } else if (action === 'refresh_one') {
+  } else if (user && action === 'refresh_one') {
     // 单门刷新：静默进行，只更新主页面工具条那句「正在刷新…」，
     // 不动结果面板、不切页签（用户可能正看着日志或预览）。
     setText($('resmeta'), '正在刷新「' + ((opts && opts.name) || '这一门') + '」…');
