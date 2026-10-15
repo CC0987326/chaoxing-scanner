@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-学习通（超星）未完成事项巡检工具  v6.15
+学习通（超星）未完成事项巡检工具  v6.16
 ================================================================
 把「登录 → 逐门课翻作业/考试/任务点/课堂活动 → 汇总成清单」这套流程固化成本地程序。
 
@@ -45,6 +45,12 @@ v6.15 要点（效率向）：①结果区改多级导航——「主页面（�
 静默分支）。③登录态常驻——只要本机会话还能用就一律复用，不再因填了别的账号
 而换罐重登；「换号」收敛成侧栏「退出登录（换号）」按钮（`logout()`，清会话 +
 归档 profile + 删 state.json，下次查询才真重登）。
+
+v6.16 要点（效率向）：①**单门刷新**——以前点「刷新」每次都整轮重查全部课程
+（12 门 ≈ 40~50 秒），现在每行课程名旁有一个 ↻ 按钮：点哪门就**只重抓那一门**
+（复用常驻登录态、不重读课程列表、不碰其它课），再把结果并回当前清单重建报告，
+约 3~4 秒。②「刷新清单」这个全局按钮改为**重新读取课程列表**（课程有增删时的
+兜底），全量重查不再占用它。
 """
 from __future__ import annotations
 
@@ -137,7 +143,7 @@ ACTIVITY_TYPES = {
 # 的「进行中 / 已结束」分桶完全一致（Vue: activeList1=进行中 activeList2=已结束）。
 
 # 版本号：界面侧栏、启动日志、使用说明都引它，别再各处手写一份
-VERSION = 'v6.15'
+VERSION = 'v6.16'
 
 # 平台自身算「已完成」的状态；除此之外都视为未完成
 DONE_STATES = ('已完成', '已互评', '待批阅', '已提交', '待互评', '已结束', '已过期')
@@ -2528,6 +2534,113 @@ def _course_wait(cfg_base, risky):
     return max(base, 0.6)
 
 
+def _fetch_course_row(ctx, page, c, cpi, cfg, fid, deep) -> dict:
+    """抓一门课的四类数据（作业 / 考试 / 课堂活动 / 任务点明细），返回 row。
+
+    scan 的逐门循环与「单门刷新」(refresh_course) 共用这一段——保证单门刷新
+    和整轮扫描对同一门课产出的字段完全一致（不会因为走了近路而少字段）。
+    """
+    row = {'name': c['name'], 'cid': c['cid'], 'clsid': c['clsid'],
+           'cpi': cpi, 'prog_text': c.get('prog', '')}
+    try:
+        hw = fetch_homework(ctx, page, c, cpi, cfg)
+    except Exception as e:
+        hw = {'no_module': False, 'items': [], 'count': '',
+              'error': str(e).splitlines()[0][:120]}
+    try:
+        ex = fetch_exam(page, c, cpi, cfg)
+    except Exception as e:
+        ex = {'no_module': False, 'items': [], 'count': '',
+              'empty': True, 'error': str(e).splitlines()[0][:120]}
+    row['hw'] = hw
+    row['exam'] = ex
+
+    # 「任务」页（课堂活动）：随堂练习 / 测验 / 签到这些以前查不到的就在这儿。
+    # 一次 JSON 接口，很轻，不做条件跳过——漏一门课的活动比多花几百毫秒严重得多。
+    try:
+        row['act'] = fetch_activities(page, c, cpi, cfg, fid=fid)
+    except Exception as e:
+        row['act'] = {'activities': [], 'ongoing': [], 'counts': {},
+                      'page_failed': True,
+                      'reason': str(e).splitlines()[0][:120]}
+
+    # 任务点章节下钻：只对存在缺口的课程做，避免拖慢扫描
+    pm_prog = re.search(r'(\d+)\s*/\s*(\d+)', c.get('prog') or '')
+    if deep and pm_prog and int(pm_prog.group(1)) < int(pm_prog.group(2)):
+        try:
+            row['prog_detail'] = fetch_progress_detail(page, c, cpi, cfg)
+        except Exception as e:
+            row['prog_detail'] = {
+                'no_module': False, 'pending': [], 'total': None,
+                'error': str(e).splitlines()[0][:120]}
+    return row
+
+
+def refresh_course(cfg, cid, clsid, name='', prog='', deep=True) -> dict:
+    """只重抓一门课，供界面「单门刷新」用。
+
+    与 scan 的区别：**不重读课程列表**（省掉 collect_courses 的滚动读取）、
+    不碰其它课程。登录态走常驻会话（check_login/restore_state），所以几乎不花
+    时间。返回 {'row': <per-course 结果 dict>}。比整轮 scan 快一个数量级。
+    """
+    t0 = time.time()
+    ctx = launch(cfg)
+    try:
+        page = ctx.new_page()
+        banner('重抓 1 门课')
+        if not check_login(page):
+            if restore_state(ctx) and check_login(page):
+                log('已用本地会话自动登录 ✓')
+            else:
+                log('本地没有可用登录态，请先登录。', 'err')
+                raise NotLoggedIn('未登录')
+        _quiet_win(page, cfg, None)
+        c = {'cid': cid, 'clsid': clsid,
+             'name': name or ('课程%s' % cid), 'prog': prog or ''}
+        cpi = cfg.get('cpi') or ''
+        fid = get_fid(ctx)
+        row = _fetch_course_row(ctx, page, c, cpi, cfg, fid, deep)
+    finally:
+        save_state(ctx)
+        close_ctx(ctx)
+    log('已重抓「%s」，用时 %.1f 秒' % (cut(name or cid, 24), time.time() - t0))
+    return {'row': row}
+
+
+def rebuild_with_row(internal, cid, clsid, new_row):
+    """把一门课的新 row 并回上次扫描的 (courses, results)，重建报告。
+
+    internal = scan() 返回的 _internal 字典（课程表 + 逐课结果 + 范围参数）。
+    按 (cid, clsid) 定位；找不到返回 None（调用方据此提示「请先完整查询一次」）。
+    就地更新 internal 里的 courses/results，供连续刷新多门时累积。
+    """
+    if not internal or new_row is None:
+        return None
+    courses = list(internal.get('courses') or [])
+    results = list(internal.get('results') or [])
+    key = (str(cid), str(clsid))
+    hit = None
+    for i, c in enumerate(courses):
+        if (str(c.get('cid')), str(c.get('clsid'))) == key:
+            hit = i
+            break
+    if hit is None or hit >= len(results):
+        return None
+    results[hit] = new_row
+    # 任务点进度随这次重抓更新：让「未完成任务点」的依据与最新状态一致
+    if new_row.get('prog_text'):
+        courses[hit]['prog'] = new_row['prog_text']
+    report = build_report(courses, results,
+                          stopped_at=internal.get('stopped_at'),
+                          scope_total=internal.get('scope_total'),
+                          scope_kind=internal.get('scope_kind') or 'selected',
+                          failed_courses=internal.get('failed_courses'),
+                          fid=internal.get('fid', '2339'))
+    internal['courses'] = courses
+    internal['results'] = results
+    return report
+
+
 def scan(cfg, limit=0, headless=None, open_report=None, deep=True, only=None) -> dict:
     """扫描并出报告。
 
@@ -2606,41 +2719,9 @@ def scan(cfg, limit=0, headless=None, open_report=None, deep=True, only=None) ->
                 log('已中止：完成 %d/%d 门课，将用已抓到的结果出报告。'
                     % (i - 1, len(courses)), 'warn')
                 break
-            row = {'name': c['name'], 'cid': c['cid'], 'clsid': c['clsid'],
-                   'cpi': cpi, 'prog_text': c.get('prog', '')}
-            try:
-                hw = fetch_homework(ctx, page, c, cpi, cfg)
-            except Exception as e:
-                hw = {'no_module': False, 'items': [], 'count': '',
-                      'error': str(e).splitlines()[0][:120]}
-            try:
-                ex = fetch_exam(page, c, cpi, cfg)
-            except Exception as e:
-                ex = {'no_module': False, 'items': [], 'count': '',
-                      'empty': True, 'error': str(e).splitlines()[0][:120]}
-            row['hw'] = hw
-            row['exam'] = ex
-
-            # 「任务」页（课堂活动）：随堂练习 / 测验 / 签到这些以前查不到的
-            # 就在这儿。一次 JSON 接口，很轻，不做条件跳过——漏一门课的活动
-            # 比多花几百毫秒严重得多。
-            try:
-                row['act'] = fetch_activities(page, c, cpi, cfg, fid=fid)
-            except Exception as e:
-                row['act'] = {'activities': [], 'ongoing': [], 'counts': {},
-                              'page_failed': True,
-                              'reason': str(e).splitlines()[0][:120]}
-
-            # 任务点章节下钻：只对存在缺口的课程做，避免拖慢全量扫描
-            pm_prog = re.search(r'(\d+)\s*/\s*(\d+)', c.get('prog') or '')
-            if deep and pm_prog and int(pm_prog.group(1)) < int(pm_prog.group(2)):
-                try:
-                    row['prog_detail'] = fetch_progress_detail(page, c, cpi, cfg)
-                except Exception as e:
-                    row['prog_detail'] = {
-                        'no_module': False, 'pending': [], 'total': None,
-                        'error': str(e).splitlines()[0][:120]}
-
+            # 单门抓取逻辑抽到 _fetch_course_row：与刷新单门共用，保证字段一致
+            row = _fetch_course_row(ctx, page, c, cpi, cfg, fid, deep)
+            hw, ex = row['hw'], row['exam']
             results.append(row)
 
             nh = sum(1 for it in hw['items'] if is_undone(it))
@@ -2760,6 +2841,15 @@ def scan(cfg, limit=0, headless=None, open_report=None, deep=True, only=None) ->
             os.startfile(str(paths['md']))  # type: ignore[attr-defined]
         except Exception:
             pass
+    # 供界面「单门刷新」(refresh_course/rebuild_with_row) 用：缓存本次的课程表、
+    # 逐课结果与范围参数，让重抓一门课后能把结果并回这份清单重建报告，而不整轮重查。
+    paths['_internal'] = {
+        'courses': courses, 'results': results,
+        'stopped_at': len(results) if stopped else None,
+        'scope_total': total_all if scope_kind else None,
+        'scope_kind': scope_kind or 'selected',
+        'failed_courses': failed_courses, 'fid': fid,
+    }
     return paths
 
 
@@ -6696,10 +6786,13 @@ def build_report(courses, results, stopped_at=None, scope_total=None,
         hw, ex = r['hw'], r['exam']
         for it in hw.get('items', []):
             if is_undone(it):
-                undone_hw.append({'course': nm, **it})
+                # cid/clsid：界面「单门刷新」按它们定位这门课，只刷新它
+                undone_hw.append({'course': nm, 'cid': r['cid'],
+                                  'clsid': r['clsid'], **it})
         for it in ex.get('items', []):
             if is_undone(it):
-                undone_exam.append({'course': nm, **it})
+                undone_exam.append({'course': nm, 'cid': r['cid'],
+                                    'clsid': r['clsid'], **it})
         # 「任务」页里进行中(status=1)的课堂活动：随堂练习 / 测验 / 签到…
         # 带上 cid/clsid/cpi：界面上这节的「刷课 / 刷题」按钮要靠它们定位
         # （拼答题链接、回课程页刷视频），没这几个参数就没法动手。

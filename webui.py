@@ -63,6 +63,9 @@ STATE = {
     'result_v': 0,          # 结果的版本号：变了界面才重画，见 _set_result()
     'ares': None,           # 交卷结果面板（逐份状态，未确认行可「重新核实」）
     'ares_v': 0,
+    # scan() 本次的课程表 + 逐课结果 + 范围参数：界面「单门刷新」靠它把重抓的
+    # 一门课并回当前清单、重建报告（见 cs.rebuild_with_row）。
+    'scan_internal': None,
 }
 
 
@@ -148,6 +151,7 @@ TASK_NAME = {
     'combo': '刷课 + 刷题（先刷视频再做作业交卷）',
     'verify': '重新核实未确认的作业',
     'answer_one': '刷题（单份作业）',
+    'refresh_one': '刷新单门课程状态',
     'brush_urls': '上传链接刷课',
     'answer_urls': '上传链接刷题',
     'combo_urls': '上传链接刷课+刷题',
@@ -494,10 +498,65 @@ def _worker(action, opts):
                 cs.log('不勾选 = 照旧查全部。')
             return
 
+        if action == 'refresh_one':
+            # 单门刷新：只重抓这一门课，复用常驻登录态，**不重读课程列表**、
+            # 也不碰其它课。比整轮 scan 快一个数量级（3~4 秒 vs 12 门 ~47 秒）。
+            # 失败时**不动结果面板**（留着用户原来那份清单），只更新统计卡片 + 日志；
+            # 但总要 _set_result 一次，好让界面的「正在刷新…」收掉、↻ 按钮恢复可用。
+            cid = str(opts.get('cid') or '').strip()
+            clsid = str(opts.get('clsid') or '').strip()
+            with LOCK:
+                internal = STATE.get('scan_internal')
+                last = STATE.get('result')
+            if not cid or not internal:
+                cs.log('单门刷新失败：还没有可用的完整查询结果，'
+                       '请先点「一键查询」跑一遍。', 'err')
+                with LOCK:
+                    STATE['summary'] = {'提示': '请先完整查询一次，再单门刷新'}
+                if last is not None:
+                    _set_result(last)
+                return
+            # 课程名与任务点进度从上次扫描的缓存里取（前端只传定位键）
+            name, prog = '', ''
+            for c in (internal.get('courses') or []):
+                if str(c.get('cid')) == cid and str(c.get('clsid')) == clsid:
+                    name, prog = c.get('name', ''), c.get('prog', '')
+                    break
+            try:
+                out = cs.refresh_course(cfg, cid, clsid, name=name, prog=prog,
+                                        deep=deep)
+                rep = cs.rebuild_with_row(internal, cid, clsid, out.get('row'))
+                if rep is None:
+                    raise RuntimeError('这门课不在上次的查询范围内（课程可能有变动）')
+                with LOCK:
+                    STATE['scan_internal'] = internal
+                paths = cs.write_outputs(rep)
+                with LOCK:
+                    STATE['report'] = str(paths.get('md') or '')
+                    STATE['summary'] = {
+                        '课程': rep.get('course_total', 0),
+                        '未完成作业': len(rep.get('undone_hw', [])),
+                        '未完成考试': len(rep.get('undone_exam', [])),
+                        '未完成任务点': len(rep.get('undone_prog', [])),
+                    }
+                    nf = len(rep.get('page_failed') or [])
+                    if nf:
+                        STATE['summary']['页面未加载'] = nf
+                _set_result(rep)
+                cs.log('已刷新「%s」的状态。' % (name or cid))
+            except Exception as e:
+                cs.log('单门刷新失败：%s' % e, 'err')
+                with LOCK:
+                    STATE['summary'] = {'提示': '刷新失败：%s' % str(e)[:60]}
+                if last is not None:
+                    _set_result(last)   # 重发原报告：收回「正在刷新…」、恢复 ↻ 可用
+            return
+
         out = cs.scan(cfg, limit=limit, only=only,
                       headless=None, open_report=False, deep=deep)
         rep = out.get('report') or {}
         with LOCK:
+            STATE['scan_internal'] = out.get('_internal')
             STATE['report'] = str(out.get('md') or '')
             STATE['summary'] = {
                 '课程': rep.get('course_total', 0),
@@ -1902,6 +1961,14 @@ PAGE = r"""<!DOCTYPE html>
   #res tbody tr:last-child td{border-bottom-color:transparent;}
   #res .num{font-variant-numeric:tabular-nums;white-space:nowrap;}
   #res .col-act{width:1%;white-space:nowrap;}
+  /* 单门刷新 ↻：紧贴课程名的小图标按钮，只重抓这一门 */
+  #res .rfc{display:inline-flex;align-items:center;padding:2px 4px;margin-left:5px;
+    vertical-align:middle;background:var(--raise);color:var(--mut);
+    border:1px solid var(--line);border-radius:4px;cursor:pointer;line-height:0;
+    transition:color var(--t) var(--ease),border-color var(--t) var(--ease);}
+  #res .rfc .ic{width:11px;height:11px;}
+  #res .rfc:hover:not(:disabled){color:var(--ac);border-color:var(--ac);}
+  #res .rfc:disabled{opacity:.35;cursor:not-allowed;}
   /* 暂存答案列：逐题「题号 + 答案」，窄列可换行，核对时一目十行 */
   #res .anscell{max-width:320px;font-size:var(--fs-xs);color:var(--mut);}
   #res .ansrow{display:flex;gap:6px;line-height:1.5;}
@@ -2396,8 +2463,8 @@ PAGE = r"""<!DOCTYPE html>
           <button class="mini" id="bdoing" style="display:none">
             <span class="ic" data-i="monitor"></span>正在进行</button>
           <button class="mini" id="brefresh" disabled
-            title="按左侧当前勾选重新查询一遍（不重新登录）">
-            <span class="ic" data-i="refresh"></span>刷新清单</button>
+            title="重新读取课程列表（课程有增删时用；只想刷新某一门的状态，点那行课程名旁的 ↻）">
+            <span class="ic" data-i="refresh"></span>刷新课程列表</button>
         </div>
         <div id="reshomebody"><div class="empty">还没有结果。填好账号密码后点左侧「一键查询未完成事项」。</div></div>
       </div>
@@ -2724,6 +2791,19 @@ function rateOpts(){
     + '>' + v + 'x</option>').join('');
 }
 
+// 单门刷新：每行课程名旁的 ↻。只重抓这门课（复用登录态、不重读课程列表），
+// 秒级返回。有 cid 才渲染——老报告 / 无定位信息的行不给假按钮。
+function rfBtn(it){
+  if (!it || !it.cid) return '';
+  return ' <button class="rfc" onclick="refreshCourse(event, this)"'
+    + ' title="只刷新「' + esc(it.course || '') + '」这一门的状态'
+    + '（不重查其它课程，约 3~4 秒）"'
+    + ' data-cid="' + esc(it.cid) + '"'
+    + ' data-clsid="' + esc(it.clsid || '') + '"'
+    + ' data-name="' + esc(it.course || '') + '">'
+    + '<span class="ic">' + icon('refresh') + '</span></button>';
+}
+
 // 未完成作业清单。「刷题」按钮按索引取用——结果区每 900ms 整个重绘一次，
 // 索引比把对象塞进 onclick 更抗重绘（重绘时 lastHw 同步刷新为同一份数据）。
 let lastHw = [];
@@ -2830,7 +2910,7 @@ function renderResult(r){
        + '<th>剩余时间</th><th class="col-act"></th></tr></thead><tbody>';
     for (let i = 0; i < ac.length; i++){
       const it = ac[i], uu = safeUrl(it.url);
-      h += '<tr><td>' + esc(it.course) + '</td>'
+      h += '<tr><td>' + esc(it.course) + rfBtn(it) + '</td>'
          + '<td><span class="st warn">' + esc(it.kind || '活动') + '</span></td>'
          + '<td>' + esc(it.name || '（无标题）') + '</td>'
          + '<td class="num sub">' + esc(it.time || '—') + '</td>'
@@ -2857,7 +2937,7 @@ function renderResult(r){
        + '<th>剩余</th><th class="col-act"></th></tr></thead><tbody>';
     for (let i = 0; i < hw.length; i++){
       const it = hw[i], u = safeUrl(it.url);
-      h += '<tr><td>' + esc(it.course) + '</td><td>' + esc(it.title)
+      h += '<tr><td>' + esc(it.course) + rfBtn(it) + '</td><td>' + esc(it.title)
          + '</td><td><span class="st err">' + esc(it.state) + '</span></td>'
          + '<td class="num sub">' + esc(it.left || '—') + '</td>'
          + '<td class="col-act">'
@@ -2879,7 +2959,7 @@ function renderResult(r){
     h += '<table><thead><tr><th>课程</th><th>考试名称</th><th>状态</th>'
        + '</tr></thead><tbody>';
     for (const it of ex){
-      h += '<tr><td>' + esc(it.course) + '</td><td>' + esc(it.title)
+      h += '<tr><td>' + esc(it.course) + rfBtn(it) + '</td><td>' + esc(it.title)
          + '</td><td><span class="st err">' + esc(it.state) + '</span></td></tr>';
     }
     h += '</tbody></table>';
@@ -2922,7 +3002,7 @@ function renderResult(r){
       h += '<details class="cbox"' + (openIdx.has(idx) ? ' open' : '')
          + ' data-idx="' + idx + '"><summary>'
          + '<span class="chev">' + icon('chev') + '</span>'
-         + '<span class="hd"><b>' + esc(it.course) + '</b>'
+         + '<span class="hd"><b>' + esc(it.course) + '</b>' + rfBtn(it)
          + '<span class="meter"><span style="width:' + rate + '%"></span></span>'
          + '<span class="sub">已完成 ' + it.done + '/' + it.total
          + '（' + rate.toFixed(1) + '%）</span></span>'
@@ -2973,6 +3053,19 @@ function renderResult(r){
   showRes('home');
   clearHomeStale();
   setText($('resmeta'), r.time ? ('生成时间 ' + r.time) : '查询结果');
+}
+
+// 单门刷新：走 run 的静默分支（auto），不清日志、不换占位、不动用户偏好。
+// 只发一条 refresh_one，后端只重抓这一门并把它并回当前清单。
+function refreshCourse(ev, btn){
+  if (ev){ ev.stopPropagation(); ev.preventDefault(); }
+  const cid = btn.getAttribute('data-cid') || '';
+  if (!cid){ toast('这门课缺少定位信息，无法单独刷新', 'warn'); return; }
+  if ($('brefresh').disabled){ toast('有任务正在跑，等状态变「已完成」再刷新这一门', 'warn'); return; }
+  btn.classList.add('attn');
+  run('refresh_one', {auto: true, cid: cid,
+    clsid: btn.getAttribute('data-clsid') || '',
+    name: btn.getAttribute('data-name') || '这一门'});
 }
 
 async function poll(){
@@ -3039,10 +3132,13 @@ async function poll(){
     // 所以登录期间也把暂停键置灰——留一个点了没用的按钮只会误导。
     $('bpause').disabled = !j.running || listing || j.phase === 'login';
     $('bstop').disabled  = !j.running || listing;
-    // 多级导航按钮：任务在跑时「刷新清单」置灰（别和正在跑的任务抢浏览器）、
+    // 多级导航按钮：任务在跑时「刷新课程列表」置灰（别和正在跑的任务抢浏览器）、
     // 「正在进行」亮起来（有任务页可看）；闲时反过来。查询本体（bquery）的
     // 禁用逻辑不在这里，它一直可用。
     $('brefresh').disabled = j.running;
+    // 单门刷新的 ↻ 同样随运行置灰（同一时刻只跑一个任务）。任务结束后
+    // 这一轮轮询会把它们恢复可用（成功时则由 renderResult 重建）。
+    document.querySelectorAll('#res .rfc').forEach(b => b.disabled = j.running);
     // 「正在进行」：任务在跑、或任务页还留着刚才那份东西（进度/交卷面板）时亮。    // 同时把标题文字据实翻转——跑完还叫「正在进行」会误导（用户报过的「任务结束了
     // 还显示在刷题」）。只在翻转时写 DOM，省掉每轮一次重排。
     const taskLive = j.running || taskHas || !!j.ares;
@@ -3135,7 +3231,7 @@ async function poll(){
       // 查询，让清单反映刚做完的进度（做掉的作业会从清单里消失）。这同时兜掉了
       // 「任务早结束了、结果区还挂着『正在后台刷这一份…』」那个割裂。
       // v6.15：任务跑完**不再自动全量重查**（那趟要 1~2 分钟，用户嫌慢）。
-      // 改为在「主页面」挂一个「清单可能已变 · 点刷新清单」的提示，用户想更新
+      // 改为在「主页面」挂一个「清单可能已变 · 点课程名旁 ↻」的提示，用户想更新
       // 自己点（#brefresh → run('query',{auto:true})）。任务页仍停在原处，
       // 用户可以从容看刚才的结果，再自己决定回主页面刷新。
       if (autoBack){
@@ -3151,7 +3247,7 @@ async function poll(){
       // 任务页里那句「正在后台刷…」的启动占位，任务一结束就没人再来覆盖它了
       // （v6.15 起不再自动重查把面板换成新清单）。留着它就等于屏幕永远停在
       // 「任务结束了还显示在刷题」——用户报过的那个。这里直接把它换成一句
-      // 收尾说明，保留用户再点一次「刷新清单」的动作提示。
+      // 收尾说明，保留用户再点单门 ↻ 刷新的动作提示。
       // 交卷面板（renderAnswerResult 会给 #resTaskBody 写带表格的内容）要留住，
       // 所以只替换仍带 .taskph 标记的占位，不动真结果。
       if (brushLike && !j.ares){
@@ -3159,7 +3255,7 @@ async function poll(){
         const ph = body.querySelector('.taskph');
         if (ph && body.children.length === 1) body.innerHTML =
           '<div class="empty">本次任务已结束 · 结果见「运行日志」；'
-          + '要看最新的未完成清单，点上面「返回主页面」后再点「刷新清单」。</div>';
+          + '要看最新的未完成清单，点上面「返回主页面」后，点对应课程名旁的 ↻ 刷新那一门。</div>';
       }
       brushLike = false;
     }
@@ -3203,6 +3299,11 @@ async function run(action, opts){
     limit: nTop,             // 只查最近 N 门；勾选非空时后端以勾选为准
     deep: $('deep').checked
   };
+  // 单门刷新：带上这门课的定位键（后端据此只重抓这一门）
+  if (action === 'refresh_one'){
+    body.cid = (opts && opts.cid) || '';
+    body.clsid = (opts && opts.clsid) || '';
+  }
   // 勾着「记住密码」发起查询：顺手把当前输入的密码存上 ——
   // 这样记住的永远是最近一次真正拿去登录的那把，而不是当初勾选时的。
   if ($('rememberpwd').checked && body.password) {
@@ -3259,6 +3360,11 @@ async function run(action, opts){
     $('resTaskBody').innerHTML = '<div class="empty">正在读取课程列表…（约 10 秒，不抓作业）</div>';
     $('bartip').textContent = '读取课程列表…';
     switchTab('log');
+  } else if (action === 'refresh_one') {
+    // 单门刷新：静默进行，只更新主页面工具条那句「正在刷新…」，
+    // 不动结果面板、不切页签（用户可能正看着日志或预览）。
+    setText($('resmeta'), '正在刷新「' + ((opts && opts.name) || '这一门') + '」…');
+    showRes('home');
   } else if (!(__DESKTOP__ && action === 'login')) {
     // 兜底的「切到日志页」。**扫码/短信登录例外**：上方已经为它切到「预览」
     // 看登录页，这里若再切回日志，刚嵌进预览的登录窗口会被 _dock_layout
@@ -3295,15 +3401,15 @@ function showRes(which){
   if (!home) taskHas = true;
 }
 // 主页面「清单可能过期」的标记：任务跑完不再自动全量重查（慢），改为在主页面上
-// 挂个提示，用户点「刷新清单」才重查。stale=null 时按普通生成时间显示。
+// 挂个提示，用户点课程名旁的 ↻ 单门刷新。stale=null 时按普通生成时间显示。
 let homeStale = null;
 function markHomeStale(n){
   homeStale = (n == null) ? true : n;
   const bar = $('resmeta').closest('.resbar');
   if (bar) bar.classList.add('stale');
   $('resmeta').textContent = (typeof homeStale === 'number')
-    ? ('本次刚完成 ' + homeStale + ' 项 · 清单可能已变，点「刷新清单」更新')
-    : '清单可能已变 · 点「刷新清单」更新';
+    ? ('本次刚完成 ' + homeStale + ' 项 · 清单可能已变，点课程名旁 ↻ 刷新那一门')
+    : '清单可能已变 · 点课程名旁 ↻ 刷新那一门';
 }
 function clearHomeStale(){
   homeStale = null;
@@ -4150,17 +4256,14 @@ $('cpin').onclick = pinPicked;
 $('recentTop').oninput = updateCount;
 $('recentTop').onkeydown = e => { if (e.key === 'Enter') $('bquery').click(); };
 $('bclear').onclick = () => { logEl.innerHTML = ''; };
-// 结果页多级导航（v6.15）：任务页「返回主页面」、主页面「正在进行」、主页面「刷新清单」。
+// 结果页多级导航（v6.15）：任务页「返回主页面」、主页面「正在进行」、主页面「刷新课程列表」。
 $('bback').onclick = () => showRes('home');
 $('bdoing').onclick = () => showRes('task');
-// 「刷新清单」：按左侧当前勾选重新查询（不重新登录——登录态常驻）。复用 run 的
-// auto 分支：它不清日志、不换占位、失败只提示，正是「刷新」要的收窄语义。
+// 「刷新课程列表」：重新读取个人空间的课程列表（课程有增删时的兜底）。
+// 只刷新某一门课程的状态请点那行课程名旁的 ↻（单门刷新，秒级）。
 $('brefresh').onclick = () => {
-  if (!picked().length && !(parseInt($('recentTop').value) > 0)) {
-    // 一门没勾、也没设「最近 N 门」→ 提示一下（全量查询可不便宜）
-    toast('没勾课程：将查询全部课程', 'ok');
-  }
-  run('query', {auto: true});
+  toast('重新读取课程列表…（约 10 秒，不抓作业）', 'ok');
+  run('list');
 };
 // 熄屏：常驻在任务工具条上，任务跑着随时能点（Chrome 的 Video Wake Lock 挡不住
 // 显式 SC_MONITORPOWER），动下鼠标屏幕就亮，再点一下即可。
