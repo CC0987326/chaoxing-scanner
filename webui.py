@@ -1827,6 +1827,17 @@ PAGE = r"""<!DOCTYPE html>
   #docklive{color:var(--warn);font-size:inherit;}
 
   .pane{flex:1;overflow:auto;min-height:0;}
+  /* 结果页多级导航（v6.15）：#res 里分「主页面 / 任务页」两个子视图，各自一条
+     小工具条 + 可滚动正文。主页面看总览、任务页看进度，来回切不再互相顶掉。 */
+  #res{display:flex;flex-direction:column;}
+  #resHome,#resTask{flex:1;display:flex;flex-direction:column;min-height:0;}
+  #reshomebody,#resTaskBody{flex:1;overflow:auto;min-height:0;}
+  .resbar{flex:none;display:flex;align-items:center;gap:9px;
+    padding:8px 18px;border-bottom:1px solid var(--line);background:var(--bg);}
+  .resbar .ttl{font-size:var(--fs-base);color:var(--mut);}
+  .resbar .sp{flex:1;}
+  .resbar.stale{border-bottom-color:var(--ac);}
+  .resbar.stale .ttl{color:var(--ac);}
   #log{
     margin:0;padding:14px 20px 44px;
     font-family:"Cascadia Mono",Consolas,ui-monospace,monospace;
@@ -2326,6 +2337,8 @@ PAGE = r"""<!DOCTYPE html>
         <span class="ic" data-i="file"></span>打开最新报告</button>
       <button class="btn" id="bdir"><span class="ic" data-i="folder"></span>
         打开输出文件夹</button>
+      <button class="btn" id="blogout" title="清除本机登录会话，下次查询需重新登录（换号用）">
+        <span class="ic" data-i="logout"></span>退出登录（换号）</button>
       <button class="btn dgr" id="bquit"><span class="ic" data-i="power"></span>
         退出程序（释放端口）</button>
     </section>
@@ -2375,7 +2388,28 @@ PAGE = r"""<!DOCTYPE html>
       <button class="mini" id="boff"><span class="ic" data-i="monitor"></span>熄屏</button>
       <button class="mini" id="bclear"><span class="ic" data-i="trash"></span>清空日志</button>
     </div>
-    <div class="pane" id="res"><div class="empty">还没有结果。填好账号密码后点左侧「一键查询未完成事项」。</div></div>
+    <div class="pane" id="res">
+      <div id="resHome">
+        <div class="resbar">
+          <span class="ttl" id="resmeta">尚未查询</span>
+          <span class="sp"></span>
+          <button class="mini" id="bdoing" style="display:none">
+            <span class="ic" data-i="monitor"></span>正在进行</button>
+          <button class="mini" id="brefresh" disabled
+            title="按左侧当前勾选重新查询一遍（不重新登录）">
+            <span class="ic" data-i="refresh"></span>刷新清单</button>
+        </div>
+        <div id="reshomebody"><div class="empty">还没有结果。填好账号密码后点左侧「一键查询未完成事项」。</div></div>
+      </div>
+      <div id="resTask" style="display:none">
+        <div class="resbar">
+          <button class="mini" id="bback"><span class="ic" data-i="back"></span>返回主页面</button>
+          <span class="ttl" id="taskhead"></span>
+          <span class="sp"></span>
+        </div>
+        <div id="resTaskBody"></div>
+      </div>
+    </div>
     <div class="pane" id="logpane" style="display:none"><pre id="log"></pre></div>
     <div class="pane" id="dockpane" style="display:none">
       <div class="empty" id="dockempty">无内容</div>
@@ -2418,6 +2452,11 @@ let autoRun = false;
 // 单独一个变量是因为存在「结束但不重查」的路（勾了自动关机），
 // 那条路同样不能把「刷视频中…」留在屏幕上。
 let brushLike = false;
+// 任务页里有没有「东西可看」（进行中的进度 / 刚跑完的交卷面板）。
+// v6.15 起任务跑完不再自动弹回主页面，用户可能先点「返回主页面」看总览，
+// 之后还想再回去看刚才那份结果——所以「正在进行」按钮不能只在 running 时出现，
+// 得在任务页有内容时一直亮着（新一次查询开始时才清掉，那份任务已成历史）。
+let taskHas = false;
 const $ = id => document.getElementById(id);
 const logEl = $('log');
 
@@ -2449,6 +2488,10 @@ const ICON_PATHS = {
     +'<path d="M5.7 13.9h4.6"/><path d="M3.1 8.3 12.9 4.8"/>',
   plug:'<path d="M6.1 1.9v2.9M9.9 1.9v2.9"/>'
     +'<path d="M4.2 4.8h7.6v2.4a3.8 3.8 0 0 1-7.6 0z"/><path d="M8 11v3"/>',
+  refresh:'<path d="M13.2 8a5.2 5.2 0 1 1-1.5-3.7"/><path d="M13.6 2.6v3.2h-3.2"/>',
+  back:'<path d="M13 8H3.2"/><path d="M6.9 4.3 3.2 8l3.7 3.7"/>',
+  logout:'<path d="M6.2 2.9H3.5a1 1 0 0 0-1 1v8.2a1 1 0 0 0 1 1h2.7"/>'
+    +'<path d="M10.4 11.1 13.5 8l-3.1-3.1"/><path d="M13.5 8H6.4"/>',
   eye:'<path d="M1.7 8S4.2 3.9 8 3.9 14.3 8 14.3 8 11.8 12.1 8 12.1 1.7 8 1.7 8z"/>'
     +'<circle cx="8" cy="8" r="1.9"/>',
   eyeoff:'<path d="M6.4 4.3A6.7 6.7 0 0 1 8 4.1c3.8 0 6.3 3.9 6.3 3.9a12 12 0 0 1-2.1 2.5"/>'
@@ -2708,7 +2751,7 @@ function renderResult(r){
   // 任务以异常收尾时结果里只有 error：把「查询中…」的占位换掉，
   // 别让用户停在无限转圈的假象里（失败详情在「运行日志」页签）
   if (r.error){
-    $('res').innerHTML = '<div class="errbox"><b>任务失败</b>'
+    $('reshomebody').innerHTML = '<div class="errbox"><b>任务失败</b>'
       + '<span>' + esc(r.error) + '<br>详情见「运行日志」页签；'
       + '可修正后重试（未登录时先登录）。</span></div>';
     return;
@@ -2922,7 +2965,14 @@ function renderResult(r){
 
   h += '<div class="sub">完整清单（含全部 ' + (r.course_total||0)
      + ' 门课程总览）已保存为 Markdown，可点左侧「打开最新报告」查看。</div>';
-  $('res').innerHTML = h;
+  $('reshomebody').innerHTML = h;
+  // 总览一次落地就把它标成「主页面内容」，并清掉「清单可能已变」的提示（这次
+  // 就是最新的一份）。**切到主页面子视图**：新到手的清单就该看得见（v6.15 前
+  // 只有一个结果容器，新结果天然可见；分成两层后若用户正停在任务页，新总览会
+  // 被 display:none 藏住）。页签不动——免得打断用户正在看的日志/预览。
+  showRes('home');
+  clearHomeStale();
+  setText($('resmeta'), r.time ? ('生成时间 ' + r.time) : '查询结果');
 }
 
 async function poll(){
@@ -2959,6 +3009,10 @@ async function poll(){
       ? (paused ? '已暂停 · 点「继续」恢复'
                 : (finishing ? '收尾中 · 正在生成报告' : ('运行中 · ' + (j.task||''))))
       : (j.done ? '已完成' : '空闲'));
+    // 任务页顶栏的标题：跑着显示任务名并带「进行中」，跑完只留任务名（别再挂着
+    // 「进行中」误导；文案要让用户知道这是「上次任务」的页面）。
+    if (j.running && j.task) setText($('taskhead'), j.task + ' · 进行中');
+    else if (taskHas && j.task) setText($('taskhead'), j.task + ' · 已完成');
     // 本机会话是谁的。没有会话（或读不到身份）就不显示，绝不编一个出来。
     // setText 内部做了「值没变就不写 DOM」，每轮轮询不会造成无谓重排。
     setText($('whotxt'), j.login_who ? ('本机会话：' + j.login_who) : '');
@@ -2985,6 +3039,21 @@ async function poll(){
     // 所以登录期间也把暂停键置灰——留一个点了没用的按钮只会误导。
     $('bpause').disabled = !j.running || listing || j.phase === 'login';
     $('bstop').disabled  = !j.running || listing;
+    // 多级导航按钮：任务在跑时「刷新清单」置灰（别和正在跑的任务抢浏览器）、
+    // 「正在进行」亮起来（有任务页可看）；闲时反过来。查询本体（bquery）的
+    // 禁用逻辑不在这里，它一直可用。
+    $('brefresh').disabled = j.running;
+    // 「正在进行」：任务在跑、或任务页还留着刚才那份东西（进度/交卷面板）时亮。    // 同时把标题文字据实翻转——跑完还叫「正在进行」会误导（用户报过的「任务结束了
+    // 还显示在刷题」）。只在翻转时写 DOM，省掉每轮一次重排。
+    const taskLive = j.running || taskHas || !!j.ares;
+    const dLabel = j.running ? '正在进行' : '上次任务';
+    if ($('bdoing').style.display !== (taskLive ? '' : 'none'))
+      $('bdoing').style.display = taskLive ? '' : 'none';
+    if ($('bdoing').dataset.lb !== dLabel){
+      $('bdoing').dataset.lb = dLabel;
+      $('bdoing').innerHTML = '<span class="ic">' + icon('monitor') + '</span>'
+        + dLabel;
+    }
     const wasPaused = $('bpause').dataset.paused === '1';
     $('bpause').dataset.paused = paused ? '1' : '0';
     // 按钮文字只在暂停状态真的翻转时才改，省掉每轮一次 innerHTML 重写
@@ -3029,6 +3098,7 @@ async function poll(){
       av = j.ares_v;
       renderAnswerResult(j.ares);
       setText($('bartip'), '交卷结果已生成');
+      showRes('task');
       switchTab('res');
       // 交卷面板就是用户要看的「刚才那批结果」：它一出现就别再自动重跑查询了——
       // 重跑会把面板整个冲掉，连面板里「重新核实未确认的」那个按钮一起没了。
@@ -3044,7 +3114,7 @@ async function poll(){
         // 平台明确回绝这组账号密码。只在这一种情况下报「账号或密码错误」——
         // 验证码没点对、超时等失败不报，免得把人引到「去改密码」的错路上。
         toast('账号或密码错误', 'err');
-        $('res').innerHTML = '<div class="errbox"><b>账号或密码错误</b>'
+        $('resTaskBody').innerHTML = '<div class="errbox"><b>账号或密码错误</b>'
           + '<span>请核对账号（手机号 / 超星号）与密码后重新查询；'
           + '密码连续输错可能触发账号保护，也可以改用左侧「扫码 / 短信登录」。</span>'
           + '</div>';
@@ -3064,14 +3134,32 @@ async function poll(){
       // 刷题 / 刷课 / 答题跑完：把界面收回「查询结果」，并用左侧当前勾选重跑一次
       // 查询，让清单反映刚做完的进度（做掉的作业会从清单里消失）。这同时兜掉了
       // 「任务早结束了、结果区还挂着『正在后台刷这一份…』」那个割裂。
+      // v6.15：任务跑完**不再自动全量重查**（那趟要 1~2 分钟，用户嫌慢）。
+      // 改为在「主页面」挂一个「清单可能已变 · 点刷新清单」的提示，用户想更新
+      // 自己点（#brefresh → run('query',{auto:true})）。任务页仍停在原处，
+      // 用户可以从容看刚才的结果，再自己决定回主页面刷新。
       if (autoBack){
         autoBack = false;
-        run('query', {auto: true});   // 它会自己把 autoRun 置位
+        markHomeStale();
       } else {
         autoRun = false;
-        // 「要自动关机，所以不重跑」这条路也得收口状态行，否则屏幕上永远留着
-        // 「刷视频中…」——那正是用户报过的「任务结束了还显示在刷题」。
-        if (brushLike) setText($('bartip'), '任务已结束');
+      }
+      // 不管走不走「自动重查」，任务页的状态行都得收口——v6.15 起不再靠那趟
+      // 重查（它会把状态行收成「查询完成」）顺带收口，所以必须自己收，否则屏幕
+      // 上永远留着「刷题中…」：正是用户报过的「任务结束了还显示在刷题」。
+      if (brushLike) setText($('bartip'), '任务已结束');
+      // 任务页里那句「正在后台刷…」的启动占位，任务一结束就没人再来覆盖它了
+      // （v6.15 起不再自动重查把面板换成新清单）。留着它就等于屏幕永远停在
+      // 「任务结束了还显示在刷题」——用户报过的那个。这里直接把它换成一句
+      // 收尾说明，保留用户再点一次「刷新清单」的动作提示。
+      // 交卷面板（renderAnswerResult 会给 #resTaskBody 写带表格的内容）要留住，
+      // 所以只替换仍带 .taskph 标记的占位，不动真结果。
+      if (brushLike && !j.ares){
+        const body = $('resTaskBody');
+        const ph = body.querySelector('.taskph');
+        if (ph && body.children.length === 1) body.innerHTML =
+          '<div class="empty">本次任务已结束 · 结果见「运行日志」；'
+          + '要看最新的未完成清单，点上面「返回主页面」后再点「刷新清单」。</div>';
       }
       brushLike = false;
     }
@@ -3153,15 +3241,22 @@ async function run(action, opts){
     // 自动刷新**不换掉结果面板**：那里面是用户刚拿到的那份清单，刷新失败时
     // 更要留着（错误由 toast + 状态行交代）。新版结果一到就整块替换。
     if (!auto){
-      $('res').innerHTML = '<div class="empty">'
+      $('reshomebody').innerHTML = '<div class="empty">'
         + (n ? ('正在查询你勾选的 ' + n + ' 门课程…')
              : (nTop ? ('正在查询最近学习的 ' + nTop + ' 门课程…')
                      : '查询进行中，请稍候…（全量通常 1~2 分钟）')) + '</div>';
     }
     $('bartip').textContent = auto ? '正在刷新…' : '查询中…';
+    // 查询/刷新都是「主页面」的事：切回主页面视图 + 结果页签，让用户看着总览更新。
+    // 一次新查询落地就等于「上一份任务结果成了历史」：把「正在进行」按钮收掉
+    // （taskHas=false）、顺手清掉任务页里上次的占位 / 错误卡，免得用户点进去
+    // 看到的是过期内容（也让结果区不会同时挂着新旧两张卡）。自动刷新不动它
+    // （那可能是用户正看着的任务页）。
+    if (!auto){ taskHas = false; $('resTaskBody').innerHTML = ''; }
+    showRes('home');
     switchTab('res');
   } else if (action === 'list') {
-    $('res').innerHTML = '<div class="empty">正在读取课程列表…（约 10 秒，不抓作业）</div>';
+    $('resTaskBody').innerHTML = '<div class="empty">正在读取课程列表…（约 10 秒，不抓作业）</div>';
     $('bartip').textContent = '读取课程列表…';
     switchTab('log');
   } else if (!(__DESKTOP__ && action === 'login')) {
@@ -3187,6 +3282,33 @@ function switchTab(t){
   // 否则在预览里的登录页打字会落到工具侧栏的账号框（真机 2026-10-14）。
   // 焦点接管是「尽力而为」，面板还没矩形/还没入坞时后端会安静返回 false。
   if (t === 'dock' && !wasDock) focusDockSoon();
+}
+// 结果页多级导航（v6.15）：切「主页面（总览）」与「任务页（进度/交卷面板）」。
+// 只动 #res 内部两个子视图的显隐，不碰 switchTab 的三页签语义——多级导航只在
+// 用户已经在「查询结果」页签里时才谈得上，别的页签由 switchTab 管。
+function showRes(which){
+  const home = which !== 'task';
+  $('resHome').style.display = home ? '' : 'none';
+  $('resTask').style.display = home ? 'none' : '';
+  // 每次切到任务页都记一笔「这里现在有东西可看」，「正在进行」按钮据此常亮
+  // （见 poll 里的 taskLive）。新一次查询开始时由 run() 把它清掉。
+  if (!home) taskHas = true;
+}
+// 主页面「清单可能过期」的标记：任务跑完不再自动全量重查（慢），改为在主页面上
+// 挂个提示，用户点「刷新清单」才重查。stale=null 时按普通生成时间显示。
+let homeStale = null;
+function markHomeStale(n){
+  homeStale = (n == null) ? true : n;
+  const bar = $('resmeta').closest('.resbar');
+  if (bar) bar.classList.add('stale');
+  $('resmeta').textContent = (typeof homeStale === 'number')
+    ? ('本次刚完成 ' + homeStale + ' 项 · 清单可能已变，点「刷新清单」更新')
+    : '清单可能已变 · 点「刷新清单」更新';
+}
+function clearHomeStale(){
+  homeStale = null;
+  const bar = $('resmeta').closest('.resbar');
+  if (bar) bar.classList.remove('stale');
 }
 // 请后端把键盘焦点交给预览里的浏览器窗口。跨进程 WS_CHILD 不 AttachThreadInput
 // 就设不了焦点，所以这件事只能在原生层做（后端 /api/focus-dock）。
@@ -3244,10 +3366,11 @@ function answerThis(ev, i, draft){
     since = 0; logEl.innerHTML = '';
     setCardsShown(false); cardFp = '';
     autoBack = true; brushLike = true;
-    $('res').innerHTML = '<div class="empty">正在后台'
+    $('resTaskBody').innerHTML = '<div class="empty taskph">正在后台'
       + (draft ? '刷题并暂存：' : '刷这一份：') + esc(it.title)
       + '…（进度看「运行日志」，可以随时暂停 / 停止）</div>';
     $('bartip').textContent = '刷题中…';
+    showRes('task');
     switchTab('log');
     clearTimeout(timer);
     poll();
@@ -3314,10 +3437,11 @@ function startActJob(path, label, body, back){
     setCardsShown(false); cardFp = '';
     autoBack = !!back; brushLike = true;
     if (back){
-      $('res').innerHTML = '<div class="empty">正在后台' + esc(label)
+      $('resTaskBody').innerHTML = '<div class="empty taskph">正在后台' + esc(label)
         + '…（进度看「运行日志」，可以随时暂停 / 停止）</div>';
     }
     $('bartip').textContent = label + '中…';
+    showRes('task');
     switchTab('log');
     clearTimeout(timer);
     poll();
@@ -3400,10 +3524,11 @@ function startBrush(ev){
     // 结果区会永远停在「正在后台刷视频…」——正是用户报过的
     // 「任务结束了还显示在刷题」。非关机时照写，收尾时由自动刷新顶掉。
     if (!shut){
-      $('res').innerHTML = '<div class="empty">正在后台刷视频…（倍速静音真实播放，'
+      $('resTaskBody').innerHTML = '<div class="empty taskph">正在后台刷视频…（倍速静音真实播放，'
         + '进度看「运行日志」；可以随时暂停/停止）</div>';
     }
     $('bartip').textContent = '刷视频中…';
+    showRes('task');
     switchTab('log');
     clearTimeout(timer);
     poll();
@@ -3427,10 +3552,11 @@ function startCombo(ev){
     setCardsShown(false); cardFp = '';
     autoBack = !shut; brushLike = true;   // 同「刷视频」：要关机就别再挂一个全量查询
     if (!shut){                           // 同上：不重跑查询就别留占位
-      $('res').innerHTML = '<div class="empty">正在后台「刷课+刷题」…（先刷视频，'
+      $('resTaskBody').innerHTML = '<div class="empty taskph">正在后台「刷课+刷题」…（先刷视频，'
         + '再做作业并交卷；进度看「运行日志」，可以随时暂停/停止）</div>';
     }
     $('bartip').textContent = '刷课+刷题中…';
+    showRes('task');
     switchTab('log');
     clearTimeout(timer);
     poll();
@@ -3472,10 +3598,11 @@ function startAnswer(ev, draft){
     since = 0; logEl.innerHTML = '';
     setCardsShown(false); cardFp = '';
     autoBack = true; brushLike = true;
-    $('res').innerHTML = '<div class="empty">正在后台做作业…（'
+    $('resTaskBody').innerHTML = '<div class="empty taskph">正在后台做作业…（'
       + (draft ? '答完暂存不交卷' : '答完直接交卷')
       + '；进度看「运行日志」；可以随时暂停/停止）</div>';
     $('bartip').textContent = draft ? '答题暂存中…' : '答题并交卷中…';
+    showRes('task');
     switchTab('log');
     clearTimeout(timer);
     poll();
@@ -3563,7 +3690,7 @@ function renderAnswerResult(a){
        + '</td></tr>';
   });
   h += '</tbody></table></div>';
-  $('res').innerHTML = h;
+  $('resTaskBody').innerHTML = h;
 }
 
 async function verifyAnswer(ev){
@@ -4023,6 +4150,18 @@ $('cpin').onclick = pinPicked;
 $('recentTop').oninput = updateCount;
 $('recentTop').onkeydown = e => { if (e.key === 'Enter') $('bquery').click(); };
 $('bclear').onclick = () => { logEl.innerHTML = ''; };
+// 结果页多级导航（v6.15）：任务页「返回主页面」、主页面「正在进行」、主页面「刷新清单」。
+$('bback').onclick = () => showRes('home');
+$('bdoing').onclick = () => showRes('task');
+// 「刷新清单」：按左侧当前勾选重新查询（不重新登录——登录态常驻）。复用 run 的
+// auto 分支：它不清日志、不换占位、失败只提示，正是「刷新」要的收窄语义。
+$('brefresh').onclick = () => {
+  if (!picked().length && !(parseInt($('recentTop').value) > 0)) {
+    // 一门没勾、也没设「最近 N 门」→ 提示一下（全量查询可不便宜）
+    toast('没勾课程：将查询全部课程', 'ok');
+  }
+  run('query', {auto: true});
+};
 // 熄屏：常驻在任务工具条上，任务跑着随时能点（Chrome 的 Video Wake Lock 挡不住
 // 显式 SC_MONITORPOWER），动下鼠标屏幕就亮，再点一下即可。
 // 万一黑屏唤不醒：按 Win+Ctrl+Shift+B 重置显卡驱动即可恢复，不必强制关机。
@@ -4064,6 +4203,22 @@ $('bopen').onclick  = () => fetch('/api/open-report', {method:'POST',
       headers:{'Content-Type':'application/json'}});
 $('bdir').onclick   = () => fetch('/api/open-dir', {method:'POST',
       headers:{'Content-Type':'application/json'}});
+// 退出登录（换号）：清本机会话 + 归档 profile，下次查询才重新登录。登录态默认
+// 常驻（v6.15），这是唯一的「我要换号」出口，所以要二次确认，避免误点把自己的
+// 登录态清了。
+$('blogout').onclick = async () => {
+  if (!confirm('退出登录？\n\n本机保存的登录会话会被清除，下次查询需要重新登录'
+             + '（换号就点这个）。')) return;
+  $('blogout').disabled = true;
+  try {
+    const r = await fetch('/api/logout', {method:'POST',
+      headers:{'Content-Type':'application/json'}});
+    const j = await r.json().catch(() => ({}));
+    toast(j.ok ? '已退出登录，下次查询请重新登录' : '退出登录未完全成功，详见日志',
+          j.ok ? 'ok' : 'err');
+  } catch(e){ toast('退出登录请求失败：' + e, 'err'); }
+  $('blogout').disabled = false;
+};
 $('bpause').onclick = () => {
   const on = $('bpause').dataset.paused === '1';
   fetch(on ? '/api/resume' : '/api/pause', {method:'POST',
@@ -4781,6 +4936,12 @@ class Handler(BaseHTTPRequestHandler):
         if u.path == '/api/pwd-forget':
             cs.forget_login_pwd()
             return self._send(200, b'{"ok":true}')
+        if u.path == '/api/logout':
+            # 退出登录（换号）：清本机会话 + 归档 profile。登录态默认常驻
+            # （v6.15），这是唯一的显式「我要换号」出口。关窗/杀进程在
+            # cs.logout() 里做，这里只回结果。
+            ok = cs.logout()
+            return self._send(200, json.dumps({'ok': ok}).encode('utf-8'))
         if u.path == '/api/open':
             # 桌面窗口里点 target="_blank" 的外链（打开作业 / 去完成 / 项目主页）：
             # 在窗口内跳转会顶掉整个界面、而且没有后退键，所以改交系统默认浏览器。

@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-学习通（超星）未完成事项巡检工具  v6.14
+学习通（超星）未完成事项巡检工具  v6.15
 ================================================================
 把「登录 → 逐门课翻作业/考试/任务点/课堂活动 → 汇总成清单」这套流程固化成本地程序。
 
@@ -36,6 +36,15 @@ v6.14 要点：修课堂活动简答题「有答案却填不上去、暂存存�
 UEditor 富文本编辑器，textarea 只是壳，直接写 value 平台读不到；改走 UE.instants
 API（与作业侧 JS_FILL_TEXT 同一套判据），编辑器 iframe 兜底、走不到就计 miss
 （安全阀拦下不把空简答存上去）。
+
+v6.15 要点（效率向）：①结果区改多级导航——「主页面（查询总览）」与「任务页
+（进度 / 交卷面板）」两层，#resHome / #resTask 来回切，跑任务时不再把刚查到的
+总览顶掉；任务页左上角「返回主页面」、主页面「正在进行 / 上次任务」按钮。
+②跑完任务**不再自动全量重查**（那趟 1~2 分钟，用户嫌慢）——改为在主页面上挂
+「清单可能已变 · 点『刷新清单』更新」，用户自己点 #brefresh 才重查（复用 auto
+静默分支）。③登录态常驻——只要本机会话还能用就一律复用，不再因填了别的账号
+而换罐重登；「换号」收敛成侧栏「退出登录（换号）」按钮（`logout()`，清会话 +
+归档 profile + 删 state.json，下次查询才真重登）。
 """
 from __future__ import annotations
 
@@ -128,7 +137,7 @@ ACTIVITY_TYPES = {
 # 的「进行中 / 已结束」分桶完全一致（Vue: activeList1=进行中 activeList2=已结束）。
 
 # 版本号：界面侧栏、启动日志、使用说明都引它，别再各处手写一份
-VERSION = 'v6.14'
+VERSION = 'v6.15'
 
 # 平台自身算「已完成」的状态；除此之外都视为未完成
 DONE_STATES = ('已完成', '已互评', '待批阅', '已提交', '待互评', '已结束', '已过期')
@@ -1099,6 +1108,39 @@ def drop_identity():
         pass
 
 
+def logout(cfg=None) -> bool:
+    """显式退出登录（清会话），供界面「退出登录（换号）」按钮调用。
+
+    v6.15：登录态默认常驻（见 do_login_password），所以必须给一个「我真的要
+    换号」的出口。做三件事：
+      · 归档整份浏览器 profile（fresh_profile）——把持久化在磁盘上的 cookie
+        / localStorage 全搬走，而不是只擦内存里的 cookie（那会被下次
+        storage_state 又灌回来）；
+      · 删掉 state.json（cookie 快照）与 identity.json（账号记录）；
+      · 停掉常驻浏览器进程，保证下次查询从**干净的新罐**起步、真的重登。
+    常驻浏览器开着时 profile 被占用，fresh_profile 会失败 → 先 stop_browser。
+    返回 True 表示会话已清干净（可换号登录了）。
+    """
+    stop_browser()
+    try:
+        ok = fresh_profile()
+    except Exception as e:
+        log('退出登录：清理浏览器痕迹失败（%s）' % e, 'warn')
+        ok = False
+    drop_identity()
+    try:
+        if STATE_FILE.exists():
+            STATE_FILE.unlink()
+    except Exception:
+        pass
+    if ok:
+        log('已退出登录（本机登录会话已清除，下次查询需重新登录）')
+    else:
+        log('已清除账号记录；但浏览器痕迹归档未完成，下次可能仍带着旧会话，'
+            '建议关掉本工具重开再登录。', 'warn')
+    return bool(ok)
+
+
 def session_label() -> str:
     """当前会话身份的展示文案，给日志和界面用。"""
     d = load_identity()
@@ -1753,21 +1795,26 @@ def do_login_password(cfg, phone, password, headless=False) -> bool:
         # 账号。于是「填 A 的密码 → 本机躺着 B 的会话 → 静默以 B 的身份跑」，
         # 用户看到的就是「登录的账号跟我输入的不是一个」。这比看上去严重：
         # 之后的刷课、交卷全都会算到 B 头上，而且不可撤销。
+        # v6.15「登录态常驻」：只要本机会话还能用就直接复用，**不再**因为
+        # 用户填了别的账号（或身份未知）就换罐重登——用户 2026-10-15 明确
+        # 「一次登录后一直保持，以效率为准，给个手动退出按钮就行」。换号收敛
+        # 成显式动作：点侧栏「退出登录（换号）」清掉会话后，下次查询才会真重登。
+        # （v3.7~v6.14 这里是「填的账号 ≠ 本机会话账号 → 换罐重登」，防的是
+        #  A 的会话下跑 B 的任务；现在按用户要求以效率优先，改为一律复用，
+        #  仅用一句日志说清「当前复用的是哪个账号」，看到不对自己去退出。）
         if restore_state(ctx) and check_login(page, navigate=True):
             have = (load_identity().get('phone') or '')
-            if have and have == phone:
+            if have and have != phone:
+                log('本机会话属于账号（%s），与你输入的 %s 不同；按「登录态常驻」'
+                    '沿用本机会话（要换号请先点侧栏「退出登录（换号）」）。'
+                    % (mask_phone(have), mask_phone(phone)), 'warn')
+            elif not have:
+                log('本机有可用登录会话（来源未记名，多为扫码登录留下的），'
+                    '直接复用 ✓')
+            else:
                 log('本机已保存该账号（%s）的登录会话，直接复用 ✓'
                     % mask_phone(phone))
-                return True
-            if have:
-                log('本机保存的会话属于另一个账号（%s），'
-                    '改按你输入的 %s 重新登录 …'
-                    % (mask_phone(have), mask_phone(phone)), 'warn')
-            else:
-                log('本机会话没记下是哪个账号（多半是扫码登录留下的），'
-                    '不能确认它就是 %s → 按你输入的账号重新登录 …'
-                    % mask_phone(phone), 'warn')
-            log('（上一个账号的会话会归档到 runtime/profile_old，不会丢）')
+            return True
 
         # 走到这说明 state.json 里没有可用会话 → 这是一次「真的要登录」。
         # 换号登录前先换罐：持久化 profile 里可能还躺着上一个账号的 cookie
