@@ -648,7 +648,8 @@ def _brush_worker(opts):
             cs.patch_config({'brush_rate': cfg['brush_rate']})
         rate = cs.g_rate(cfg)
         cs.log('播放方式：%sx 倍速 + 静音，真实播放到片尾（不伪造心跳）。' % rate)
-        cs.log('只刷视频任务点；测验 / 作业不会替你自动完成。')
+        cs.log('只刷视频任务点（已完成的视频会自动跳过，不重复播）；'
+               '测验 / 作业 / 文档不是视频，刷课不管——节点里还有这类任务点时下面会如实提示。')
 
         def progress(msg, *a):
             cs.log(msg, a[0] if a else 'info')
@@ -2469,7 +2470,7 @@ PAGE = r"""<!DOCTYPE html>
               <input type="text" id="llm_url" placeholder="接口地址（填到 /v1 即可）">
             </div>
             <div class="field">
-              <input type="text" id="llm_model" placeholder="模型名，如 deepseek-chat">
+              <input type="text" id="llm_model" placeholder="模型名，如 deepseek-flash">
             </div>
             <div class="field has-in">
               <input type="password" id="llm_key" placeholder="API Key">
@@ -3102,7 +3103,8 @@ function renderResult(r){
        + '<label class="chk inline"><input type="checkbox" id="sdafter"'
        + (sdAfterOn ? ' checked' : '') + '> 刷完自动关机</label>'
        + '<span class="note">勾课程 = 全部章节；展开后可只勾某些章节。'
-       + '刷视频 = 倍速静音真实播放；做作业 = 点开选「暂存」（存平台'
+       + '刷视频 = 倍速静音真实播放（已完成的视频会自动跳过，不重复播）；'
+       + '做作业 = 点开选「暂存」（存平台'
        + '草稿不交卷）或「提交」（正式交卷）；同题干复用上次答案，'
        + '附件 / 报告题会跳过并提示。'
        + '自动关机只在正常刷完时触发，关机前留 60 秒缓冲'

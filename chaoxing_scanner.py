@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-学习通（超星）未完成事项巡检工具  v6.18
+学习通（超星）未完成事项巡检工具  v6.21
 ================================================================
 把「登录 → 逐门课翻作业/考试/任务点/课堂活动 → 汇总成清单」这套流程固化成本地程序。
 
@@ -72,6 +72,39 @@ v6.18 要点（界面改版，照抄云析布局 + Material3 蓝调）：①**�
 ⑥新增**检查更新**（查 GitHub release，只提示 + 给下载链接，不自动下载）与
 **导出日志**（另存 `输出/日志`）。⑦新增**引导提示开关**与**刷课时阻止电脑休眠
 开关**（默认开）。⑧**删掉「退出程序」按钮**（关窗口 × 仍可退）。
+
+v6.19 要点（修「章节节点多任务卡」死循环）：一个章节节点其实是**一叠卡片**
+（`knowledge/cards` 页里若干 `.ans-attach-ct`），视频只是其中一种，还可能是
+测验（`modules/work`，章节测验/作业）、文档（`modules/pdf`）等；哪张卡是「任务
+点」看它带不带 `.ans-job-icon`，完成没完成看该图标的 `aria-label`（「任务点
+已完成」）或卡片 class 里有没有 `ans-job-finished`。以前「刷课」**只认
+`modules/video`**，而且光看页面里有没有 `<video>`、**不看这张卡完成没有** →
+节点里只要混着测验/文档卡，视频刷完了节点照样「未完成」，于是重跑「刷课」
+又把已完成的视频**从头再播一遍**，卡死在这种循环里。本版：①刷课**跳过已完成
+的视频**（不再重复播）；②刷完一个节点后**如实列出它还剩哪些非视频任务点**
+（测验/作业/文档），提示用「刷课+刷题」或手动完成——不再让用户对着「刷完了
+还显示未完成」发懵。测验/文档本身仍**不由「刷课」代做**（语义不变）。
+
+v6.20 要点（真机复现后补的「哑节点」盲区）：v6.19 只堵住了「有残余」的节点——
+现在补上「一个视频都没刷到」的哑节点。真机（Linux 课）复现：有的任务点卡
+**不带 `.ans-job-icon`**，`_scan_leftover_tasks` 认不出来，于是既没视频可刷、
+又报不出残余，日志里那行节点**一片空白**，汇总只写「完成 0 个」——用户看不出
+为啥，只能重跑刷课（于是又重播已完成视频，回到死循环）。本版：节点若既没刷到
+也没失败，就**明说**「这个节点没有可刷的视频（已完成 / 或不是视频任务点），
+仍未完成，多半是章节测验/作业，用『刷课+刷题』或手动完成」。刷课依旧只管视频。
+
+v6.21 要点（真机确诊：章节里的测验根本不在第一格选项卡）：
+用户报「章节里的测验/作业一直找不到，刷完视频节点还是未完成」。真机（账号
+190…6550 的大学物理-软件学院2026，1.1 理想流体的定常流动）查到底：学生页顶部
+有一排**选项卡**（「1视频与讲义 / 2讨论 / 3测试」），每格对应 cards 地址里的
+`num` 参数：视频与讲义=0、讨论=1、测试=2。**章节测验 / 单元测试就挂在 num=2
+那格里**（1.1 在第 3 格、1.2 在第 2 格、1.7 恰好在第 1 格——逐节点不同）。
+以前 `CARDS_URL` 把 `num` **写死成 0**，于是只在第一格里找作业卡：绝大多数
+节点的测验永远找不到，日志还一片空白（连「没找到」都不说）。本版：
+①答题引擎先读出本章选项卡列表，再**逐格找作业卡**（标题像「测试/测验/作业/
+练习」的排前面），找到就用那一格答题；②「刷课」同样**逐格找视频卡**；
+③残余任务点按选项卡分别统计；④**找不到时如实说明**（列出扫过哪几格），
+不再让那行日志空着——用户才能分清「这节点本来就没作业」和「工具没找到」。
 """
 from __future__ import annotations
 
@@ -164,7 +197,7 @@ ACTIVITY_TYPES = {
 # 的「进行中 / 已结束」分桶完全一致（Vue: activeList1=进行中 activeList2=已结束）。
 
 # 版本号：界面侧栏、启动日志、使用说明都引它，别再各处手写一份
-VERSION = 'v6.18'
+VERSION = 'v6.23'
 
 # 平台自身算「已完成」的状态；除此之外都视为未完成
 DONE_STATES = ('已完成', '已互评', '待批阅', '已提交', '待互评', '已结束', '已过期')
@@ -193,7 +226,7 @@ DEFAULT_CONFIG = {
     # 按当前用户托管，文件拷到别的机器/用户下解不开），这里只在加密不可用时
     # （非 Windows / DPAPI 故障）才留明文兜底。
     'llm_key': '',
-    'llm_model': '',        # 模型名（如 gpt-4o-mini / deepseek-chat）
+    'llm_model': '',        # 模型名（如 gpt-4o-mini / deepseek-flash）
     # ---- 视觉模型（可选）：文本模型看不了图，公式题 / 图表题的题面是图片或
     # MathML，纯文本提取拿到的往往是空白或乱码，得让能看到图的模型「亲眼看」。
     # 四项全空 = 不启用视觉，行为与之前完全一致（纯文本答题）。
@@ -3011,8 +3044,20 @@ def is_undone(item) -> bool:
 #      （multimedia/log 响应 {"isPassed":true}，章节列表节点翻绿）；
 #   3) 播放中偶发自暂停（无弹窗），再次 play() 即可继续；
 #   4) 测验卡（doHomeWorkNew）不是视频，本模块不碰——替考式自动答题不做。
+# ⚠️ num 是选项卡序号，**不是**「第几个任务点」。真机实测（2026-10-17，
+# 账号 190…6550 的大学物理）：
+#   章节页顶部有一排选项卡（学生页文案是「1视频与讲义 2讨论 3测试」），
+#   每个选项卡对应一个 num：视频与讲义=0、讨论=1、测试=2。**测验/作业卡
+#   常常不在 num=0**——1.1 的章节测验在 num=2、1.2 的在 num=1，1.7 的恰好在
+#   num=0。以前这里把 num 写死成 0，于是只在第一个选项卡里找作业卡，
+#   绝大多数「章节里的测验」永远找不到（用户报的「检测不到作业测验」根因）。
+#   选项卡数量逐节点不同，要 0,1,2,… 扫到连续空为止（见 _wait_hw_iframe）。
 CARDS_URL = ('https://mooc1.chaoxing.com/mooc-ans/knowledge/cards'
-             '?clazzid={clsid}&courseid={cid}&knowledgeid={kid}&num=0&ut=s&cpi={cpi}')
+             '?clazzid={clsid}&courseid={cid}&knowledgeid={kid}&num={num}&ut=s&cpi={cpi}')
+
+# 扫选项卡的上限。学生页实测最多 3 张（视频与讲义/讨论/测试），留点余量；
+# 老师端偶见更多。超过这个数还连续空，就当到头了，免得无限翻。
+MAX_CARDS_TABS = 6
 
 # 视频元素就绪（duration 是有限数才算加载完，NaN 是还在缓冲）。
 # ⚠️ 学习通的播放器是 preload=none：duration 在开始播放前一直是 NaN，
@@ -3052,12 +3097,26 @@ JS_VIDEO_PLAY = r"""
 
 JS_VIDEO_PAUSE = "() => { const v = document.querySelector('video'); if (v && !v.paused) v.pause(); }"
 
-# 这个 frame 里的视频刷完没有（刷完打标记，防止同一个卡被刷两遍）
+# 这个视频 frame「还需不需要刷」。false = 已刷过（window.__cx_brushed）
+# 或**这张卡平台已判完成**（aria-label「任务点已完成」/ class 含
+# ans-job-finished）→ 跳过，重跑不再重复播（v6.19 修死循环的关键）。
+# 视频 frame 与主文档同源，window.frameElement 能读到父文档里这张卡的标记。
 JS_VIDEO_CLAIM = r"""
 () => {
   if (window.__cx_brushed) return false;
   const v = document.querySelector('video');
-  return !!v;
+  if (!v) return false;
+  try {
+    const fe = window.frameElement;
+    const ct = fe && fe.closest ? fe.closest(".ans-attach-ct") : null;
+    if (ct) {
+      const cls = (ct.className || "").toString();
+      const job = ct.querySelector(".ans-job-icon");
+      const lbl = job ? (job.getAttribute("aria-label") || "") : "";
+      if (/已完成/.test(lbl) || /ans-job-finished/.test(cls)) return false;
+    }
+  } catch (e) { /* 跨源/取不到就当未完成，保持旧行为 */ }
+  return true;
 }
 """
 
@@ -3355,18 +3414,35 @@ JS_PARSE_TIMUS = r"""
   const _lis = [...document.querySelectorAll('.questionLi')];
   const _tms = [...document.querySelectorAll('.TiMu')];
   const _boxes = (_lis.length && _tms.length <= 1) ? _lis : _tms;
+  // 上标/下标转普通字符：平台把 10 的 5 次方写成 <sup>5</sup>，textContent
+  // 读出来是「6×105Pa」——模型会当成「一百零五」而不是「十的五次方」，
+  // 真机实测就栽在这上面（作业 1.2 第 2 题，答案差了一个数量级）。
+  // v6.22 起统一转成 ^5 / _2 这种可读写法再拼题干与选项文字。
+  const _txt = (node) => {
+    if (!node) return '';
+    let c;
+    try { c = node.cloneNode(true); } catch (e) { return node.textContent || ''; }
+    c.querySelectorAll('sup').forEach(s => {
+      const t = (s.textContent || '').trim();
+      s.replaceWith(document.createTextNode(t.length > 1 ? '^(' + t + ')' : '^' + t));
+    });
+    c.querySelectorAll('sub').forEach(s => {
+      const t = (s.textContent || '').trim();
+      s.replaceWith(document.createTextNode(t.length > 1 ? '_(' + t + ')' : '_' + t));
+    });
+    return c.textContent || '';
+  };
   _boxes.forEach((li, idx) => {
     const at = li.querySelector('input[name^=answertype]');
     // 题干提取三级兜底。真机实测踩过：某课作业卡的题干不在 .Zy_TItle 里
     // （结构差异），取到空题干 → 附件规则无从匹配 → 模型只看到「1.【简答】」
     // 就瞎编了一段「进入课程作业中的实验报告，点击上传文件……提交即可」当
     // 答案，工具照填还交了卷，整题 0 分。宁可题干带点噪声，也不能空着。
-    let stem = ((li.querySelector('.Zy_TItle') || {}).textContent || '');
+    let stem = _txt(li.querySelector('.Zy_TItle'));
     if (!stem.trim()) {
       // .mark_name 是新版每题容器里的题目信息行（题号 + 题型 + 分值）
-      const cand = li.querySelector(
-        '.mark_name, .Zy_Questions_Con, .TiMu_Title, .quesDetail, .questionCon, p');
-      if (cand) stem = cand.textContent || '';
+      stem = _txt(li.querySelector(
+        '.mark_name, .Zy_Questions_Con, .TiMu_Title, .quesDetail, .questionCon, p'));
     }
     if (!stem.trim()) {
       // 兜底取整题文本，但要先剔掉富文本编辑器与工具条：它们的占位
@@ -3374,7 +3450,7 @@ JS_PARSE_TIMUS = r"""
       const clone = li.cloneNode(true);
       clone.querySelectorAll(
         '.edui-default, .eidtDiv, textarea, script, input').forEach(x => x.remove());
-      stem = clone.textContent || '';
+      stem = _txt(clone);
     }
     stem = stem.replace(/\s+/g, ' ').trim().slice(0, 500);
     const opts = [], fills = [];
@@ -3398,16 +3474,26 @@ JS_PARSE_TIMUS = r"""
           ? [...scope.querySelectorAll('input[name="answer' + qid + '"]')]
               .filter(y => y.type === 'radio' || y.type === 'checkbox')
           : [];
-        (exact.length ? exact
-          : [...scope.querySelectorAll('input[type=radio],input[type=checkbox]')])
-          .forEach(x => {
-            if (x.type === 'hidden') return;
-            if (exact.length && qid && x.name !== 'answer' + qid) return;
-            const label = (x.closest('li') || x.parentElement);
-            opts.push({name: x.name, val: x.value, type: x.type,
-                       label: ((label && label.textContent) || x.value)
-                              .replace(/\s+/g, ' ').trim().slice(0, 150)});
-          });
+        // ⚠ 走「宽松收任何 radio」只在**这一层确实只有一道题**时才允许。
+        // 真机 2026-10-17（大学物理 1.3）踩过：第 1 题是填空、容器里没有
+        // radio，向上找一层就把**第 2 题**的四个选项收进来了 → 模型按这四
+        // 个选项作答、工具再拿第 2 题的 name 去点，题号和答案整体错位。
+        // 判据：这一层里 answertype 的个数 —— 多于 1 个就说明跨题了，只认
+        // 精确匹配的 qid。
+        const nAt = scope.querySelectorAll('input[name^=answertype]').length;
+        const allowAny = !qid || nAt <= 1;
+        const list = exact.length ? exact
+          : (allowAny
+             ? [...scope.querySelectorAll('input[type=radio],input[type=checkbox]')]
+             : []);
+        list.forEach(x => {
+          if (x.type === 'hidden') return;
+          if (exact.length && qid && x.name !== 'answer' + qid) return;
+          const label = (x.closest('li') || x.parentElement);
+          opts.push({name: x.name, val: x.value, type: x.type,
+                     label: ((label && label.textContent) || x.value)
+                            .replace(/\s+/g, ' ').trim().slice(0, 150)});
+        });
         scope = scope.parentElement;
       }
     }
@@ -3433,6 +3519,20 @@ JS_PARSE_TIMUS = r"""
           });
       }
     }
+    // 选项的**显示字母**（真机 2026-10-17，大学物理 1.8，randomOptions=true）：
+    //   平台把选项顺序打乱了再渲染，页面上从 A 起按**显示位置**标字母，
+    //   而 radio 的 value 仍是打乱**前**的原始字母。实测 Q2：
+    //     显示 A 的 value 是 C，显示 C 的 value 是 D……
+    //   模型（看截图也好、读题面文字也好）答的一定是**显示字母**，按 value
+    //   匹配就会把答案点到别的选项上——用户看到的就是「答案是对的，但填错
+    //   位置」，7 道错题里有 6 道与这个错位完全吻合。
+    // 所以每个选项都要记下「它显示在第几位、标的是哪个字母」，落答侧据此定位。
+    opts.forEach((o, i) => {
+      o.pos = i;
+      const m = String(o.label || '').trim()
+        .match(/^[（(]?\s*([A-Za-z])\s*[)）.．、:：\s]/);
+      o.dl = (m ? m[1] : 'ABCDEFGHIJKLMNOP'.charAt(i)).toUpperCase();
+    });
     // 仍拿不到选项：把整题结构转储给 page_diag（iframe/自定义控件一次看清）
     if (!opts.length) {
       const c2 = li.cloneNode(true);
@@ -3445,6 +3545,19 @@ JS_PARSE_TIMUS = r"""
         timu: document.querySelectorAll('.TiMu').length,
         liIf: li.querySelectorAll('iframe').length};
       li_html = c2.outerHTML.replace(/\s+/g, ' ').trim().slice(0, 6000);
+    }
+    // ⚠ 判附件题用的 HTML 必须**剔掉富文本编辑器子树**：UEditor 工具条里
+    //   明晃晃写着「上传图片」「上传视频」，拿它去匹配 ATTACH_RE 会把普通
+    //   填空题整份判成「要交附件、整份跳过」。
+    //   以前这个坑被另一个 bug 盖住了——第 1 题会把**下一题**的选项捞进来，
+    //   opts 非空 → li_html 压根不生成 → 规则没机会误判。v6.22 修掉串选项后
+    //   它就露头了（test_vision_v39 当场抓红），这里一并修掉。
+    let htmlForRule = li_html || '';
+    if (htmlForRule) {
+      const c3 = li.cloneNode(true);
+      c3.querySelectorAll('.edui-default, .edui-editor, .edui-toolbar,'
+        + ' .edui-upload, .edui-editor-body, script, style').forEach(x => x.remove());
+      htmlForRule = c3.outerHTML.replace(/\s+/g, ' ').slice(0, 6000);
     }
     li.querySelectorAll('textarea, input[type=text]').forEach(x => {
       fills.push({name: x.name || '', tag: x.tagName.toLowerCase()});
@@ -3465,7 +3578,7 @@ JS_PARSE_TIMUS = r"""
     // v6.13：手写/纸上书写题（真机实测：「粘贴答案要求：在纸上书写ok()函数，
     // 拍照上传」——要求写在题目富文本里而非纯题干，所以 stem 和 li_html 都要扫）
     const ATTACH_RE = /上传附件|提交附件|附件上传|附件提交|以附件|附件形式|拍照上传|手写|纸上书写|纸上作答|在纸上|书写后拍照|拍照.{0,8}(发送|回传)|上传.{0,8}(报告|文件|文档|图片|视频|音频|压缩包|作品|附件)|提交.{0,8}(报告|文件|文档|压缩包|作品|附件)|(报告|文件|作品|附件).{0,6}(上传|提交)/;
-    const stemUpload = ATTACH_RE.test(stem) || ATTACH_RE.test(li_html);
+    const stemUpload = ATTACH_RE.test(stem) || ATTACH_RE.test(htmlForRule);
     const upload = hasUploader || stemUpload;
     // 题干里是否带图/公式：这类题靠纯文本拿不到题面——超星的数学公式常以图片或
     // MathML 渲染，提取出来是空白或乱码。命中就标记，交给视觉模型「亲眼看」
@@ -3473,11 +3586,27 @@ JS_PARSE_TIMUS = r"""
     // 漏了则是整题答不出。
     const hasMedia = !!li.querySelector(
       'img, svg, math, .MathJax, .MathJax_Preview, [class*=formula], [class*=math], canvas');
+    // 字体反爬（真机 2026-10-17，大学物理 1.3/1.4/1.5 全中）：平台把题干和
+    // 选项里的每个字换成**另一个码位的字**（「理想流体」→「惪想惥惦」），再用
+    // 自定义字体 font-cxsecret 把真实字形画出来。DOM 文本是乱码，纯文本通道
+    // 喂给模型只能得到一段胡编的答案（用户看到的就是「答案填错」）。
+    // 判据：题干/选项元素的计算字体族里带 cxsecret（平台上就是这个族名）。
+    // ⚠ 不能靠「含私用区字符」判：这些乱码是正常汉字码位，_stem_missing
+    //   那套 PUA 判据对它们完全无效（这是本轮真机踩到的坑）。
+    let scrambled = false;
+    try {
+      const fam = e => (e ? (getComputedStyle(e).fontFamily || '') : '').toLowerCase();
+      const RE_CX = /cxsecret|font-cx|cx-?secret/;
+      const probe = [li.querySelector('.Zy_TItle')].concat(
+        [...li.querySelectorAll('.Zy_TItle span, .Zy_TItle p')].slice(0, 4),
+        [...li.querySelectorAll('li')].slice(0, 4));
+      scrambled = probe.some(e => RE_CX.test(fam(e)));
+    } catch (e) { /* 取不到计算样式就当没加密，宁可多走一次文本通道 */ }
     // 供截图按题定位（Playwright 侧用 [data-cx-idx="N"] 抓这一题的图）
     li.setAttribute('data-cx-idx', idx);
     out.push({no: idx + 1, stem: stem.slice(0, 500),
               atype: at ? at.value : '',
-              opts, fills, upload, hasMedia, li_html, doc_counts: li_doc});
+              opts, fills, upload, hasMedia, scrambled, li_html, doc_counts: li_doc});
   });
   return out;
 }
@@ -3629,6 +3758,26 @@ JS_DO_SUBMIT = r"""
 }
 """
 
+# 回读：每题当前**真正勾着**的选项值，按 input name 归组。
+# 用来核实「点过了」≠「还在」——平台 reload 会静默冲掉未落库的点选
+# （真机 2026-10-17：填 15 道、交上去只剩 8 道）。
+JS_READ_CHECKED = r"""
+() => {
+  const boxes = document.querySelectorAll(
+    'input[name^=answer][type=radio], input[name^=answer][type=checkbox]');
+  // ⚠ 一个可选项都没找到 = 这页面结构我们不认识，**返回 null 表示「读不了」**，
+  //   绝不能返回 {}：空对象与「页面上一道都没勾」长得一模一样，调用方会据此
+  //   把整份判成答案全丢。宁可漏报也不能谎报。
+  if (!boxes.length) return null;
+  const out = {};
+  boxes.forEach(x => {
+    if (!x.checked) return;
+    (out[x.name] = out[x.name] || []).push(x.value || '');
+  });
+  return out;
+}
+"""
+
 # 暂存（不交卷）：saveWork 是平台自己的「临时保存」
 JS_DO_SAVE = r"""
 () => {
@@ -3644,7 +3793,7 @@ JS_DO_SAVE = r"""
 # 预设表只有后端这一份真相源，界面的下拉直接用它渲染，避免前后端两份漂移。
 LLM_PLATFORMS = [
     {'key': 'deepseek', 'label': 'DeepSeek',
-     'url': 'https://api.deepseek.com/v1', 'model': 'deepseek-chat',
+     'url': 'https://api.deepseek.com/v1', 'model': 'deepseek-flash',
      'vision_model': ''},          # DeepSeek 开放平台暂无视觉模型
     {'key': 'openai', 'label': 'OpenAI',
      'url': 'https://api.openai.com/v1', 'model': 'gpt-4o-mini',
@@ -4150,7 +4299,7 @@ def llm_chat(cfg, prompt, timeout=120, key=None, images=None, purpose=None):
     if not model:
         raise RuntimeError(
             '视觉模型还没填模型名（如 qwen-vl-max / glm-4v-flash）'
-            if vis else '还没填模型名（如 deepseek-chat）')
+            if vis else '还没填模型名（如 deepseek-flash）')
     content = prompt
     if images:
         content = [{'type': 'text', 'text': prompt}]
@@ -4370,12 +4519,30 @@ def _stem_key(stem):
     读取侧不受影响：空键永远 cache.get 不到东西。
     （2026-10-08 审查发现：守卫写法 `and _stem_key(...)` 对空串恒为真，
     等于这条守卫从来没生效过。）
+
+    v6.22：先剥掉题号前缀与题型标记再取哈希。真机实测（2026-10-17）：
+    答题页的题干是「2 【单选题】…」，同一道题在**已批阅**页是
+    「1 【单选题】…」（批阅页每题都显示 1）——不剥前缀，两边算出的键
+    对不上，「把正确答案回灌缓存」就永远写不进下次要用的那个键。
     """
     import hashlib
-    norm = re.sub(r'\s+', '', stem or '')
+    norm = _stem_norm(stem)
     if not norm:
         return ''
     return hashlib.sha1(norm.encode('utf-8')).hexdigest()[:16]
+
+
+def _stem_norm(stem):
+    """题干归一：剥题号/题型前缀、压掉全部空白。空题干返回空串。
+
+    只剥**开头**那一段「1 【单选题】」「2. 」「(3) 」——正文里的数字不动。
+    """
+    s = (stem or '').strip()
+    if not s:
+        return ''
+    s = re.sub(r'^\s*\d+\s*【[^】]{0,12}】\s*', '', s)
+    s = re.sub(r'^\s*[（(]?\d+[）).、]\s*', '', s)
+    return re.sub(r'\s+', '', s)
 
 
 def _answer_cache_load():
@@ -4414,10 +4581,13 @@ def _answer_cache_save(cache):
 def _need_vision(t) -> bool:
     """这题要不要交给视觉模型看。
 
-    范围：主观题（填空 / 简答），或题干里带图 / 公式的题。不含图的客观选择题
-    不截——纯文字选择题给文本就够，省流量也省等待。
+    范围：主观题（填空 / 简答），题干里带图 / 公式的题，以及**字体反爬**的题
+    （t['scrambled']：DOM 里是「惪想惥惦」这类替换码位，纯文本喂模型只会得到
+    胡编的答案，真机 2026-10-17 实测）。不含图的纯文字选择题不截——给文本
+    就够，省流量也省等待。
     """
-    return bool(t.get('hasMedia')) or (t.get('atype') in STYPES)
+    return (bool(t.get('hasMedia')) or bool(t.get('scrambled'))
+            or (t.get('atype') in STYPES))
 
 
 def _shot_timu(hw, idx):
@@ -4426,16 +4596,52 @@ def _shot_timu(hw, idx):
     定位靠 JS 解析时打的 data-cx-idx（与 JS_PARSE_TIMUS 的 _boxes 同序）。
     整题连题干带公式带选项一起截，模型才看得全。走 JPEG q60：题面多是文字
     与线条，压完通常几十 KB，比 PNG 小一个数量级，字照样清楚。
+
+    v6.22：元素截图会**偶发卡死**（真机 2026-10-17：`ElementHandle.screenshot:
+    Timeout 30000ms exceeded`，同一题前后两次探测都是 0.1 秒成功的）。卡住的
+    那一题如果恰好是选项全为图片 / 字体反爬的题，纯文本通道根本答不出来——
+    用户看到的就是「第 1 题答案完全空着」。所以这里改成：
+      ① 短超时（8 秒）+ 关动画关光标，最多连试两次；
+      ② 还不行就退回「整页截图 + 裁剪框」（page.screenshot(clip=…)）——
+         实测这条路一直稳，出图内容与元素截图一致；
+      ③ 全失败才返回 None，并如实记日志（不再谎称「按纯文本处理」）。
     """
+    el = None
     try:
         el = hw.query_selector('[data-cx-idx="%d"]' % idx)
-        if not el:
-            return None
-        return el.screenshot(type='jpeg', quality=60)
-    except Exception as e:
-        log('    第 %d 题截图失败（%s），这题按纯文本处理。'
-            % (idx + 1, str(e)[:60]), 'warn')
+    except Exception:
+        el = None
+    if not el:
         return None
+    kw = dict(type='jpeg', quality=60, timeout=8000,
+              animations='disabled', caret='hide')
+    for _ in (1, 2):
+        try:
+            return el.screenshot(**kw)
+        except Exception:
+            continue
+    # ---- 兜底：整页截图 + 裁剪框 ----
+    pg = getattr(hw, 'page', None)
+    if pg is not None:
+        try:
+            el.scroll_into_view_if_needed(timeout=3000)
+        except Exception:
+            pass
+        try:
+            bb = el.bounding_box()
+        except Exception:
+            bb = None
+        if bb:
+            try:
+                return pg.screenshot(clip=bb, type='jpeg', quality=70,
+                                     timeout=10000, animations='disabled')
+            except Exception as e:
+                log('    第 %d 题截图失败（%s）。' % (idx + 1, str(e)[:70]),
+                    'warn')
+                return None
+    log('    第 %d 题截图失败（元素截图两次超时，裁剪兜底也拿不到）。'
+        % (idx + 1), 'warn')
+    return None
 
 
 def _attach_shots(hw, timus, cfg):
@@ -4466,18 +4672,31 @@ def _attach_shots(hw, timus, cfg):
     return timus
 
 
-def _clean_vision_answer(a: str) -> str:
-    """收拾视觉模型的回答：只留答案本身；'?' 表示没把握（按未答处理）。"""
+def _clean_vision_answer(a: str, atype='') -> str:
+    """收拾视觉模型的回答：只留答案本身；'?' 表示没把握（按未答处理）。
+
+    v6.22：按题型归一，与文本通道（_parse_llm_answers）口径一致——
+    真机 2026-10-17 踩过：视觉通道把「答案：B」原样交上去，选择题落答时
+    拿 'B' 去比选项值比上了，但「B、」「选B」这类就会落不下去；判断题也会
+    被原样塞进卷子。选择题只留字母、判断题统一对/错、填空简答洗 LaTeX。
+    """
     s = (a or '').strip()
     if not s:
         return ''
     # 只取第一行：模型偶尔会在答案后面补一句解释
     s = s.splitlines()[0].strip()
-    s = re.sub(r'^(答案|答)\s*[:：]\s*', '', s).strip()
+    s = re.sub(r'^(答案|答|正确答案|最终答案)\s*[:：]\s*', '', s).strip()
     s = s.strip('"\'“”「」『』（）()').strip()
     if s in ('?', '？', '无', '未知'):
         return ''
-    return s
+    if atype in ('0', '1'):
+        # 「B」「选B」「答案B」「（B）」→ 'B'；多选「A、C」→ 'AC'
+        s = re.sub(r'[^A-Za-z]', '', s).upper()
+    elif atype == '3':
+        s = '错' if s in ('错', '错误', 'FALSE', 'F', '×', 'false') else '对'
+    elif atype in ('2', '4'):
+        s = _clean_answer_text(s)
+    return s.strip()
 
 
 def _ask_one_vision(cfg, t):
@@ -4498,10 +4717,16 @@ def _ask_one_vision(cfg, t):
         hint = '选择题：只输出所选选项的大写字母，多选连写（如 AC）。'
     stem = (t.get('stem') or '').strip()
     parts = ['图片是作业里的一道%s题，请**直接看图**作答。%s' % (tn, hint)]
-    if stem:
+    # 字体反爬的题：题干是「惪想惥惦」这类替换码位的乱码，喂给模型只会把它
+    # 带偏（真机 2026-10-17：把乱码题干一起发过去，模型答非所问）。
+    # 这种情况**一个字都不给**，只让它看图。
+    if stem and not t.get('scrambled'):
         # 提取到的题干可能因公式渲染而残缺，说明以图为准，免得模型被误导
         parts.append('（页面提取的题干文字，可能与图不一致，以图中的题目为准）：'
                      + stem[:400])
+    elif t.get('scrambled'):
+        parts.append('（页面文字被平台字体加密，提取出来是乱码，已隐去；'
+                     '请完全以图片内容为准。）')
     opts = [o['label'] for o in (t.get('opts') or [])]
     if opts and t['atype'] not in STYPES:
         parts.append('页面给的选项：\n' + '\n'.join('   ' + x for x in opts))
@@ -4523,7 +4748,7 @@ def _solve_by_vision(cfg, timus, progress):
     out = {}
     for t in timus:
         try:
-            a = _clean_vision_answer(_ask_one_vision(cfg, t))
+            a = _clean_vision_answer(_ask_one_vision(cfg, t), t.get('atype'))
         except RuntimeError as e:
             progress('    第 %d 题视觉模型调用失败：%s'
                      % (t['no'], str(e)[:110]), 'warn')
@@ -4562,7 +4787,9 @@ def llm_solve(cfg, timus, progress):
     for t in todo:
         # 有图的题不查缓存也不用缓存：截图内容（图形 / 公式）没法用题干哈希
         # 代表，拿旧答案复用有答错的风险，宁可多花一次调用。
-        if not t.get('shot'):
+        # 字体反爬的题同样不查：题干是乱码，哈希能对上但语义完全不可靠
+        # （两道不同的题可能都是「惪想惥惦…」这类替换串）。
+        if not t.get('shot') and not t.get('scrambled'):
             hit = cache.get(_stem_key(t.get('stem')))
             if hit:
                 ans[t['no']] = hit
@@ -4575,7 +4802,16 @@ def llm_solve(cfg, timus, progress):
         return ans
     todo = rest
     vis = [t for t in todo if t.get('shot')]
-    txt = [t for t in todo if not t.get('shot')]
+    # ⚠ 字体反爬又没截到图的题**不能**走文本通道：题干是「惪想惥惦」这类
+    # 替换码位，模型只能照着乱码率性作答，交上去必然错（真机 2026-10-17：
+    # 1.5 第 1 题被填成「256」）。这类题一律不答，让 answer_one 按「没答上」
+    # 处理并如实提示——错答比空着更糟，空着用户还能自己补。
+    blind = [t for t in todo if t.get('scrambled') and not t.get('shot')]
+    txt = [t for t in todo if not t.get('shot') and not t.get('scrambled')]
+    if blind:
+        progress('    第 %s 题的页面文字被平台字体加密、又没截到图，'
+                 '发给模型只会得到乱码答案，按没答上处理。'
+                 % '、'.join(str(t['no']) for t in blind[:8]), 'warn')
     got = {}
     # ---- 视觉通道：带截图的题，逐题「看图作答」 ----
     if vis:
@@ -4637,9 +4873,14 @@ def llm_solve(cfg, timus, progress):
     ans.update(got)
     # 新答上的题写回缓存（'?' = 没把握，绝不能进缓存）。
     # 带图的题题干常常为空，哈希键为空时跳过，免得把不同题混成一个键。
+    # v6.22：**看图答的题不写缓存**。截图代表不了一段题干（同一题干换一组
+    # 图答案就不同），而 `_stem_key` 只看题干——真机 2026-10-17：1.2 第 1 题
+    # （选项全是图片）看图答上的 'B' 被写进缓存，换一份作业同题干再问时会
+    # 拿到这条旧答案却看不到图。字体反爬的题同理（题干是乱码，语义不可靠）。
     fresh = {t['no']: t for t in todo
              if ans.get(t['no']) not in (None, '?', '')
-             and _stem_key(t.get('stem'))}
+             and _stem_key(t.get('stem'))
+             and not t.get('shot') and not t.get('scrambled')}
     if fresh:
         for t in fresh.values():
             cache[_stem_key(t.get('stem'))] = ans[t['no']]
@@ -4649,6 +4890,186 @@ def llm_solve(cfg, timus, progress):
 
 
 _GRADED_TEXT_MARKS = ('本次成绩', '重新测试')
+
+
+# 已批阅页里「正确答案」的提取。真机（2026-10-17，大学物理 1.2）实测结构：
+#   选择题： <span>正确答案： B </span>                  （选项本身是图片时唯一可靠来源）
+#   填空题： <p class="font14">正确答案：</p> 之后紧跟
+#            <p class="font14">第一空： 8</p>（多空就多行）
+# 平台的答案本来就是标准答案，比让模型猜准得多 —— 拿它回灌本地缓存，
+# 下次同题干直接命中，既省模型钱又几乎不会错。
+JS_GRADED_ANSWERS = r"""
+() => {
+  const lis = [...document.querySelectorAll('.questionLi')];
+  const tms = [...document.querySelectorAll('.TiMu')];
+  const boxes = (lis.length && tms.length <= 1) ? lis : tms;
+  const out = [];
+  boxes.forEach((li, idx) => {
+    let right = '';
+    // ① 单行写法：正确答案： X    （真机上这一行常常和「我的答案：」挤在同一个
+    //    span 里，如「正确答案： B 我的答案：」——所以取到后要在「我的答案」处截断）
+    for (const e of li.querySelectorAll('span,p,div,i,b')) {
+      const t = (e.innerText || '').replace(/\s+/g, ' ').trim();
+      if (!/^正确答案\s*[:：]/.test(t) || e.children.length > 3) continue;
+      right = t.replace(/^正确答案\s*[:：]\s*/, '')
+               .split(/我的答案|得分\s*[:：]|\s:\s*;/)[0].trim();
+      if (right) break;
+    }
+    // ② 分空写法：「正确答案：」后面跟着一串「第N空： xxx」
+    if (!right) {
+      const blanks = [];
+      let started = false;
+      for (const e of li.querySelectorAll('p,span,div')) {
+        const t = (e.innerText || '').replace(/\s+/g, ' ').trim();
+        if (!t || t.length > 200) continue;
+        if (/^正确答案\s*[:：]\s*$/.test(t)) { started = true; continue; }
+        if (started && /^第[一二三四五六七八九十\d]+空\s*[:：]/.test(t)) {
+          blanks.push(t.replace(/^第[一二三四五六七八九十\d]+空\s*[:：]\s*/, '').trim());
+          continue;
+        }
+        if (started && /^我的答案/.test(t)) break;
+      }
+      if (blanks.length) right = blanks.join('|');
+    }
+    // ③ i[aria-label] 写法（判断题）：我的答案：<i aria-label="错">错</i>
+    //    正确答案同构时也用这个
+    if (!right) {
+      const i = li.querySelector('.Py_answer i[aria-label], i.font14[aria-label]');
+      const t = (li.innerText || '');
+      if (i && /正确答案/.test(t)) {
+        const seg = t.slice(t.indexOf('正确答案'));
+        const m = seg.match(/正确答案\s*[:：]\s*([^\s]{1,20})/);
+        if (m) right = m[1].trim();
+      }
+    }
+    out.push({no: idx + 1, right: right,
+              mine: ((li.innerText || '').match(/我的答案\s*[:：]\s*([^\n]{0,80})/) || [])[1] || ''});
+  });
+  return out;
+}
+"""
+
+
+def _graded_answers(frame):
+    """从「已批阅」页读出平台的正确答案：[{no, right, mine}]；读不到返回 []。
+
+    读不到不算错：平台改版、题不是标准题型都可能读空。调用方按「没读到就
+    照旧走模型」处理，绝不因为这里失败而影响答题主流程。
+    """
+    try:
+        got = frame.evaluate(JS_GRADED_ANSWERS) or []
+    except Exception:
+        return []
+    out = []
+    for g in got:
+        try:
+            out.append({'no': int(g.get('no')), 'right': (g.get('right') or '').strip(),
+                        'mine': (g.get('mine') or '').strip()})
+        except Exception:
+            continue
+    return out
+
+
+def _harvest_graded(hw, log, progress):
+    """已批阅的作业：把平台的正确答案读下来回灌本地缓存（v6.22）。
+
+    为什么值得做：这次用户反馈的「答案填错」里，平台其实已经把正确答案写在
+    批阅页上（「正确答案： B」「第一空： 8」）。工具以前看到 `already` 就
+    直接返回，把这份现成的标准答案白白放掉了——下次遇到同一章重做/同一份
+    作业，还得再让模型猜一次，猜错就又是 0 分。
+
+    只做只读提取 + 本地缓存写入：不点按钮、不交卷、不改平台任何状态。
+    失败一律静默（平台改版读不到就算了），绝不影响答题主流程。
+    """
+    try:
+        graded = _graded_answers(hw)
+    except Exception:
+        return 0
+    if not graded:
+        return 0
+    # 题干：能解析到就用解析出的（已剥过题号前缀，与答题页口径一致）；
+    # 解析不到就退回批阅页自己那份 DOM，同样走 _stem_key 归一。
+    stem_map = {}
+    try:
+        timus = _poll(hw, JS_PARSE_TIMUS, lambda v: bool(v), 8000, 400) or []
+    except Exception:
+        timus = []
+    for t in timus:
+        # 字体反爬的题干是乱码，写进缓存只会污染
+        if t.get('scrambled'):
+            continue
+        stem_map[t['no']] = t.get('stem') or ''
+    if not stem_map:
+        try:
+            rows = hw.evaluate(r"""() => {
+              const lis = [...document.querySelectorAll('.questionLi')];
+              const tms = [...document.querySelectorAll('.TiMu')];
+              const boxes = (lis.length && tms.length <= 1) ? lis : tms;
+              return boxes.map((li, i) => ({no: i + 1,
+                stem: ((li.querySelector('.Zy_TItle') || {}).textContent || '')}));
+            }""") or []
+            for r in rows:
+                stem_map[int(r['no'])] = r.get('stem') or ''
+        except Exception:
+            return 0
+    try:
+        return _cache_graded(stem_map, graded, progress)
+    except Exception:
+        return 0
+
+
+def _strip_blank_prefix(s):
+    """剥掉平台批阅页答案里的「第一空：」前缀，多空用 | 串起来。
+
+    真机实测（2026-10-17，1.2 第 2 题）：批阅页写的是「第一空： 8」，
+    原样写进输入框就是错的——空里只能有「8」。多空题会拿到
+    「第一空： a|第二空： b」，逐空剥完再用 | 连接，正好对上 _split_fill。
+    """
+    s = (s or '').strip()
+    if not s:
+        return ''
+    # 多空先处理：按 | 切开逐段剥（不能先走单空那条——「第[一..]空：」的正则
+    # 会把后面的「|第二空： b」整段吞进捕获组）
+    if '|' in s:
+        parts = []
+        for p in s.split('|'):
+            p = re.sub(r'^\s*第[一二三四五六七八九十\d]+空\s*[:：]\s*', '', p)
+            parts.append(p.strip())
+        return '|'.join(parts)
+    # 单空：整串就是一个「第N空： 值」
+    m = re.fullmatch(r'第[一二三四五六七八九十\d]+空\s*[:：]\s*(.*)', s, re.S)
+    if m:
+        return m.group(1).strip()
+    return s
+
+
+def _cache_graded(stem_map, graded, progress):
+    """把已批阅页的正确答案写回本地答案缓存（按题干归一后的哈希）。
+
+    stem_map: {题号: 题干}。只写**读得到题干且答案非空**的题。
+    返回写入条数。字体反爬的题干是乱码，写进去只会污染缓存——调用方
+    传进来的 stem_map 已把这类题滤掉。
+    """
+    if not graded or not stem_map:
+        return 0
+    cache = _answer_cache_load()
+    n = 0
+    for g in graded:
+        stem = stem_map.get(g['no'])
+        right = _strip_blank_prefix(g.get('right') or '')
+        if not stem or not right or right in ('?', '无'):
+            continue
+        k = _stem_key(stem)
+        if not k:
+            continue
+        if cache.get(k) != right:
+            cache[k] = right
+            n += 1
+    if n:
+        _answer_cache_save(cache)
+        progress('    已把平台给的 %d 条正确答案回灌本地缓存（下次同题直接命中）。'
+                 % n)
+    return n
 
 
 def _looks_graded(frame):
@@ -4670,7 +5091,120 @@ def _looks_graded(frame):
     return any(m in txt for m in _GRADED_TEXT_MARKS)
 
 
-def _wait_hw_iframe(page, url, log):
+def _cards_url(c, cpi, kid, num=0):
+    """章节卡片页地址。num 见 CARDS_URL 上方注释（选项卡序号）。"""
+    return CARDS_URL.format(clsid=c['clsid'], cid=c['cid'], kid=kid,
+                            num=num, cpi=cpi)
+
+
+JS_CARDS_TABS = r"""
+() => {
+  // 两条路子，任一命中即可：
+  //  A. cards 页当着 iframe 挂在学生页里时，选项卡那一排在外层 #prev_tab
+  //     （每格 li: id=dct{N}、title=中文名、onclick=changeDisplayContent(N,…)，
+  //      N 从 1 起，对应 URL 的 num=N-1）。
+  //  B. cards 页被**直接当顶层打开**时（工具一直这么干），外层根本没有
+  //     prev_tab，但本页的 AttachmentSetting 会带一个 cardid——**选项卡越界
+  //     时 AttachmentSetting 整个不存在**（真机实测：1.7 只有 num=0 有，
+  //     num=1/2 都没了）。所以「有没有 cardid」就是「这一格存不存在」。
+  const grab = doc => {
+    try {
+      const pt = doc && doc.getElementById('prev_tab');
+      if (!pt) return null;
+      const lis = [...pt.querySelectorAll('li')];
+      if (!lis.length) return null;
+      return lis.map((li, i) => {
+        let num = i;
+        const oc = li.getAttribute('onclick') || '';
+        const m = oc.match(/changeDisplayContent\(\s*(\d+)/);
+        if (m) num = parseInt(m[1], 10) - 1;
+        return {num: num,
+                title: (li.getAttribute('title') || '').trim(),
+                text: (li.innerText || '').replace(/\s+/g, ' ').trim()};
+      });
+    } catch (e) { return null; }
+  };
+  let r = null;
+  try { r = grab(window.parent.document); } catch (e) {}
+  if (!r) { try { r = grab(window.top.document); } catch (e) {} }
+  if (!r) { try { r = grab(document); } catch (e) {} }
+  if (r && r.length) return r;
+  // ---- B：只有 cardid，没有选项卡名字 ----
+  try {
+    const S = (typeof AttachmentSetting !== 'undefined') ? AttachmentSetting : null;
+    if (S && S.defaults && S.defaults.cardid) {
+      const n = parseInt(location.search.match(/[?&]num=(\d+)/)?.[1] || '0', 10);
+      return [{num: n, title: '', text: ''}];
+    }
+  } catch (e) {}
+  return [];
+}
+"""
+
+# 这一格选项卡是否真实存在（越界的 num 在平台上压根没有）。
+# 判据：AttachmentSetting 有没有带 cardid —— 比「连续两格空」准得多，
+# 也不会因为某格恰好没作业就误判成到头了。
+JS_TAB_EXISTS = r"""
+() => {
+  try {
+    const S = (typeof AttachmentSetting !== 'undefined') ? AttachmentSetting : null;
+    return !!(S && S.defaults && S.defaults.cardid);
+  } catch (e) { return true; }   // 取不到就当存在，宁可多扫一格
+}
+"""
+
+# 选项卡名字里可能出现的「放作业」关键词。用来决定先扫哪一格——纯优化，
+# 取不到标题时退回 0,1,2… 顺序扫，结果一样。
+_TAB_WORK_WORDS = ('测试', '测验', '作业', '练习', '考试', '任务')
+
+
+def _cards_tabs(page):
+    """本节点到底有几张选项卡、各叫什么；拿不到返回 []。
+
+    真机（2026-10-17，大学物理 1.1）实测：3 格 —— 视频与讲义(num=0) /
+    讨论(num=1) / 测试(num=2)，**章节测验在第 3 格**。以前 num 写死 0，
+    所以只在第一格里找作业卡，测验几乎永远找不到。
+    """
+    try:
+        tabs = page.evaluate(JS_CARDS_TABS) or []
+    except Exception:
+        return []
+    out = []
+    for t in tabs:
+        try:
+            out.append({'num': int(t.get('num')), 'title': t.get('title') or '',
+                        'text': t.get('text') or ''})
+        except Exception:
+            continue
+    return out
+
+
+def _tab_order(tabs, have_first=True):
+    """扫选项卡的顺序：放作业的那几格排前面，其余按序号。
+
+    这一步只是省时间（一格里平均要等 6 秒才判「没有作业壳」）。顺序错了
+    也不影响正确性——最终会把所有格都扫到。名字拿不到时（顶层打开 cards
+    页那种情况）就是 0,1,2,…，照样能扫到。
+    """
+    nums = [t['num'] for t in tabs]
+    if not nums:
+        return list(range(MAX_CARDS_TABS))
+    head = [t['num'] for t in tabs
+            if any(w in (t['title'] + t['text']) for w in _TAB_WORK_WORDS)]
+    rest = [n for n in sorted(nums) if n not in head]
+    order = head + rest
+    if have_first and 0 in order:
+        # 0 号（视频与讲义）本来就要打开，排最后能省一次；不过刷课那边已经
+        # 在 num=0 上了，这里照顺序无所谓，保持稳定即可。
+        pass
+    # 再补上未知的后续格（标题拿不到时也靠它兜底）
+    for n in range(MAX_CARDS_TABS):
+        if n not in order:
+            order.append(n)
+    return order
+
+
+def _wait_hw_iframe(page, url, log, tabs=None):
     """打开 cards 页等 doHomeWorkNew 内层 iframe。
 
     作业卡结构是两跳异步重定向：壳(ananas/modules/work) →
@@ -4682,7 +5216,62 @@ def _wait_hw_iframe(page, url, log):
          最终答题页地址（请求层不受骰子影响），直接塞给壳内 iframe
          强制加载；
       ③ 仍不出 → 重开一次 cards，再走一遍。
-    返回 (hw | None, note)。
+
+    tabs：要扫的选项卡序号（num）。默认 None = 只扫 0（向后兼容旧调用）。
+      给 None 之外的值时按顺序扫，**找到作业卡就停**；扫到连续两格空
+      （或到 MAX_CARDS_TABS / 已知选项卡数）就收工。返回的 note 里会带
+      '|tab=N' 后缀，调用方据此知道这次是在哪个选项卡找到的。
+    返回 (hw | None, note)。note ∈ ''|'already'|'nocard'|'norender'|'failed'
+        （扫全部选项卡时可能附 '|tab=N'）。
+    """
+    # 单选项卡 = 老行为（num 已在 url 里写死），保持逐字节等价
+    nums = [None] if tabs is None else list(tabs)
+    last_note = 'nocard'
+    for num in nums:
+        u = url
+        if num is not None:
+            if '{num}' in url:
+                u = url.replace('{num}', str(num))
+            elif 'num=' in url:
+                u = re.sub(r'num=\d+', 'num=%d' % num, url)
+            else:
+                u = url + ('&' if '?' in url else '?') + 'num=%d' % num
+        hw, note = _wait_hw_iframe_one(page, u, log)
+        if hw is not None:
+            return hw, note if num is None else '%s|tab=%d' % (note, num)
+        if note == 'oob':
+            # 这一格**压根不存在**（AttachmentSetting 都没了）。选项卡是连续
+            # 编号的，越界就说明到头了 —— 这是唯一可靠的收工信号：
+            # 1.7 只有 1 格、1.1 有 3 格，而「某格没作业」跟「这格不存在」
+            # 长得一模一样，靠数空格子会误判（v6.21 真机踩过：1.1 的测验在
+            # 第 3 格，被「连空两格」提前截断，白漏）。
+            break
+        last_note = note
+        if num is None:
+            break
+        if note == 'failed':
+            break
+        # 有作业卡但渲染失败 / 这格没作业 → 都继续看下一格，别在这一格死磕
+    return None, last_note
+
+
+def _tab_exists(page, timeout_ms=1500):
+    """这一格选项卡是否真实存在（见 JS_TAB_EXISTS）。"""
+    try:
+        page.wait_for_function("() => (typeof AttachmentSetting !== 'undefined')",
+                               timeout=timeout_ms)
+    except Exception:
+        pass
+    try:
+        return bool(page.evaluate(JS_TAB_EXISTS))
+    except Exception:
+        return True      # 判不了就当存在，宁可多扫一格
+
+
+def _wait_hw_iframe_one(page, url, log):
+    """单个选项卡里等 doHomeWorkNew（_wait_hw_iframe 的内层实现）。
+
+    多返回一种 note='oob'（out of bounds）：这个 num 在平台上不存在。
     """
     for attempt in (1, 2):
         try:
@@ -4693,6 +5282,10 @@ def _wait_hw_iframe(page, url, log):
         deadline = time.time() + 25
         shell_dl = time.time() + 6
         forced = False
+        # 第一次进 loop 就先看这格在不在（约 1 秒），不存在就立刻收工，
+        # 不用白白等满 6 秒的「连壳都没有」判定。
+        if not _tab_exists(page):
+            return None, 'oob'
         while time.time() < deadline:
             hw = next((f for f in page.frames
                        if 'doHomeWorkNew' in (f.url or '')), None)
@@ -4812,6 +5405,40 @@ def _submit_ok(resp_seen):
 _POS_LETTERS = 'ABCDEFG'
 
 
+def _by_display_letter(t, vals):
+    """按选项**显示字母**定位，返回 (names, 该选项的 value 列表)；失败 (set(), None)。
+
+    为什么必须有这一层（真机 2026-10-17，大学物理 1.8 单元测试，15 题）：
+    平台开了 `randomOptions=true`，渲染时把选项**顺序打乱**，页面上仍从 A 起
+    按显示位置标字母，但 radio 的 `value` 是打乱前的原始字母。实测 Q2：
+        显示 A → value=C   显示 B → value=D
+        显示 C → value=B   显示 D → value=A
+    模型看截图（或被题面文字带着）答的永远是**显示字母**。旧代码按 value
+    匹配 → 答 C 实际点到「显示 B」那个选项 → 平台记 B。
+    用户原话「大模型返回的答案是对的，但是还是填错位置」；批阅页 7 道错题里
+    6 道的「我的答案」与按 value 点出来的结果完全一致，确认无疑。
+
+    与 `_fallback_by_position` 的分工：那个是**位置**语义（第 N 个选项），
+    这个是**显示字母**语义（A/B/C/D 标在第几个上）。平台打乱顺序时两者
+    恰好等价，但显式读显示字母更稳——将来平台改标法（比如只标数字）也不怕。
+    """
+    opts = t.get('opts') or []
+    if not opts:
+        return set(), None
+    out_names, out_vals = set(), []
+    for ch in vals:
+        want = str(ch).strip().upper()
+        o = next((x for x in opts if str(x.get('dl') or '').upper() == want), None)
+        if o is None:
+            i = _POS_LETTERS.find(want)          # 没标字母就按位置兜
+            o = opts[i] if 0 <= i < len(opts) else None
+        if o is None or not o.get('name') or not o.get('val'):
+            return set(), None
+        out_names.add(o['name'])
+        out_vals.append(o['val'])
+    return out_names, out_vals or None
+
+
 def _fallback_by_position(t, vals):
     """按选项**位置**把字母答案映射到选项，返回 (names, vals)；失败 (set(), None)。
 
@@ -4902,17 +5529,53 @@ def answer_one(page, c, cpi, kid, cfg, submit, progress, pre=None, detail=None,
     """
     from urllib.parse import urlencode  # noqa: F401  (仅说明用)
     direct = bool(url)          # True = 作业列表直链（新版 dowork 页）
-    if not direct:
-        url = CARDS_URL.format(clsid=c['clsid'], cid=c['cid'], kid=kid, cpi=cpi)
-    hw, note = (_open_work_page(page, url, log) if direct
-                else _wait_hw_iframe(page, url, log))
+    tab_hit = None              # 作业卡是在哪一格选项卡里找到的
+    if direct:
+        hw, note = _open_work_page(page, url, log)
+    else:
+        # 章节页有好几格选项卡（视频与讲义 / 讨论 / 测试…），测验/作业卡
+        # **不一定在第一格**。先打开 num=0 读出选项卡列表，再按「像放作业
+        # 的排前面」的顺序逐格找；全都没有才算这个节点没作业。
+        url = _cards_url(c, cpi, kid, 0)
+        try:
+            page.goto(url, wait_until='domcontentloaded')
+            page.wait_for_timeout(1200)
+            tabs = _cards_tabs(page)
+        except Exception:
+            tabs = []
+        order = _tab_order(tabs) if tabs else list(range(MAX_CARDS_TABS))
+        if tabs and len(tabs) > 1:
+            log('    本章有 %d 个选项卡（%s），逐个找作业卡…'
+                % (len(tabs),
+                   ' / '.join('%d.%s' % (t['num'], t['title'] or '?')
+                              for t in tabs)))
+        hw, note = _wait_hw_iframe(page, url, log, tabs=order)
+        m = re.search(r'\|tab=(\d+)$', note or '')
+        if m:
+            tab_hit = int(m.group(1))
+            note = note[:m.start()]
+            if tab_hit:
+                log('    作业卡在第 %d 格选项卡（num=%d）里。'
+                    % (tab_hit + 1, tab_hit))
     if note == 'already':
         log('    平台显示这份作业已批阅（此前已交过），无需再答再交。')
+        _harvest_graded(hw, log, progress)
         return 'already'
     if hw is None:
         if note == 'norender':
             log('    作业卡两次都没渲染出答题页。', 'warn')
             return 'norender'
+        # 以前这里一声不吭就 return，日志只有「节点 N/M」两行、汇总是
+        # 「交卷 0」，用户看不出是「这节点本来就没作业」还是「工具没找到」。
+        # 现在把看到的选项卡如实报出来（v6.21）。
+        if not direct:
+            if tabs and len(tabs) > 1:
+                log('    这个节点的 %d 个选项卡里都没有作业/测验卡（%s），'
+                    '跳过。' % (len(tabs),
+                                ' / '.join(t['title'] or ('第%d格' % (t['num'] + 1))
+                                           for t in tabs)))
+            else:
+                log('    这个节点没有作业/测验卡，跳过。')
         return 'nohw'                        # 视频/文档卡，答题模块不碰
     # 开卷先「读题」停留：开卷几秒内做完交卷是老师端和风控端都看得见的
     # 时序特征，停留时长随机、与题数无关地拉开
@@ -5042,24 +5705,49 @@ def answer_one(page, c, cpi, kid, cfg, submit, progress, pre=None, detail=None,
                 vals = ['true' if a == '对' else 'false']
         else:
             vals = list(a)                   # 多选 "AC" → ['A','C']
-        # div 选区变体（type=divradio）：显示字母与真实值错位，按值匹配
-        # 会把模型按截图答的显示字母对到错误选项上，只走位置映射
-        names = {o['name'] for o in t['opts']
-                 if o['val'] in vals and o.get('type') != 'divradio'}
-        if not names:
-            # 先试大小写归一（有的页面 value 是小写字母），再按位置兜底
-            up = [str(v).upper() for v in vals]
-            names = {o['name'] for o in t['opts']
-                     if str(o.get('val', '')).upper() in up
-                     and o.get('type') != 'divradio'}
-        pos_vals = None
-        if not names:
+        # ⚠ 落答顺序（v6.23 起重排）：**显示字母优先**，其次按值，最后按位置。
+        #   为什么显示字母排第一（真机 2026-10-17，大学物理 1.8）：
+        #   平台随机打乱选项顺序后，页面上仍按显示位置标 A/B/C/D，而 radio 的
+        #   value 是**打乱前**的原始字母（实测 Q2：显示 A=value C、显示 C=value B）。
+        #   模型答的是它看到的显示字母，按 value 匹配就会点到别的选项 →
+        #   用户看到的「答案对、位置错」。批阅页 7 道错题 6 道与错位吻合。
+        #   判断题没有字母标号（对/错），继续走位置语义，所以排除 atype=='3'。
+        names, pos_vals = set(), None
+        if t['atype'] == '3':
             names, pos_vals = _fallback_by_position(t, vals)
+        else:
+            names, pos_vals = _by_display_letter(t, vals)
             if names:
-                peek = ' / '.join(str(o.get('val', ''))[:14]
-                                  for o in (t['opts'][:4]))
-                log('    第 %d 题选项值不是字母（%s），已按选项位置落答。'
-                    % (t['no'], peek), 'info')
+                # 打乱过的页面：选中的选项「显示字母 ≠ 真实 value」。
+                # 如实说一句，用户/排查时一眼就能确认这层在起作用。
+                swapped = ['%s→%s' % (str(o.get('dl') or '?'),
+                                      str(o.get('val')))
+                           for o in t['opts']
+                           if str(o.get('dl') or '') != str(o.get('val'))
+                           and str(o.get('dl') or '').upper()
+                           in {str(v).upper() for v in vals}]
+                if swapped:
+                    log('    第 %d 题选项顺序被平台打乱过，已按页面显示字母落答'
+                        '（%s）。' % (t['no'], '、'.join(swapped[:4])), 'info')
+        if not names:
+            # 显示字母对不上（页面没标字母 / 标的是数字）→ 退回按 value 匹配，
+            # 再退回按位置。两条老路都保留，老页面行为不变。
+            names = {o['name'] for o in t['opts']
+                     if o['val'] in vals and o.get('type') != 'divradio'}
+            if not names:
+                # 大小写归一（有的页面 value 是小写字母）
+                up = [str(v).upper() for v in vals]
+                names = {o['name'] for o in t['opts']
+                         if str(o.get('val', '')).upper() in up
+                         and o.get('type') != 'divradio'}
+            pos_vals = None
+            if not names:
+                names, pos_vals = _fallback_by_position(t, vals)
+                if names:
+                    peek = ' / '.join(str(o.get('val', ''))[:14]
+                                      for o in (t['opts'][:4]))
+                    log('    第 %d 题选项值不是字母（%s），已按选项位置落答。'
+                        % (t['no'], peek), 'info')
         if not names:
             peek = ('%d 个选项' % len(t['opts'])) if t['opts'] \
                 else '页面里解析到 0 个选项'
@@ -5125,7 +5813,6 @@ def answer_one(page, c, cpi, kid, cfg, submit, progress, pre=None, detail=None,
 
     txt_miss = 0
     op_miss = 0
-    saved_last = False
     for bi, batch in enumerate(batches):
         op = _strip([f for f in batch if 'vals' in f])
         tx = _strip([f for f in batch if 'val' in f])
@@ -5141,15 +5828,45 @@ def answer_one(page, c, cpi, kid, cfg, submit, progress, pre=None, detail=None,
             txt_miss += int(r.get('miss') or 0)
             log('    已填 %d 道主观题（未命中 %d）。'
                 % (r.get('ok', 0), r.get('miss', 0)))
-        last = (bi + 1) >= len(batches)
-        # 还有下一批、或本来就是暂存模式、或已知有题答不上 → 落一次库。
-        # 只有「最后一批 + 要交卷 + 没缺题」才省掉这一次：提交马上就到，
-        # 多存一次纯属白多一个请求。
-        saved_last = False
-        if (not last) or (not submit) or bool(missing):
-            saved_last = _save_draft()
-        if not last:
+        if bi + 1 < len(batches):
             time.sleep(random.uniform(0.8, 2.2))
+    # ---- 填完回读：确认点中的选项**真的还在页面上**（v6.23）----
+    # 平台任何一次 `location.reload()` 都会把没落库的点选静默冲掉，而
+    # `JS_FILL_ANSWERS` 的返回值只代表「点那一下点到了」。不自己回读一遍，
+    # 「填了 15 道、交上去只剩 8 道」这种事在日志里完全看不出来（真机踩过）。
+    want = {}
+    for f in order:
+        if 'vals' in f:
+            want.setdefault(f['name'], set()).update(
+                str(v) for v in (f.get('vals') or []))
+    if want:
+        try:
+            got = hw.evaluate(JS_READ_CHECKED)
+        except Exception:
+            got = None
+        # 读不到（页面结构不认识 / frame 已分离）就**不做判断**：宁可漏报，
+        # 也不能因为一次读失败就谎称「答案全丢了」把整份判成没答上。
+        # JS 侧用 null 表示「读不了」，{} 表示「读了，一道都没勾」——两者语义
+        # 完全不同，这里不能混。
+        if isinstance(got, dict):
+            lost = [nm for nm, vs in want.items()
+                    if not vs.issubset({str(x) for x in (got.get(nm) or [])})]
+            if lost:
+                op_miss += len(lost)
+                log('    ⚠ 有 %d 个选项点完又丢了（页面被平台重载过），'
+                    '这些题交上去会是空。' % len(lost), 'warn')
+    # ⚠ 暂存**只能放在所有批次填完之后**（v6.23 修正）。
+    #   根因（真机 2026-10-17，大学物理 1.8 单元测试，15 题全对却只落下几道）：
+    #   平台 saveWork() 成功后自己会 `window.location.reload()`（源码里明写着，
+    #   探针实测拦不住 Location 上的 reload）。旧代码每填完一批就暂存一次，
+    #   于是「填 → 存 → 整页重载 → 后面批次刚点上的选项全被冲掉」：
+    #   日志里三次「已填 5 个选项（未命中 0）」都在，最后交上去的却只剩
+    #   几道——用户看到的就是「最后两个甚至没填上」。
+    #   「做几道存几道」的本意是「别因为没交卷就全白做」，一次收尾暂存同样
+    #   满足；而中途暂存反而会**亲手毁掉**还没落库的那部分。
+    saved_last = False
+    if (not submit) or bool(missing) or txt_miss or op_miss:
+        saved_last = _save_draft()
     # 主观题没真正写进编辑器（UE 未就绪等）＝平台会收到空答案。
     # 这是「误交卷」级别的事故，宁可不交也不能悄悄交白卷（实测踩过）。
     if txt_miss or missing or op_miss:
@@ -5512,8 +6229,7 @@ def answer_courses(cfg, only, submit=False, progress=None, control=None,
                         'key': course_key(c), 'kid': node['kid'],
                         'course': c['name'],
                         'node': node.get('name') or ('节点 %d' % j),
-                        'url': CARDS_URL.format(clsid=c['clsid'], cid=c['cid'],
-                                                kid=node['kid'], cpi=cpi),
+                        'url': _cards_url(c, cpi, node['kid']),
                         'answers': det.get('answers', {}) if det else {},
                         'stems': det.get('stems', {}) if det else {},
                         'total': det.get('total', 0) if det else 0,
@@ -5531,8 +6247,7 @@ def answer_courses(cfg, only, submit=False, progress=None, control=None,
                         'key': course_key(c), 'kid': node['kid'],
                         'course': c['name'],
                         'node': node.get('name') or ('节点 %d' % j),
-                        'url': CARDS_URL.format(clsid=c['clsid'], cid=c['cid'],
-                                                kid=node['kid'], cpi=cpi),
+                        'url': _cards_url(c, cpi, node['kid']),
                         'answers': {}, 'stems': {}, 'total': 0, 'miss': [],
                         'status': {'submitted': 'done', 'already': 'already',
                                    'unverified': 'unverified'}.get(r, r),
@@ -5547,8 +6262,7 @@ def answer_courses(cfg, only, submit=False, progress=None, control=None,
                         'key': course_key(c), 'kid': node['kid'],
                         'course': c['name'],
                         'node': node.get('name') or ('节点 %d' % j),
-                        'url': CARDS_URL.format(clsid=c['clsid'], cid=c['cid'],
-                                                kid=node['kid'], cpi=cpi),
+                        'url': _cards_url(c, cpi, node['kid']),
                         'answers': {}, 'stems': {}, 'total': 0, 'miss': [],
                         'status': {'ok': 'ok', 'partial': 'partial',
                                    'already': 'already'}.get(r, r),
@@ -5833,9 +6547,18 @@ def verify_items(cfg, items, progress=None, control=None, headless=None) -> dict
                 progress('  【%d/%d】核实：%s · %s'
                          % (i, len(pending), cut(c['name'], 18),
                             cut(it.get('node', ''), 28)))
+                # 核实也要扫全部选项卡：交上去的那份测验可能不在第一格
+                rurl = _cards_url(c, cpi, it.get('kid'), 0)
+                try:
+                    page.goto(rurl, wait_until='domcontentloaded')
+                    page.wait_for_timeout(900)
+                    rtabs = _cards_tabs(page)
+                except Exception:
+                    rtabs = []
                 _, note = _wait_hw_iframe(
-                    page, CARDS_URL.format(clsid=c['clsid'], cid=c['cid'],
-                                           kid=it.get('kid'), cpi=cpi), log)
+                    page, rurl, log,
+                    tabs=(_tab_order(rtabs) if rtabs
+                          else list(range(MAX_CARDS_TABS))))
                 if note == 'already':
                     progress('  ✓ 平台显示已批阅——这份确实交上了。')
                     st[(it.get('key'), it.get('kid'))] = 'already'
@@ -5874,30 +6597,95 @@ def verify_items(cfg, items, progress=None, control=None, headless=None) -> dict
     return out
 
 
+def _scan_leftover_tasks(page):
+    """扫当前 cards 页里「刷课刷不动的非视频任务点」。
+
+    一个章节节点是一叠 `.ans-attach-ct`：带 `.ans-job-icon` 的才是任务点，
+    完成态看该图标的 aria-label（含「已完成」）或卡片 class 含 ans-job-finished。
+    刷课只负责视频；这里把刷完后**仍未完成**的非视频任务点按种类计数返回，
+    好在日志里把「刷完视频为啥节点还显示未完成」说清楚（v6.19）。
+    返回 {'测验/作业': n, '文档': n} 之类；空 dict = 没有残留。失败也返回 {}。
+    """
+    try:
+        return page.main_frame.evaluate(JS_LEFTOVER_TASKS) or {}
+    except Exception:
+        return {}
+
+
+JS_LEFTOVER_TASKS = r"""
+() => {
+  const out = {};
+  document.querySelectorAll('.ans-attach-ct').forEach(ct => {
+    const job = ct.querySelector('.ans-job-icon');
+    if (!job) return;                                  // 非任务点卡，不算账
+    const lbl = job.getAttribute('aria-label') || '';
+    const cls = (ct.className || '').toString();
+    if (/已完成/.test(lbl) || /ans-job-finished/.test(cls)) return;  // 已完成
+    const ifr = ct.querySelector('iframe');
+    const src = ifr ? (ifr.src || '') : '';
+    // 视频是刷课自己的活（刷不动有 fail 计数兜底），不算「残余」——
+    // 且本函数紧跟在刷完视频之后跑，页面 DOM 未必已刷新成「已完成」，
+    // 数它会把刚刷的视频误报成「刷课管不了」。只数非视频任务点。
+    if (/modules\/video/.test(src)) return;
+    let kind = '其他任务点';
+    if (/modules\/work/.test(src)) kind = '测验/作业';
+    else if (/modules\/pdf|insertdoc|modules\/doc/.test(src)) kind = '文档';
+    else if (/modules\/audio/.test(src)) kind = '音频';
+    out[kind] = (out[kind] || 0) + 1;
+  });
+  return out;
+}
+"""
+
+
 def brush_node(page, c, cpi, kid, cfg, progress, control):
-    """刷一个章节节点里的全部视频卡。返回 (完成数, 未完成数, 是否被停止)"""
-    url = CARDS_URL.format(clsid=c['clsid'], cid=c['cid'], kid=kid, cpi=cpi)
+    """刷一个章节节点里**未完成**的视频卡；再扫出本节点残余的非视频任务点。
+
+    返回 (完成数, 未完成数, 是否被停止, leftover)：
+      leftover = 本节点刷完后仍「未完成」的非视频任务点种类计数，
+                 形如 {'测验/作业': 2, '文档': 1}（空 dict = 没有残留）。
+                 刷课只负责视频；测验/文档要用户自己用「刷课+刷题」或手动完成。
+                 在日志里如实回报，免得用户以为工具坏了、反复重跑（v6.19）。
+    """
+    # 视频也**不一定在 num=0**：章节页是「视频与讲义 / 讨论 / 测试」多格
+    # 选项卡，实测有的节点视频挂在后面几格。先读出选项卡列表，按顺序逐格
+    # 刷；每格都是「扫不到新视频卡」才换下一格。
+    url = _cards_url(c, cpi, kid, 0)
     try:
         page.goto(url, wait_until='domcontentloaded')
     except Exception as e:
         log('    打开章节页失败：%s' % str(e)[:80], 'warn')
-        return 0, 1, False
+        return 0, 1, False, {}
+    try:
+        page.wait_for_timeout(1200)
+        _tabs = _cards_tabs(page)
+    except Exception:
+        _tabs = []
+    # 顶层打开 cards 页时只能看到「当前这一格」（外层 prev_tab 不在），
+    # 所以数量不能只用来决定扫几格——视频可能在任何一格，一直往后扫，
+    # 遇到不存在的格（AttachmentSetting 没了）就停。
+    _nums = [0] + [t['num'] for t in _tabs if t['num'] != 0]
+    _nums += [n for n in range(MAX_CARDS_TABS) if n not in _nums]
+    if len(_tabs) > 1:
+        log('    本章有 %d 个选项卡（%s），逐格找视频卡…'
+            % (len(_tabs),
+               ' / '.join('%d.%s' % (t['num'], t['title'] or '?') for t in _tabs)))
     done = fail = 0
-    # 一个节点挂好几张卡（视频/文档/测验混排），视频卡是懒加载的：
-    # 刷完一张再扫一遍 frame，扫不到新的才算这个节点完事
-    for _ in range(12):
-        vf = None
-        for f in page.frames:
-            if 'modules/video' not in (f.url or ''):
-                continue
+    leftover = {}
+    for _num in _nums:
+        if _num != 0:
             try:
-                if f.evaluate(JS_VIDEO_CLAIM):
-                    vf = f
-                    break
+                page.goto(_cards_url(c, cpi, kid, _num),
+                          wait_until='domcontentloaded')
+                page.wait_for_timeout(400)
             except Exception:
                 continue
-        if vf is None:
-            time.sleep(2)
+            if not _tab_exists(page):
+                break          # 这一格不存在 → 选项卡到头了
+        # 一个节点挂好几张卡（视频/文档/测验混排），视频卡是懒加载的：
+        # 刷完一张再扫一遍 frame，扫不到新的才算这一格完事
+        for _ in range(12):
+            vf = None
             for f in page.frames:
                 if 'modules/video' not in (f.url or ''):
                     continue
@@ -5907,39 +6695,72 @@ def brush_node(page, c, cpi, kid, cfg, progress, control):
                         break
                 except Exception:
                     continue
-        if vf is None:
-            break
-        try:
-            vf.evaluate("() => { window.__cx_brushed = true; }")
-        except Exception:
-            pass
-        r = brush_video_frame(vf, cfg, progress, control)
-        # 卡住/超时后原地重试（网络抖动、临时卡顿最常见）：同一个页面还在，
-        # 清掉防重刷标记重跑一遍即可，不用重新导航（重新导航会把已完成的
-        # 视频卡也重播一遍，浪费时间还重复心跳）
-        retries = max(int(cfg.get('brush_retry', 1) or 0), 0)
-        attempt = 0
-        while r in ('stuck', 'timeout') and attempt < retries:
-            attempt += 1
-            if _wait_control(control, progress) == 'stop':
-                return done, fail, True
-            progress('    ⚠ 上一次%s（第 %d 次重试）…'
-                     % ('卡住' if r == 'stuck' else '超时', attempt), 'warn')
-            time.sleep(random.uniform(4.0, 8.0))
+            if vf is None:
+                time.sleep(2)
+                for f in page.frames:
+                    if 'modules/video' not in (f.url or ''):
+                        continue
+                    try:
+                        if f.evaluate(JS_VIDEO_CLAIM):
+                            vf = f
+                            break
+                    except Exception:
+                        continue
+            if vf is None:
+                break
             try:
-                vf.evaluate("() => { window.__cx_brushed = false; }")
+                vf.evaluate("() => { window.__cx_brushed = true; }")
             except Exception:
                 pass
             r = brush_video_frame(vf, cfg, progress, control)
-            if r == 'stopped':
-                return done, fail, True
-        if r == 'done':
-            done += 1
-            log('    ✓ 这个视频刷完了')
-        elif r in ('stuck', 'timeout'):
-            fail += 1
-        # 'novideo'：这卡是文档/音频之类，不算账
-    return done, fail, False
+            # 卡住/超时后原地重试（网络抖动、临时卡顿最常见）：同一个页面还在，
+            # 清掉防重刷标记重跑一遍即可，不用重新导航（重新导航会把已完成的
+            # 视频卡也重播一遍，浪费时间还重复心跳）
+            retries = max(int(cfg.get('brush_retry', 1) or 0), 0)
+            attempt = 0
+            while r in ('stuck', 'timeout') and attempt < retries:
+                attempt += 1
+                if _wait_control(control, progress) == 'stop':
+                    return done, fail, True, {}
+                progress('    ⚠ 上一次%s（第 %d 次重试）…'
+                         % ('卡住' if r == 'stuck' else '超时', attempt), 'warn')
+                time.sleep(random.uniform(4.0, 8.0))
+                try:
+                    vf.evaluate("() => { window.__cx_brushed = false; }")
+                except Exception:
+                    pass
+                r = brush_video_frame(vf, cfg, progress, control)
+                if r == 'stopped':
+                    return done, fail, True, {}
+            if r == 'done':
+                done += 1
+                log('    ✓ 这个视频刷完了')
+            elif r in ('stuck', 'timeout'):
+                fail += 1
+            # 'novideo'：这卡是文档/音频之类，不算账
+        # 残余任务点按选项卡分别统计再取最大值：每个选项卡是一组独立的卡，
+        # 只有当前页的 DOM 可见，扫完就没了（v6.21）。
+        try:
+            _lf = _scan_leftover_tasks(page) or {}
+        except Exception:
+            _lf = {}
+        for _k, _v in _lf.items():
+            leftover[_k] = max(leftover.get(_k, 0), _v)
+    if leftover:
+        parts = '、'.join('%s×%d' % (k, v) for k, v in leftover.items())
+        progress('    这个节点还剩 %s 未完成 —— 视频之外的，刷课只管视频；'
+                 '用「刷课+刷题」或手动完成。' % parts, 'warn')
+    elif done == 0 and fail == 0:
+        # 这个节点一个视频都没刷到，两种常态：①视频都已完成（正常跳过）；
+        # ②它的任务点是卡片图标没标出的类型——有的「章节测验」卡不带
+        # .ans-job-icon，_scan_leftover_tasks 也认不出来，于是既没得刷、
+        # 又报不出残余，日志一片空白。无论哪种，它仍然「未完成」，必须
+        # 如实说明；否则用户只看到「完成 0 个」就重跑刷课，白白重播
+        # 已完成的视频，卡在死循环里（v6.20）。
+        progress('    这个节点没有可刷的视频（视频要么已完成、要么本来就不是'
+                 '视频任务点）——它仍未完成，多半是章节测验/作业，请用'
+                 '「刷课+刷题」或手动完成。', 'warn')
+    return done, fail, False, leftover
 
 
 def _wait_control(control, progress):
@@ -5949,6 +6770,21 @@ def _wait_control(control, progress):
         if act != 'pause':
             return act
         time.sleep(0.3)
+
+
+def _leftover_note(out, progress):
+    """把累计的「刷课刷不动的非视频任务点」在收尾时如实汇报一次（v6.19）。
+
+    这就是「章节刷完视频仍显示未完成、重跑只会重播已完成视频」的成因；
+    在刷课收尾处点名，用户才知道该去用「刷课+刷题」或手动补。
+    """
+    lo = out.get('leftover') or {}
+    if not lo:
+        return
+    parts = '、'.join('%s %d 个' % (k, v) for k, v in lo.items())
+    progress('⚠ 另有 %s 任务点不是视频，刷课管不了（要用「刷课+刷题」或手动完成）'
+             '——这就是有些章节刷完视频仍显示「未完成」的原因，重跑刷课只会'
+             '重播已完成的视频。' % parts, 'warn')
 
 
 def brush_videos(cfg, only, progress=None, control=None, headless=None) -> dict:
@@ -5961,7 +6797,7 @@ def brush_videos(cfg, only, progress=None, control=None, headless=None) -> dict:
     control(): 'run' | 'pause' | 'stop'，界面注入；CLI 用默认的「一直 run」。
     返回 {'courses': [...], 'done': n, 'fail': n, 'stopped': bool}
     """
-    progress = progress or (lambda m: log(m))
+    progress = progress or (lambda m, *a: log(m, a[0] if a else 'info'))
     control = control or (lambda: 'run')
     t0 = time.time()
     ctx = launch(cfg, headless=headless)
@@ -5970,7 +6806,8 @@ def brush_videos(cfg, only, progress=None, control=None, headless=None) -> dict:
     except Exception:
         close_ctx(ctx)     # new_page 失败也要收浏览器，别把 profile 占死
         raise
-    out = {'courses': [], 'done': 0, 'fail': 0, 'stopped': False}
+    out = {'courses': [], 'done': 0, 'fail': 0, 'stopped': False,
+           'leftover': {}}
     # 连刷歇息的小本子：见 brush_pace_rest 的说明（防零进度节点反复歇）
     rest_state = {'last': 0}
     try:
@@ -6039,10 +6876,12 @@ def brush_videos(cfg, only, progress=None, control=None, headless=None) -> dict:
                     stopped_here = True
                     break
                 progress('  ▶ 节点 %d/%d：%s' % (j, len(nodes), cut(node['name'], 30)))
-                d, f, stopped_here = brush_node(page, c, cpi, node['kid'],
-                                                cfg, progress, control)
+                d, f, stopped_here, lf = brush_node(page, c, cpi, node['kid'],
+                                                    cfg, progress, control)
                 cd += d
                 cf += f
+                for _k, _v in (lf or {}).items():
+                    out['leftover'][_k] = out['leftover'].get(_k, 0) + _v
                 if stopped_here:
                     break
                 # 连刷一阵就歇一会：连续几小时零停顿是明显统计特征
@@ -6064,6 +6903,7 @@ def brush_videos(cfg, only, progress=None, control=None, headless=None) -> dict:
             time.sleep(max(float(cfg.get('course_delay', 3.0)), 2.0))
         progress('刷视频结束：完成 %d 个，未完成 %d 个，用时 %.0f 分钟。'
                  % (out['done'], out['fail'], (time.time() - t0) / 60))
+        _leftover_note(out, progress)
         if out['fail']:
             progress('没刷完的多半是「反复暂停卡住」的插问视频或超长视频，'
                      '这些需要你手动看一遍。')
@@ -6212,6 +7052,15 @@ JS_PARSE_QUIZ = r"""
     });
     qi.querySelectorAll('textarea').forEach(x => {
       if (x.name) fills.push({name: x.name, tag: 'textarea'});
+    });
+    // 显示字母（与 JS_PARSE_TIMUS 同一口径，v6.23）：平台可能随机打乱选项
+    // 顺序，页面按显示位置标 A/B/C/D，而 value 是打乱前的字母。模型答的是
+    // 它看到的显示字母，落答必须按这个来，否则整题点到别的选项上。
+    opts.forEach((o, i) => {
+      o.pos = i;
+      const m = String(o.label || '').trim()
+        .match(/^[（(]?\s*([A-Za-z])\s*[)）.．、:：\s]/);
+      o.dl = (m ? m[1] : 'ABCDEFGHIJKLMNOP'.charAt(i)).toUpperCase();
     });
     const hasMedia = !!qi.querySelector(
       'img, svg, math, .MathJax, .MathJax_Preview, [class*=formula], [class*=math], canvas');
@@ -6420,26 +7269,29 @@ def _answer_one_activity(page, t, cfg, submit, progress, fid):
                 if f['name']:
                     fills.append({'name': f['name'], 'val': a, 'no': x['no']})
             continue
-        # 客观题：判断题先归一，再按选项值匹配字母，落不下去就按位置映射
+        # 客观题：显示字母优先（平台可能随机打乱选项顺序，见 _by_display_letter），
+        # 其次按选项值匹配，落不下去再按位置映射。
         if x['atype'] == '3':
             a = '对' if a in ('对', '正确', 'TRUE', 'T', '√') else '错'
             vals = [a]
             if not any(str(o['val']) == a for o in x['opts']):
                 vals = ['true' if a == '对' else 'false']
+            names, pos_vals = _fallback_by_position(x, vals)
         else:
             # 按字符拆（多选 "AC" → ['A','C']）。先剔掉分隔符/空白（"A、C"、
             # "A C"），再去重保序——checkbox 是开关：重复字母或已勾选项点两次
             # 会把勾取消掉，等于没选/选错位。
             vals = [c for c in str(a) if c not in ' \t、，,；;｜|/']
             vals = list(dict.fromkeys(vals))
-        names = {o['name'] for o in x['opts'] if str(o['val']) in vals}
-        if not names:
-            up = [str(v).upper() for v in vals]
-            names = {o['name'] for o in x['opts']
-                     if str(o.get('val', '')).upper() in up}
-        pos_vals = None
-        if not names:
-            names, pos_vals = _fallback_by_position(x, vals)
+            names, pos_vals = _by_display_letter(x, vals)
+            if not names:
+                names = {o['name'] for o in x['opts']
+                         if str(o['val']) in vals}
+            if not names:
+                up = [str(v).upper() for v in vals]
+                names = {o['name'] for o in x['opts']
+                         if str(o.get('val', '')).upper() in up}
+                pos_vals = None
         if not names:
             log('    第 %d 题模型答了（%s）但选项落不下去（页面里 %d 个选项），'
                 '按没答上处理。' % (x['no'], str(a)[:12], len(x['opts'])), 'warn')
@@ -6724,7 +7576,7 @@ def brush_by_urls(cfg, urls, progress=None, control=None, headless=None) -> dict
     返回 {'courses': [...], 'done': n, 'fail': n, 'stopped': bool}
     """
     from urllib.parse import urlparse as _urlparse, parse_qs as _parse_qs
-    progress = progress or (lambda m: log(m))
+    progress = progress or (lambda m, *a: log(m, a[0] if a else 'info'))
     control = control or (lambda: 'run')
 
     # 解析出 (cid, clsid) 去重
@@ -6747,7 +7599,8 @@ def brush_by_urls(cfg, urls, progress=None, control=None, headless=None) -> dict
         targets.append({'cid': cid, 'clsid': clsid,
                         'cpi': q.get('cpi', '') or cfg.get('cpi', ''), 'url': u})
 
-    out = {'courses': [], 'done': 0, 'fail': 0, 'stopped': False}
+    out = {'courses': [], 'done': 0, 'fail': 0, 'stopped': False,
+           'leftover': {}}
     if not targets:
         raise RuntimeError('这些链接里都没解析出课程（需要带 courseid 和 clazzid）')
 
@@ -6801,10 +7654,12 @@ def brush_by_urls(cfg, urls, progress=None, control=None, headless=None) -> dict
                     stopped_here = True
                     break
                 progress('  ▶ 节点 %d/%d：%s' % (j, len(nodes), cut(node['name'], 30)))
-                d, f, stopped_here = brush_node(page, c, t.get('cpi', ''),
-                                                node['kid'], cfg, progress, control)
+                d, f, stopped_here, lf = brush_node(page, c, t.get('cpi', ''),
+                                                    node['kid'], cfg, progress, control)
                 cd += d
                 cf += f
+                for _k, _v in (lf or {}).items():
+                    out['leftover'][_k] = out['leftover'].get(_k, 0) + _v
                 if stopped_here:
                     break
                 if brush_pace_rest(out['done'] + cd, cfg, progress, control, rest_state):
@@ -6819,6 +7674,7 @@ def brush_by_urls(cfg, urls, progress=None, control=None, headless=None) -> dict
                 out['stopped'] = True
                 break
             time.sleep(max(float(cfg.get('course_delay', 3.0)), 2.0))
+        _leftover_note(out, progress)
     finally:
         save_state(ctx)
         close_ctx(ctx)
