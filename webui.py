@@ -154,6 +154,8 @@ TASK_NAME = {
     'verify': '重新核实未确认的作业',
     'answer_one': '刷题（单份作业）',
     'refresh_one': '刷新单门课程状态',
+    'grades': '查成绩（逐节点读分）',
+    'retake': '查成绩并重刷低于 85 分的测验',
     'brush_urls': '上传链接刷课',
     'answer_urls': '上传链接刷题',
     'combo_urls': '上传链接刷课+刷题',
@@ -352,6 +354,15 @@ def _open_work_async(url):
             cs.log('作业窗口已关闭，「去完成」下次点击会重新开窗。')
 
     threading.Thread(target=run, daemon=True, name='open-work').start()
+
+
+def _ui_control():
+    """模块级「运行 / 暂停 / 停止」状态（_worker 里没有局部 control）。"""
+    if CANCEL.is_set():
+        return 'stop'
+    if PAUSE.is_set():
+        return 'pause'
+    return 'run'
 
 
 def _spawn(fn, *args):
@@ -571,7 +582,11 @@ def _worker(action, opts):
             return
 
         out = cs.scan(cfg, limit=limit, only=only,
-                      headless=None, open_report=False, deep=deep)
+                      headless=None, open_report=False, deep=deep,
+                      # v6.24：勾了「顺带查成绩」才逐节点读分（每门多花 1~4 分钟）
+                      grades=bool(opts.get('grades')),
+                      progress=lambda m, *a: cs.log(m, a[0] if a else 'info'),
+                      control=_ui_control)
         rep = out.get('report') or {}
         with LOCK:
             STATE['scan_internal'] = out.get('_internal')
@@ -586,6 +601,9 @@ def _worker(action, opts):
             nf = len(rep.get('page_failed') or [])
             if nf:
                 STATE['summary']['页面未加载'] = nf
+            # 查了成绩才有的卡：低于 85 分的份数
+            if opts.get('grades'):
+                STATE['summary']['低于85分'] = len(rep.get('low_scores') or [])
         _set_result(rep)
     except cs.NotLoggedIn as e:
         cs.log('%s' % e, 'err')
@@ -695,6 +713,118 @@ def _brush_worker(opts):
         cs.log('■ 任务结束')
         if locals().get('all_done') and opts.get('shutdown'):
             _shutdown_pc()
+
+
+def _retake_worker(opts):
+    """「查成绩 + 重刷」后台线程。
+
+    用户选的是「扫描时顺带查成绩」+「低于 85 分自动重刷，最多 2 次，取最高分」。
+    这里把两件事串起来：先逐节点读分，再把低于阈值的点开重做、重新作答交卷，
+    交卷后重读分数；最多重刷 N 次，记录最终成绩。
+
+    ⚠ 重刷是**真的**在用户账号上动：消耗平台重做次数、重新交卷。所以只有在
+      用户明确点了按钮、且节点确实低于阈值时才做；任何一份失败都只跳过它。
+    """
+    only = [str(k) for k in (opts.get('only') or []) if k]
+    try:
+        threshold = float(opts.get('threshold') or 85)
+    except (TypeError, ValueError):
+        threshold = 85.0
+    try:
+        cap = max(int(opts.get('max_retakes') or 2), 1)
+    except (TypeError, ValueError):
+        cap = 2
+    retake = bool(opts.get('retake', True))
+
+    cs.log('')
+    cs.log('▶ 任务开始：%s' % TASK_NAME['retake' if retake else 'grades'])
+    PAUSE.clear()
+    CANCEL.clear()
+    with LOCK:
+        STATE['paused'] = False
+        STATE['phase'] = 'answering'
+    try:
+        cfg = cs.load_config()
+        if retake and not cs.llm_ready(cfg):
+            cs.log('还没有配置大模型：重刷要重新作答，请先在「设置 · 大模型」里配好。',
+                   'err')
+            with LOCK:
+                STATE['summary'] = {'提示': '先配置大模型接口'}
+            return
+        cs.log('阈值：低于 %s 分%s（最多 %d 次，取最高分）'
+               % (('%g' % threshold), '自动重刷' if retake else '只报不刷', cap))
+
+        def progress(msg, *a):
+            cs.log(msg, a[0] if a else 'info')
+            with LOCK:
+                STATE['task'] = '成绩 · ' + (msg[:54] if msg else '')
+
+        def control():
+            if CANCEL.is_set():
+                return 'stop'
+            if PAUSE.is_set():
+                return 'pause'
+            return 'run'
+
+        out = cs.query_scores(cfg, only, threshold=threshold,
+                              retake=retake, max_retakes=cap,
+                              progress=progress, control=control)
+        items = out.get('items') or []
+        with LOCK:
+            STATE['summary'] = {
+                '测验份数': len(items),
+                '低于阈值': sum(1 for x in items
+                                if cs.needs_retake(x, threshold)),
+                '重刷次数': out.get('retaken', 0),
+                '失败': out.get('failed', 0),
+            }
+            if out.get('stopped'):
+                STATE['summary']['状态'] = '已停止'
+        # 复用「交卷结果」面板：逐份列出成绩/重刷结果
+        _set_ares({'time': time.strftime('%H:%M'), 'items': [
+            {'key': x.get('key'), 'kid': x.get('kid'), 'course': x.get('course'),
+             'node': x.get('node'), 'status': _grade_status(x, threshold),
+             'score': x.get('score'), 'after': x.get('after'),
+             'left': x.get('left'), 'attempts': x.get('attempts') or 0,
+             'url': x.get('url') or ''}
+            for x in items]})
+    except cs.NotLoggedIn as e:
+        cs.log('%s' % e, 'err')
+        with LOCK:
+            STATE['summary'] = {'提示': '未登录，请先登录'}
+    except Exception as e:
+        cs.log('任务失败：%s' % e, 'err')
+        import traceback
+        cs.log(traceback.format_exc()[-900:], 'err')
+        _set_result({'error': str(e)[:200] or type(e).__name__})
+    finally:
+        cs.set_control_hook(None)
+        PAUSE.clear()
+        CANCEL.clear()
+        with LOCK:
+            STATE['running'] = False
+            STATE['done'] = True
+            STATE['paused'] = False
+            STATE['phase'] = ''
+        cs.log('■ 任务结束')
+
+
+def _grade_status(x, threshold):
+    """一行成绩在面板里的状态文案。"""
+    sc = x.get('score')
+    after = x.get('after')
+    if x.get('attempts'):
+        if after is not None and float(after) >= float(threshold):
+            return 'retaken-ok'
+        return 'retaken-low'
+    if x.get('pending'):
+        return 'pending'
+    if sc is None:
+        return 'noscore'
+    try:
+        return 'low' if float(sc) < float(threshold) else 'ok'
+    except (TypeError, ValueError):
+        return 'noscore'
 
 
 def _answer_worker(opts):
@@ -2329,6 +2459,25 @@ PAGE = r"""<!DOCTYPE html>
           <p class="note guide">勾选优先于上面填的数：勾了课就只查这几门，一门不勾 = 查全部。</p>
         </section>
 
+        <section class="blk">
+          <h2 class="blk-t">成绩与重刷</h2>
+          <label class="chk"><input type="checkbox" id="gradeon">
+            查询时顺带查每个测验的成绩</label>
+          <div class="field"><input type="number" id="gradethr" min="0" max="100"
+                 value="85" placeholder="低于多少分算低分">
+          </div>
+          <button class="btn" id="bgrades"><span class="ic" data-i="list"></span>
+            只查成绩</button>
+          <button class="btn pri" id="bretake"><span class="ic" data-i="play"></span>
+            查成绩并重刷低于阈值</button>
+          <p class="note guide">作业列表只给「已完成 / 未完成」，分数要打开作业卡才看得到，
+            所以「顺带查成绩」会让查询慢一些（每门课多 1~4 分钟）。「查成绩并重刷」会对
+            勾选课程里低于阈值的测验点「重做」，然后重新作答并交卷，每份最多 2 次、取最高分。
+            <b>重做会消耗平台的剩余重做次数</b>；平台重做时会把题目顺序重排，所以工具会
+            重新作答而不是照抄上次的答案。只动<b>平台已判不及格</b>的卷子；
+            「待完成」（从没做的作业）只报告、不替你动手。</p>
+        </section>
+
         <section class="blk" id="cardsblk" style="display:none">
           <h2 class="blk-t">本次统计</h2>
           <div id="cards" class="cards"></div>
@@ -3125,7 +3274,9 @@ function renderResult(r){
          + '（' + rate.toFixed(1) + '%）</span></span>'
          + '<span class="foldhint">'
          + '<span class="t-closed">'
-         + (chs.length ? chs.length + ' 个章节待完成 · 点这里展开' : '点这里展开')
+         + (chs.length ? chs.length + ' 个章节待完成'
+            + (it.fake ? '（含 ' + it.fake + ' 个平台标已完成、实际没做）' : '')
+            + ' · 点这里展开' : '点这里展开')
          + '</span><span class="t-open">点这里收起</span></span>'
          // 没有 cid/clsid 的课（旧缓存结果）压根不渲染勾选框——没有定位参数
          // 就不能假装能刷
@@ -3145,8 +3296,16 @@ function renderResult(r){
               + '<input type="checkbox" class="ck" value="'
               + esc(bkey + '|' + c.kid) + '"></label>'
             : '';
+          // v6.25：章节目录说「已完成」、点进去其实是空的节点。不加标记的话，
+          // 用户看到进度 100% 却出现在欠账区，会以为是工具算错了。
+          const fakeTag = c.fakeDone
+            ? '<span class="cnt" title="平台上这一节的任务点图标显示已完成，'
+              + '但里面的测验点进去是没做的（平台目录标记与测验状态不一致）。'
+              + '勾上后点「做作业」即可补做。">平台标已完成 · 实际没做</span>'
+            : '';
           h += '<div>' + ckb + '<span class="cnm">' + esc(c.name) + '</span>'
-             + '<span class="cnt">待完成 ' + (c.count||1) + '</span></div>';
+             + '<span class="cnt">待完成 ' + (c.count||1) + '</span>'
+             + fakeTag + '</div>';
         }
         h += '</div>';
       } else {
@@ -3425,7 +3584,9 @@ async function run(action, opts){
     password: $('pwd').value,
     only: picked(),          // 勾了哪些课；空数组 = 全部
     limit: nTop,             // 只查最近 N 门；勾选非空时后端以勾选为准
-    deep: $('deep').checked
+    deep: $('deep').checked,
+    // v6.24：勾了就顺带逐节点读成绩（慢一些，但报告里直接给分数）
+    grades: !!($('gradeon') && $('gradeon').checked)
   };
   // 单门刷新：带上这门课的定位键（后端据此只重抓这一门）
   if (action === 'refresh_one'){
@@ -4365,6 +4526,41 @@ function startLinkJob(path, label){
 if ($('blinkbrush')){
   $('blinkbrush').onclick = () => startLinkJob('/api/brush-urls', '刷课');
   $('blinkanswer').onclick = () => startLinkJob('/api/answer-urls', '刷题');
+
+  // ---- 成绩 / 重刷（v6.24）----
+  function startGradeJob(api, label){
+    const only = picked();
+    if (!only.length){
+      toast('先在「查询范围」里勾选要查成绩的课程（一门不勾不是「全部」，避免误查）', 'warn');
+      return;
+    }
+    const thr = parseInt(($('gradethr') || {}).value || '85', 10);
+    if (!(thr >= 0 && thr <= 100)){
+      toast('阈值要填 0~100 之间的数', 'warn');
+      return;
+    }
+    if (api === '/api/retake' && !confirm(
+        '将对勾选的 ' + only.length + ' 门课查成绩，并自动重刷低于 ' + thr +
+        ' 分的测验（每份最多 2 次，取最高分）。\n\n' +
+        '重做会消耗平台的剩余重做次数，并且会重新交卷。继续？')) return;
+    fetch(api, {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({only: only, threshold: thr, max_retakes: 2,
+                            retake: api === '/api/retake'})})
+      .then(r => {
+        if (r.status === 409){ toast('上一个任务还在跑，等它结束再点', 'warn'); return; }
+        if (!r.ok){ toast('任务没能启动（HTTP ' + r.status + '）', 'err'); return; }
+        switchTab('res');
+        setText($('bartip'), label + '中…');
+        if ($('resHome')) $('resHome').style.display = 'none';
+        $('resTask').style.display = '';
+        $('taskhead').textContent = label;
+        $('resTaskBody').innerHTML = '<div class="empty taskph">正在后台' +
+          esc(label) + '…（逐个打开作业卡读分，比较慢，请耐心等）</div>';
+      })
+      .catch(() => toast('连不上本地程序，请确认程序还在运行', 'err'));
+  }
+  if ($('bgrades')) $('bgrades').onclick = () => startGradeJob('/api/grades', '查成绩');
+  if ($('bretake')) $('bretake').onclick = () => startGradeJob('/api/retake', '查成绩并重刷');
   $('blinkcombo').onclick = () => startLinkJob('/api/combo-urls', '刷课+刷题');
 }
 $('call').onclick = () => {
@@ -4796,6 +4992,7 @@ class Handler(BaseHTTPRequestHandler):
     # 清单保留作对照：曾经只对这里列的端点设闸，/api/answer-one 恰好
     # 漏在名单外 —— 按端点挑名单的维护方式本身就是缺陷。
     _JSON_PATHS = ('/api/run', '/api/brush', '/api/answer', '/api/combo',
+                   '/api/grades', '/api/retake',
                    '/api/answer-one', '/api/answer-verify',
                    '/api/brush-act', '/api/answer-act', '/api/combo-act',
                    '/api/llm-config', '/api/llm-test',
@@ -4896,6 +5093,29 @@ class Handler(BaseHTTPRequestHandler):
             _spawn(_brush_worker, {'only': only,
                                    'shutdown': bool(data.get('shutdown')),
                                    'rate': data.get('rate')})
+            return self._send(200, b'{"ok":true}')
+        if u.path in ('/api/grades', '/api/retake'):
+            # 「查成绩」/「查成绩并重刷」。only 必填（同刷课，绝不默认全量）。
+            try:
+                data = json.loads(raw.decode('utf-8') or '{}')
+            except Exception:
+                data = {}
+            only = [str(k) for k in (data.get('only') or []) if k]
+            if not only:
+                return self._send(400, json.dumps(
+                    {'error': '没有勾选要查成绩的课程'}).encode('utf-8'))
+            _close_work_window()
+            retake = (u.path == '/api/retake')
+            with LOCK:
+                if STATE['running']:
+                    return self._send(409, b'{"error":"busy"}')
+                STATE.update(running=True,
+                             task=TASK_NAME['retake' if retake else 'grades'],
+                             lines=[], done=False, summary=None,
+                             started=time.time(), login_fail=None)
+            _spawn(_retake_worker, {'only': only, 'retake': retake,
+                                    'threshold': data.get('threshold') or 85,
+                                    'max_retakes': data.get('max_retakes') or 2})
             return self._send(200, b'{"ok":true}')
         if u.path == '/api/answer':
             # 「做勾选课程的章节作业」。only 必填；draft=True 走暂存，

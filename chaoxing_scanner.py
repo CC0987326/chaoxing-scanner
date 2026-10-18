@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-学习通（超星）未完成事项巡检工具  v6.21
+学习通（超星）未完成事项巡检工具  v6.25
 ================================================================
 把「登录 → 逐门课翻作业/考试/任务点/课堂活动 → 汇总成清单」这套流程固化成本地程序。
 
@@ -105,6 +105,50 @@ v6.21 要点（真机确诊：章节里的测验根本不在第一格选项卡�
 练习」的排前面），找到就用那一格答题；②「刷课」同样**逐格找视频卡**；
 ③残余任务点按选项卡分别统计；④**找不到时如实说明**（列出扫过哪几格），
 不再让那行日志空着——用户才能分清「这节点本来就没作业」和「工具没找到」。
+
+v6.24 要点（成绩与重刷 + 视觉通道的一处真错）：
+用户报「6.23 还有题填错/填不上，而且有的刷完不及格」。逐条查下来：
+① **视觉通道给字体加密题的选项发乱码**。题干早就隐去了（v6.22），选项没管：
+   「惪想惥惦」这种被平台换过码位的选项文字照样发过去，模型被带偏，挑的字母
+   与图完全对不上。本版反爬题只把**显示字母**（A/B/C…）告诉模型，让它看图
+   回字母，落答侧再按 dl 映射。已加证伪守卫。
+② **成绩与重刷**。作业列表只给「已完成/未完成」，分数必须打开作业卡才看得到，
+   所以「分数低 / 不及格」以前只能靠用户自己发现。本版新增三个能力：
+   查询时顺带逐节点读分（可勾选）；低于阈值（默认 85）的单独列出；
+   「查成绩并重刷」自动点平台的重做、重新作答交卷，每份最多 2 次、取最高分。
+   重刷**真的会消耗平台的剩余重做次数**，所以只在用户点按钮、且节点确实低于
+   阈值时才做。平台重做时会**连题目顺序一起重排**（真机实测：批阅页第 10 题
+   在重做后变成第 6 题，选项图 4/4 相同），所以不能照抄上次的答案，必须重答。
+
+v6.25 要点（「显示任务点已完成、其实没做题」+ 视觉调用省钱）：
+① **平台的两个标记会打架**。真机（大学物理·软件学院2026，账号 190****6550）
+   章节目录里 4.7 单元测试挂的是 `<div class="catalog_state icon_yiwanc
+   catalog_tishi56">已完成</div>`，可点进去是 doHomeWorkNew 答题页、
+   15 题一题没答。工具以前只认章节列表的 `.catalog_jindu`，这类节点根本
+   进不了待办——用户说「巡检工具还查不到」就是这个。
+   本版在查成绩时顺带对账：**测验卡说待完成、章节目录却说已完成** → 标
+   `fakeDone`，当未完成任务点列进清单，可以勾选、可以交给「做作业」补做。
+   全量实测 25 个作业节点里有 9 个是这种（2.5/3.9/4.6/4.7/5.7/5.8/6.5/7.7/7.8，
+   含三份 15~20 题的单元测试）。不额外导航：查成绩本来就会打开每张测验卡。
+② **视觉调用省钱，且不减准确率**。真机 4.7 / 5.8 整卷都是图片题（题干一张
+   PNG、每选项一张 PNG，DOM 只剩「N 【单选题】」）：
+   · 以前 `_need_vision` 把所有填空/简答也送去逐题截图 —— 纯文字主观题看图
+     没用，纯烧钱。改成只有真有图/公式/字体反爬才走视觉。
+   · 客观题合并成**一次**多图请求（4.7 的 15 题从 15 次降到 1 次）；解析不出
+     来自动退回逐题，部分没答上只补问那几题。
+   · 新增**题面图片指纹**（`_q_fp` / `_cache_key`）当缓存键。图片地址是内容
+     哈希，实测三次加载题干图、选项图、选项顺序全部一致，所以同一串图片 =
+     同一道题；指纹不含题号，平台重做时重排题目顺序也不影响。全图片题以前
+     题干哈希是空串、**永远命不中缓存**，现在 15/15 都有键。
+     ⚠ 纯文字选项也进指纹——4.7 的 Q5/Q9/Q11 四个选项全是文字，只认图片
+       的话这几题指纹里的选项部分是空的，选项一换位缓存就答错。
+③ **缓存命中前校验选项，防「答错且不报错」**。文字题的缓存键是题干哈希、
+   不含选项顺序，而缓存里存的是**显示字母**；平台换卷面实例后一重排，同一个
+   字母就指到另一个选项上。以前这里没有任何校验——省钱省出个错答案是最亏的。
+   现在缓存值带「显示字母 → 选项内容」，命中时按内容重新对齐字母：对得上
+   就换成当前字母（顺序真没变时照样复用），对不上就当没命中、重新问模型。
+   老缓存（纯字符串）没有这层信息：文字题照用不倒退，图片题一律当 miss。
+   多选逐字母换算、绝不截断；页面这次没读出选项时不判错。
 """
 from __future__ import annotations
 
@@ -197,7 +241,7 @@ ACTIVITY_TYPES = {
 # 的「进行中 / 已结束」分桶完全一致（Vue: activeList1=进行中 activeList2=已结束）。
 
 # 版本号：界面侧栏、启动日志、使用说明都引它，别再各处手写一份
-VERSION = 'v6.23'
+VERSION = 'v6.25'
 
 # 平台自身算「已完成」的状态；除此之外都视为未完成
 DONE_STATES = ('已完成', '已互评', '待批阅', '已提交', '待互评', '已结束', '已过期')
@@ -2396,7 +2440,7 @@ JS_COUNT_CHAPTER = r"""
 
 JS_PROG_DETAIL = r"""
 () => {
-  const res = { total: null, pending: [], nodes: 0 };
+  const res = { total: null, pending: [], all: [], nodes: 0 };
   const m = (document.body.innerText || '')
         .match(/已完成任务点[:：]?\s*(\d+)\s*\/\s*(\d+)/);
   if (m) res.total = [parseInt(m[1], 10), parseInt(m[2], 10)];
@@ -2407,6 +2451,14 @@ JS_PROG_DETAIL = r"""
     name = (name || '').replace(/\s+/g, ' ').trim();
     if (!name) return;
     res.nodes++;
+    // v6.24：扫描期「逐节点查成绩」要一份**全部**节点清单（不只是欠账的）。
+    // 标题带「测试/测验/练习/作业/考试」的才可能是作业卡；视频/文档节点
+    // 打开也是白跑，这里先按标题筛掉，省大量无谓导航。
+    const _kid = (item.id || '').replace(/^cur/, '');
+    if (_kid && /测试|测验|练习|作业|考试|习题/.test(name)) {
+      res.all.push({ name: name, kid: _kid,
+                     pending: !!item.querySelector('.catalog_jindu') });
+    }
     // 未完成的节点带 .catalog_jindu（且通常附加 catalog_tishi120）
     const jd = item.querySelector('.catalog_jindu');
     if (!jd) return;
@@ -2464,7 +2516,9 @@ def fetch_progress_detail(page, c, cpi, cfg) -> dict:
     return {'no_module': False,
             'pending': data.get('pending') or [],
             'total': data.get('total'),
-            'nodes': data.get('nodes', 0)}
+            'nodes': data.get('nodes', 0),
+            # v6.24：全部「像作业卡」的节点（含已完成），扫描期逐节点查成绩用
+            'all': data.get('all') or []}
 
 
 # ================================================================ 抓「任务」页（课堂活动）
@@ -2751,13 +2805,17 @@ def rebuild_with_row(internal, cid, clsid, new_row):
     return report
 
 
-def scan(cfg, limit=0, headless=None, open_report=None, deep=True, only=None) -> dict:
+def scan(cfg, limit=0, headless=None, open_report=None, deep=True, only=None,
+         grades=False, progress=None, control=None) -> dict:
     """扫描并出报告。
 
     only: 课程 key 列表（course_key() 的返回值）。给了就只扫这些课；
           留空/None 表示扫全部。优先于 limit。
     limit: 只扫最近 N 门。课程列表的顺序就是学习通个人空间的默认顺序
           （最近学习过的在最前），所以「前 N 门」即「最近学过的 N 门」。
+    grades: True = 顺带逐节点读测验/作业成绩（v6.24）。作业列表只给
+          「已完成/未完成」，分数只在打开作业卡后的批阅页上，所以这一步要
+          逐个节点打开——每门课会多花 1~4 分钟。只读，不点重做、不交卷。
     """
     limit = limit or cfg.get('max_courses') or 0
     open_report = cfg.get('open_report', True) if open_report is None else open_report
@@ -2852,6 +2910,16 @@ def scan(cfg, limit=0, headless=None, open_report=None, deep=True, only=None) ->
             extra = ''
             if pd is not None and not pd.get('no_module'):
                 extra = ' · 未完成章节 %d' % len(pd.get('pending') or [])
+            # v6.24：顺带查成绩（默认关）。必须放在这一门课的其它抓取之后，
+            # 因为它会在这个 page 上来回导航作业卡；失败不影响主扫描。
+            if grades:
+                try:
+                    row['scores'] = scan_scores(cfg, page, c, cpi,
+                                                progress or log,
+                                                control=control)
+                except Exception as e:
+                    row['scores'] = {'items': [], 'failed': 1,
+                                     'reason': str(e).splitlines()[0][:120]}
             act = row.get('act') or {}
             n_act = len(act.get('ongoing') or [])
             act_txt = ''
@@ -3438,6 +3506,17 @@ JS_PARSE_TIMUS = r"""
     // （结构差异），取到空题干 → 附件规则无从匹配 → 模型只看到「1.【简答】」
     // 就瞎编了一段「进入课程作业中的实验报告，点击上传文件……提交即可」当
     // 答案，工具照填还交了卷，整题 0 分。宁可题干带点噪声，也不能空着。
+    // v6.25：题面图片的 URL 顺序。全图片题（题干和选项都是 PNG，DOM 文本
+    // 只剩「1 【单选题】」）只能靠它认题——题干哈希对这类题是空的，拿不到
+    // 可靠的缓存键。选项顺序实测三轮加载完全稳定（真机 2026-10-18 4.7），
+    // 所以同一串图片 = 同一道题、同一套字母映射。
+    let mediaSig = '';
+    try {
+      mediaSig = [...li.querySelectorAll('img')].slice(0, 12)
+        .map(im => (im.getAttribute('src') || '').split('/').pop()
+                    .split('?')[0])
+        .filter(Boolean).join(',');
+    } catch (e) { mediaSig = ''; }
     let stem = _txt(li.querySelector('.Zy_TItle'));
     if (!stem.trim()) {
       // .mark_name 是新版每题容器里的题目信息行（题号 + 题型 + 分值）
@@ -3455,12 +3534,21 @@ JS_PARSE_TIMUS = r"""
     stem = stem.replace(/\s+/g, ' ').trim().slice(0, 500);
     const opts = [], fills = [];
     let li_html = null, li_doc = null;
+    // v6.25：选项自己的图片指纹。纯图片选项（真机 4.7 四个选项各是一张
+    // PNG、文字只有「A/B/C/D」）在视觉通道和缓存里都得靠它认——只有字母
+    // 的话，同一串图换个字母映射就没法核对了。
+    const _imgSig = (lab) => {
+      const im = lab ? lab.querySelector('img') : null;
+      return im ? ((im.getAttribute('src') || '').split('/').pop()
+                   .split('?')[0]) : '';
+    };
     li.querySelectorAll('input[name^=answer]').forEach(x => {
       if (x.type === 'hidden') return;
       const label = (x.closest('li') || x.parentElement);
       opts.push({name: x.name, val: x.value, type: x.type,
                  label: ((label && label.textContent) || x.value)
-                        .replace(/\s+/g, ' ').trim().slice(0, 150)});
+                        .replace(/\s+/g, ' ').trim().slice(0, 150),
+                 img: _imgSig(label)});
     });
     // 页面变体兜底（真机 2026-10-09：atype/题干都读得到，选项 radio 却不在
     // 题容器子树里——选项另起一块的结构）。向上最多走两层找 radio/checkbox；
@@ -3492,7 +3580,8 @@ JS_PARSE_TIMUS = r"""
           const label = (x.closest('li') || x.parentElement);
           opts.push({name: x.name, val: x.value, type: x.type,
                      label: ((label && label.textContent) || x.value)
-                            .replace(/\s+/g, ' ').trim().slice(0, 150)});
+                            .replace(/\s+/g, ' ').trim().slice(0, 150),
+                     img: _imgSig(label)});
         });
         scope = scope.parentElement;
       }
@@ -3606,7 +3695,8 @@ JS_PARSE_TIMUS = r"""
     li.setAttribute('data-cx-idx', idx);
     out.push({no: idx + 1, stem: stem.slice(0, 500),
               atype: at ? at.value : '',
-              opts, fills, upload, hasMedia, scrambled, li_html, doc_counts: li_doc});
+              opts, fills, upload, hasMedia, scrambled, li_html, doc_counts: li_doc,
+              mediaSig: mediaSig});
   });
   return out;
 }
@@ -4532,6 +4622,61 @@ def _stem_key(stem):
     return hashlib.sha1(norm.encode('utf-8')).hexdigest()[:16]
 
 
+def _q_fp(t) -> str:
+    """题面图片指纹：题干图 + 各选项图，按页面显示顺序拼起来取哈希。
+
+    v6.25 新增。真机 2026-10-18（大学物理 4.7 / 5.8）整卷都是图片题：
+    题干一张 PNG、四个选项各一张 PNG，DOM 文字只剩「N 【单选题】」，
+    题干哈希是空串——这类题每次重刷都得把 15 张图重新发给模型。
+
+    图片地址是内容哈希（p.ananas.chaoxing.com/star3/origin/<md5>.png），
+    同一道题永远同一串地址；选项顺序实测三轮加载完全一致，所以这串指纹
+    既能认题、也能安全地复用「字母答案」。
+
+    没有任何图返回 ''（纯文字题继续用题干哈希）。
+    """
+    if not isinstance(t, dict):
+        return ''
+    sig = (t.get('mediaSig') or '').strip()
+    if not sig:
+        # 没有图 = 纯文字题。**必须**返回空串让调用方退回题干哈希：
+        # 纯文字题的选项顺序会被平台打乱（v6.23 的 randomOptions），按显示
+        # 顺序拼出来的指纹每次都不一样，缓存永远命不中，等于白丢缓存。
+        return ''
+    opts = []
+    for o in (t.get('opts') or []):
+        own = str(o.get('img') or '').strip()
+        if not own:
+            # 纯文字选项：真机 4.7 的 Q5 / Q9 / Q11 四个选项全是文字，
+            # Q7 / Q8 各有一个。只认图片不认文字，这几题的指纹里选项部分
+            # 就是空的——选项一换位，缓存里的字母就指到别的选项上。
+            if t.get('scrambled'):
+                # 字体反爬的选项文字是乱码：密文本体跨加载实测一致，但为
+                # 稳妥只记「这里有个文字选项」，不把密文塞进指纹。
+                own = '#'
+            else:
+                own = re.sub(r'\s+', '', str(o.get('label') or ''))[:80]
+        opts.append(own)
+    if any(opts):
+        sig += '|' + ','.join(opts)
+    if not sig.strip('|,'):
+        return ''
+    import hashlib
+    return 'img:' + hashlib.sha1(sig.encode('utf-8')).hexdigest()[:16]
+
+
+def _cache_key(t) -> str:
+    """这道题在答案缓存里该用哪个键。
+
+    有图片指纹优先用指纹：全图片题题干是空的，只有指纹认得出来；纯文字
+    题退回题干哈希。指纹键带 `img:` 前缀，与 sha1 十六进制不会撞。
+    """
+    fp = _q_fp(t)
+    if fp:
+        return fp
+    return _stem_key(t.get('stem'))
+
+
 def _stem_norm(stem):
     """题干归一：剥题号/题型前缀、压掉全部空白。空题干返回空串。
 
@@ -4543,6 +4688,88 @@ def _stem_norm(stem):
     s = re.sub(r'^\s*\d+\s*【[^】]{0,12}】\s*', '', s)
     s = re.sub(r'^\s*[（(]?\d+[）).、]\s*', '', s)
     return re.sub(r'\s+', '', s)
+
+
+def _opt_map(t):
+    """{显示字母: 选项指纹}——按**页面当前渲染**取。
+
+    显示字母用 `dl`（平台打乱后标在页面上的那个字母），不是位置下标：
+    真机实测 Q1 显示 A 的选项，radio 的 value 是 C，位置和字母并不是一回事。
+    答案字母对的就是 `dl`（落答侧也是按 `dl` 找选项），所以校验也只能用 `dl`。
+    """
+    out = {}
+    for o in (t.get('opts') or []):
+        dl = str(o.get('dl') or '').strip().upper()
+        if not dl:
+            continue
+        v = str(o.get('img') or '').strip()
+        if not v:
+            v = '#' if t.get('scrambled') else re.sub(
+                r'\s+', '', str(o.get('label') or ''))[:80]
+            # 选项文字自带显示字母（真机：「A P1和P2两点」）。选项一换位
+            # 这个前缀就跟着变，不剥掉的话同一个选项永远对不上、缓存全 miss。
+            v = re.sub(r'^[（(]?[A-Za-z][)）.．、:：]?', '', v)
+        out[dl] = v
+    return out
+
+
+def _cache_get(cache, t):
+    """从缓存里取答案；取不到 / 不可信时返回 ''。v6.25。
+
+    见 patch 头注释：文字题的键不含选项顺序，所以**必须**校验字母指向的
+    选项还是原来那个，否则会把答案填到别的选项上。
+    """
+    k = _cache_key(t)
+    if not k:
+        return ''
+    hit = cache.get(k)
+    if hit is None:
+        return ''
+    if not isinstance(hit, dict):
+        # 老格式（纯字符串）：只有纯文字题敢用，图片题没法校验
+        return '' if _q_fp(t) else str(hit)
+    ans = str(hit.get('a') or '')
+    if not ans or ans in ('?', '无'):
+        return ''
+    old = hit.get('o') or []
+    if not old:
+        return ans
+    cur = _opt_map(t)
+    if not cur:
+        # 页面这次没读出选项（读了一半）——不能拿题目不完整时的状态去判错
+        return ans
+    old_map = {str(dl).upper(): str(sig) for dl, sig in old
+               if str(dl or '').strip()}
+    by_sig = {}
+    for dl, sig in cur.items():
+        by_sig.setdefault(sig, dl)
+    out = []
+    for ch in ans.upper():
+        if not ch.strip() or ch in (' ', '，', ',', '、'):
+            continue
+        # old_map 里没有这个字母（缓存答案带着当前卷子不存在的选项，比如上次
+        # 四选一、这次三选一）→ 这份答案对不上这题，当没命中。不用单独判：
+        # get 拿到 None，下面一样返回 ''。
+        now = by_sig.get(old_map.get(ch))
+        if not now:
+            return ''                 # 那个选项没了 / 内容变了 → 重新问
+        out.append(now)
+    if not out:
+        return ''
+    return ''.join(sorted(out))
+
+
+def _cache_put(cache, t, answer):
+    """写缓存，连同「显示字母 → 选项指纹」。返回是否写入。"""
+    k = _cache_key(t)
+    if not k or answer in (None, '?', '', '无'):
+        return False
+    m = _opt_map(t)
+    if m:
+        cache[k] = {'a': str(answer), 'o': sorted(m.items())}
+    else:
+        cache[k] = str(answer)
+    return True
 
 
 def _answer_cache_load():
@@ -4586,8 +4813,12 @@ def _need_vision(t) -> bool:
     胡编的答案，真机 2026-10-17 实测）。不含图的纯文字选择题不截——给文本
     就够，省流量也省等待。
     """
-    return (bool(t.get('hasMedia')) or bool(t.get('scrambled'))
-            or (t.get('atype') in STYPES))
+    # v6.25：主观题**不再无条件**走视觉。真机实测（2026-10-18）：纯文字
+    # 填空题/简答题截图发给视觉模型，模型要先把图里的字认一遍再答，既慢
+    # 又容易把数字认错，而且每题一次调用——一份 20 题的主观卷就是 20 次
+    # 请求。只有题面真有图/公式（hasMedia）或被平台字体加密（scrambled）
+    # 时才值得看图。
+    return bool(t.get('hasMedia')) or bool(t.get('scrambled'))
 
 
 def _shot_timu(hw, idx):
@@ -4727,9 +4958,21 @@ def _ask_one_vision(cfg, t):
     elif t.get('scrambled'):
         parts.append('（页面文字被平台字体加密，提取出来是乱码，已隐去；'
                      '请完全以图片内容为准。）')
-    opts = [o['label'] for o in (t.get('opts') or [])]
+    opts = t.get('opts') or []
     if opts and t['atype'] not in STYPES:
-        parts.append('页面给的选项：\n' + '\n'.join('   ' + x for x in opts))
+        if t.get('scrambled'):
+            # 选项文字和题干一样被平台字体加密（「理想流体」→「惪想惥惦」）。
+            # 把乱码选项一起发过去只会把模型带偏：真机 2026-10-18 复现时，
+            # 模型挑了个字母但理由与图完全对不上。只保留显示字母——模型只要
+            # 知道有几个选项、看图辨认后回字母，落答侧再按 dl 映射。
+            parts.append('选项文字被平台字体加密，已隐去（共 %d 个选项，'
+                         '按图中从上到下依次标为 A 起）：\n%s'
+                         % (len(opts), '\n'.join(
+                             '   %s、（内容见图片）' % (o.get('dl') or '?')
+                             for o in opts)))
+        else:
+            parts.append('页面给的选项：\n'
+                         + '\n'.join('   ' + o['label'] for o in opts))
     parts.append('只输出答案本身：不要题号、不要解释、不要任何多余文字。'
                  '答案会被原样填进网页输入框：禁止 LaTeX（\\frac、'
                  '\\begin{pmatrix}、$…$）、Markdown（**、#、`）、代码块——'
@@ -4761,6 +5004,74 @@ def _solve_by_vision(cfg, timus, progress):
     return out
 
 
+def _solve_vision_batch(cfg, timus, progress):
+    """把若干**客观题**的截图合并成一次多图请求作答。返回 {题号: 答案}。
+
+    v6.25。真机（2026-10-18，大学物理 4.7 / 5.8）每份 15 题、每题一张整题
+    截图，逐题发就是 15 次带图请求。合批只发一次，成本降一个数量级，而且
+    模型一次看到全部题面，题号反而更不容易串。
+
+    准确率保护（省钱的实现绝不能拿正确率换）：
+      · 每张图前都标「第 N 题」，模型按题号回 JSON；
+      · 整批解析不出来 → **退回逐题**重来；
+      · 部分题没答上 → 只对那几题逐题补问；
+      · 仍按 `_clean_vision_answer` 归一，与单题通道口径一致。
+    """
+    timus = [t for t in (timus or []) if t.get('shot')]
+    if not timus:
+        return {}
+    if len(timus) == 1:
+        return _solve_by_vision(cfg, timus, progress)
+    parts = ['下面是同一份作业里的 %d 道题，**每张图就是一整道题**'
+             '（题干和它的选项都在同一张图里，按 A、B、C…从上到下排）。'
+             % len(timus)]
+    imgs = []
+    for t in timus:
+        tn = ATYPES.get(t['atype']) or '选择题'
+        nopt = len(t.get('opts') or [])
+        parts.append(('【第 %d 题】%s，%d 个选项。'
+                      % (t['no'], tn, nopt)) if nopt
+                     else ('【第 %d 题】%s。' % (t['no'], tn)))
+        # 题干文字能读（没被字体加密）就一并给，模型对文字比看图更稳
+        stem = (t.get('stem') or '').strip()
+        if stem and not t.get('scrambled'):
+            parts.append('   题干文字（可能与图不一致，以图为准）：'
+                         + stem[:300])
+        imgs.append(t['shot'])
+    parts.append('输出要求：只输出一个 JSON 对象，键为题号数字的字符串'
+                 '（"1"、"2"…），值为答案。单选输出一个大写字母；多选连写'
+                 '（如 "AC"）；判断题输出 "对" 或 "错"。'
+                 '看不清、没把握的题，值写 "?"。'
+                 '不要输出 JSON 以外的任何文字，不要解释。')
+    try:
+        resp = llm_chat(cfg, '\n'.join(parts), timeout=240, images=imgs)
+    except RuntimeError as e:
+        progress('    批量看图调用失败（%s），改回逐题。'
+                 % str(e)[:100], 'warn')
+        return _solve_by_vision(cfg, timus, progress)
+    got = _parse_llm_answers(resp, max(t['no'] for t in timus),
+                             types={t['no']: t['atype'] for t in timus})
+    out = {}
+    for t in timus:
+        a = got.get(t['no'])
+        if a:
+            c = _clean_vision_answer(a, t.get('atype'))
+            if c:
+                out[t['no']] = c
+    if not out:
+        progress('    批量看图的回答解析不出来，改回逐题。', 'warn')
+        return _solve_by_vision(cfg, timus, progress)
+    miss = [t['no'] for t in timus if t['no'] not in out]
+    if miss:
+        # 合批没答上的少量题单独补问一次：总代价仍远低于每题都发
+        left = [t for t in timus if t['no'] in miss]
+        progress('    合批里有 %d 题没答上，逐题补问。' % len(left))
+        out.update(_solve_by_vision(cfg, left, progress))
+    progress('    合批看图：一次请求答上 %d/%d 题。'
+             % (len(out), len(timus)))
+    return out
+
+
 def llm_solve(cfg, timus, progress):
     """把整卷发给大模型。返回 {题号: 答案}，没答上的题不出现。
 
@@ -4785,15 +5096,22 @@ def llm_solve(cfg, timus, progress):
     cache = _answer_cache_load()
     ans, rest = {}, []
     for t in todo:
-        # 有图的题不查缓存也不用缓存：截图内容（图形 / 公式）没法用题干哈希
-        # 代表，拿旧答案复用有答错的风险，宁可多花一次调用。
-        # 字体反爬的题同样不查：题干是乱码，哈希能对上但语义完全不可靠
-        # （两道不同的题可能都是「惪想惥惦…」这类替换串）。
-        if not t.get('shot') and not t.get('scrambled'):
-            hit = cache.get(_stem_key(t.get('stem')))
-            if hit:
-                ans[t['no']] = hit
-                continue
+        # v6.25：有**图片指纹**的题也能查缓存了。真机 4.7 / 5.8 整卷都是图，
+        # 题干哈希是空串——以前这类题每次重刷都整卷重问一遍。图片地址是内容
+        # 哈希、选项顺序三轮加载一致，所以同一串图 = 同一道题、同一套字母。
+        # 没有指纹的带图题仍然不查（截图代表不了题干，老规矩）。
+        k = _cache_key(t)
+        if not k:
+            rest.append(t)
+            continue
+        # 字体反爬且没指纹：题干是乱码，哈希对得上但语义不可靠，不查
+        if t.get('scrambled') and not _q_fp(t):
+            rest.append(t)
+            continue
+        hit = _cache_get(cache, t)
+        if hit:
+            ans[t['no']] = hit
+            continue
         rest.append(t)
     if ans:
         progress('    本地答案缓存命中 %d/%d 题%s。' % (
@@ -4813,10 +5131,22 @@ def llm_solve(cfg, timus, progress):
                  '发给模型只会得到乱码答案，按没答上处理。'
                  % '、'.join(str(t['no']) for t in blind[:8]), 'warn')
     got = {}
-    # ---- 视觉通道：带截图的题，逐题「看图作答」 ----
+    # ---- 视觉通道 ----
+    # v6.25：**纯图片客观题合并成一次请求**。真机 4.7 / 5.8 每份 15 题全是
+    # 「题干一张图 + 四个选项各一张图」，逐题发就是 15 次带图请求；合起来
+    # 一次发，模型还能同时看到全部题干，反而更不容易串题。
+    # 主观题（填空/简答）仍然一题一发：它们的作答要求各不相同，而且历史
+    # 上正是混在一起发导致答案错位。
     if vis:
-        progress('    有 %d 道题带截图，走视觉模型。' % len(vis))
-        got.update(_solve_by_vision(cfg, vis, progress))
+        batch = [t for t in vis if t['atype'] in ATYPES]
+        solo = [t for t in vis if t['atype'] not in ATYPES]
+        if batch:
+            progress('    %d 道图片题合并成一次视觉请求（省调用次数）。'
+                     % len(batch))
+            got.update(_solve_vision_batch(cfg, batch, progress))
+        if solo:
+            progress('    %d 道主观题逐题看图。' % len(solo))
+            got.update(_solve_by_vision(cfg, solo, progress))
     # ---- 文本通道：其余题照旧整卷一次发 ----
     if txt:
         lines = []
@@ -4877,13 +5207,17 @@ def llm_solve(cfg, timus, progress):
     # 图答案就不同），而 `_stem_key` 只看题干——真机 2026-10-17：1.2 第 1 题
     # （选项全是图片）看图答上的 'B' 被写进缓存，换一份作业同题干再问时会
     # 拿到这条旧答案却看不到图。字体反爬的题同理（题干是乱码，语义不可靠）。
+    # v6.25：判据从「不是截图题」改成「有图片指纹 或 不是截图题」。
+    # 纯图片题**必须**靠指纹才写得进缓存（题干是空的）；反过来，截图题
+    # 若算不出指纹就还是不能写——那正是 v6.22 那条「截图代表不了题干」。
     fresh = {t['no']: t for t in todo
              if ans.get(t['no']) not in (None, '?', '')
-             and _stem_key(t.get('stem'))
-             and not t.get('shot') and not t.get('scrambled')}
+             and _cache_key(t)
+             and not t.get('scrambled')
+             and (_q_fp(t) or not t.get('shot'))}
     if fresh:
         for t in fresh.values():
-            cache[_stem_key(t.get('stem'))] = ans[t['no']]
+            _cache_put(cache, t, ans[t['no']])
         _answer_cache_save(cache)
     progress('    大模型返回：%s' % json.dumps(ans, ensure_ascii=False)[:200])
     return ans
@@ -4942,7 +5276,18 @@ JS_GRADED_ANSWERS = r"""
         if (m) right = m[1].trim();
       }
     }
-    out.push({no: idx + 1, right: right,
+    // 回灌缓存要按选项校验（v6.25）：批阅页这份 DOM 就在手边，顺手把选项
+    // 带上——否则写进缓存的字母没有校验依据，换份卷子一重排就答错。
+    const opts = [];
+    li.querySelectorAll('input[name^=answer]').forEach(x => {
+      if (x.type === 'hidden') return;
+      const lab = x.closest('li') || x.parentElement;
+      const im = lab ? lab.querySelector('img') : null;
+      opts.push({val: x.value,
+                 label: ((lab && lab.innerText) || '').replace(/\s+/g, ' ').trim().slice(0, 120),
+                 img: im ? (im.getAttribute('src') || '').split('/').pop() : ''});
+    });
+    out.push({no: idx + 1, right: right, opts: opts,
               mine: ((li.innerText || '').match(/我的答案\s*[:：]\s*([^\n]{0,80})/) || [])[1] || ''});
   });
   return out;
@@ -4990,6 +5335,7 @@ def _harvest_graded(hw, log, progress):
     # 题干：能解析到就用解析出的（已剥过题号前缀，与答题页口径一致）；
     # 解析不到就退回批阅页自己那份 DOM，同样走 _stem_key 归一。
     stem_map = {}
+    opt_map = {}
     try:
         timus = _poll(hw, JS_PARSE_TIMUS, lambda v: bool(v), 8000, 400) or []
     except Exception:
@@ -4999,6 +5345,9 @@ def _harvest_graded(hw, log, progress):
         if t.get('scrambled'):
             continue
         stem_map[t['no']] = t.get('stem') or ''
+        # v6.25：回灌也要留选项指纹，否则这份答案在缓存里没有校验依据
+        if t.get('opts'):
+            opt_map[t['no']] = _opt_map(t)
     if not stem_map:
         try:
             rows = hw.evaluate(r"""() => {
@@ -5012,8 +5361,16 @@ def _harvest_graded(hw, log, progress):
                 stem_map[int(r['no'])] = r.get('stem') or ''
         except Exception:
             return 0
+    # 解析不到题干时退回批阅页 DOM：那份里也有 opts（JS 已顺手带走），
+    # 题干和选项要在同一份 DOM 上取，否则字母对不上同一套选项。
+    if not opt_map:
+        for g in graded:
+            if g.get('opts'):
+                om = _opt_map({'opts': g['opts']})
+                if om:
+                    opt_map[g['no']] = om
     try:
-        return _cache_graded(stem_map, graded, progress)
+        return _cache_graded(stem_map, graded, progress, opt_map)
     except Exception:
         return 0
 
@@ -5043,12 +5400,16 @@ def _strip_blank_prefix(s):
     return s
 
 
-def _cache_graded(stem_map, graded, progress):
+def _cache_graded(stem_map, graded, progress, opt_map=None):
     """把已批阅页的正确答案写回本地答案缓存（按题干归一后的哈希）。
 
     stem_map: {题号: 题干}。只写**读得到题干且答案非空**的题。
     返回写入条数。字体反爬的题干是乱码，写进去只会污染缓存——调用方
     传进来的 stem_map 已把这类题滤掉。
+
+    opt_map: {题号: {显示字母: 选项指纹}}（v6.25）。写进去的答案要能被
+    `_cache_get` 校验；不校验的旧条目在换卷重排后会把答案填到别的选项上。
+    没有选项的题（填空/简答）照旧写纯字符串。
     """
     if not graded or not stem_map:
         return 0
@@ -5062,14 +5423,352 @@ def _cache_graded(stem_map, graded, progress):
         k = _stem_key(stem)
         if not k:
             continue
-        if cache.get(k) != right:
-            cache[k] = right
+        m = (opt_map or {}).get(g['no']) or {}
+        val = {'a': right, 'o': sorted(m.items())} if m else right
+        if cache.get(k) != val:
+            cache[k] = val
             n += 1
     if n:
         _answer_cache_save(cache)
         progress('    已把平台给的 %d 条正确答案回灌本地缓存（下次同题直接命中）。'
                  % n)
     return n
+
+
+# ================================================================ 成绩 / 重做
+# 背景（2026-10-18，v6.24）：用户要「扫描时顺带查成绩」，并把低于 85 分的
+# 测验自动重刷（最多 2 次，取最高分）。
+#
+# 真机实测三种页面的可见信号（大学物理 1.7~7.8 全部核过）：
+#   ① 已批阅且有成绩：正文有「本次成绩：100 / 最终成绩：100」+「还可以重做5次」
+#   ② 未到及格线：正文明说「未达到及格线，请重做」，但**不显示分数**
+#   ③ 待完成/已重做：正文「待完成」，没有成绩也没有「未达到及格线」
+# 所以「低于 85 分」只能对 ① 精确判定；② 一律当作「不及格、该重刷」。
+JS_SCORE = r"""
+() => {
+  const t = (document.body ? document.body.innerText : '').replace(/\r/g, '');
+  const flat = t.replace(/\s+/g, ' ');
+  const num = re => { const m = flat.match(re); return m ? parseFloat(m[1]) : null; };
+  // 「本次成绩」是这一轮真正生效的分数；「最终成绩」在多次作答后才是最高分，
+  // 但页面上两者通常相同。优先本次，取不到再退最终。
+  let score = num(/本次成绩\s*[:：]?\s*([\d.]+)/);
+  if (score === null) score = num(/最终成绩\s*[:：]?\s*([\d.]+)/);
+  const left = num(/还可以重做\s*(\d+)\s*次/);
+  // 满分：标题行「共N题,M分」里的 M；取不到就按 100。
+  const full = num(/共\s*\d+\s*题\s*[，,]\s*([\d.]+)\s*分/);
+  // 「是不是答题页」：有提交按钮或没渲染出批阅信息，都说明还没交。
+  // ⚠ 真机 2026-10-18（2.6 未及格）踩过：答题页顶部也写着「未达到及格线，
+  //   请重做」——那是提示文案，不是可点的重做入口。拿它当按钮去找一定扑空。
+  //   真正能点「重做」的只有**已批阅页**（有本次成绩 + 正确答案 + 重做链接）。
+  const submitBtn = !!document.querySelector(
+    '#confirmSubmitWork, #form1submit, .btnBlueSubmit, a[onclick*=submit]');
+  return {
+    score: score,
+    full: full || 100,
+    left: left,
+    canRedo: /重做/.test(flat) && left !== 0,
+    graded: /本次成绩|最终成绩|正确答案/.test(flat),
+    notPass: /未达到及格线|请重做/.test(flat),
+    pending: /待完成/.test(flat),
+    done: /已完成/.test(flat),
+    isAnswerPage: submitBtn || !/本次成绩|正确答案/.test(flat),
+    nQ: document.querySelectorAll('.questionLi,.TiMu').length
+  };
+}
+"""
+
+
+def read_score(frame) -> dict:
+    """读一个作业卡当前页面的成绩/重做状态。读不到返回 {}。
+
+    只读，不点任何按钮。frame 已分离/页面结构不认识时返回 {}，
+    调用方据此按「未知」处理——绝不把「读不到」当成「没分」。
+    """
+    try:
+        d = frame.evaluate(JS_SCORE)
+    except Exception:
+        return {}
+    return d if isinstance(d, dict) else {}
+
+
+# 点「重做」→ 等弹窗 → 点「确定」。
+# 真机结构（2026-10-18）：批阅页有一个文字为「重做」的按钮，点了弹 #redoWin
+# 对话框「之前答题内容会保留，确认重做？」，再点「确定」才真的调 retest()。
+# 分两步是为了能如实区分「没有重做按钮」和「弹窗没出来」。
+JS_CLICK_REDO = r"""
+() => {
+  // 真机 2026-10-18（7.8 批阅页）实测的按钮长这样：
+  //   <span style="..." onclick="$('.mask').css('display','block');$('#redoWin').show();">重做</span>
+  // 它是叶子节点、没有 id/class，只有文本 + onclick 指向 #redoWin。
+  // 所以：① 先按「叶子节点且文本正好是重做」找（别用 closest，会把整块
+  //        答题区都算进来）；② 再按 onclick 里出现 redoWin / retest 兜底。
+  const leaf = e => e && e.children.length === 0;
+  const norm = e => ((e.innerText || e.value || '') + '').replace(/\s+/g, '');
+  const cands = [...document.querySelectorAll('a,button,span,div,i,em')];
+  let b = cands.find(e => leaf(e) && norm(e) === '重做' && (e.offsetWidth || e.offsetHeight));
+  if (!b) b = cands.find(e => norm(e) === '重做');
+  if (!b) {
+    b = cands.find(e => {
+      const oc = e.getAttribute('onclick') || '';
+      return /redoWin|retest/i.test(oc) && (e.offsetWidth || e.offsetHeight);
+    });
+  }
+  if (!b) return 'none';
+  b.click();
+  return 'ok';
+}
+"""
+
+JS_CONFIRM_REDO = r"""
+() => {
+  // 弹窗结构（真机 7.8）：#redoWin 里两个按钮，文案「确定」「取消」。
+  // 找可见的那一个——弹窗本身可能还在 display:none 里闪一下。
+  const win = document.querySelector('#redoWin');
+  const scope = win || document.querySelector('.layui-layer') || document;
+  const leaf = e => e && e.children.length === 0;
+  const norm = e => ((e.innerText || e.value || '') + '').replace(/\s+/g, '');
+  const ok = [...scope.querySelectorAll('a,button,span,div,input')].find(
+    e => norm(e) === '确定' && (e.offsetWidth || e.offsetHeight));
+  const b = ok || [...scope.querySelectorAll('a,button,span,div,input')]
+    .find(e => norm(e) === '确定');
+  if (!b) return 'none';
+  b.click();
+  return 'ok';
+}
+"""
+
+
+def _click_redo(hw) -> str:
+    """在批阅页点「重做」并确认。返回 ok / none / no-dialog。"""
+    try:
+        if hw.evaluate(JS_CLICK_REDO) != 'ok':
+            return 'none'
+    except Exception:
+        return 'none'
+    # 弹窗是平台 JS 现渲染的，给它一点时间
+    for _ in range(12):
+        time.sleep(0.25)
+        try:
+            if hw.evaluate(JS_CONFIRM_REDO) == 'ok':
+                return 'ok'
+        except Exception:
+            return 'ok'      # 点击后 frame 可能立刻分离（正在导航），算成功
+    return 'no-dialog'
+
+
+def _wait_answer_frame(page, timeout=20.0):
+    """重做后等答题页出现。返回 (frame, note)。
+
+    retest() 是 GET {_HOST_CP2_}/work/retest，平台处理完才 302 回
+    doHomeWorkNew；网络慢时会先看到一批空 frame。所以就按 URL 找
+    doHomeWorkNew，超时返回 (None, 'timeout')。
+    """
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        for f in page.frames:
+            if 'doHomeWorkNew' in (f.url or ''):
+                return f, 'ok'
+        time.sleep(0.4)
+    return None, 'timeout'
+
+
+def _score_of(d) -> float:
+    """把 read_score 的结果转成可比较的分数；读不到返回 -1。"""
+    try:
+        s = d.get('score')
+        return float(s) if s is not None else -1.0
+    except Exception:
+        return -1.0
+
+
+def needs_retake(d, threshold=85.0) -> bool:
+    """看 read_score 的结果，判断这份要不要重刷。
+
+    三种情况：
+      · 明确低于阈值（满分不是 100 的按百分比折算）→ 要
+      · 平台明说「未达到及格线，请重做」→ 要（此时页面不给分数）
+      · 其余（无成绩 / 已达标 / 读不到）→ 不要
+
+    ⚠ 不能只看 score：不及格页面（真机 2.6 / 3.10 / 6.6）**根本不显示分数**，
+      只写「未达到及格线，请重做」。漏掉这条会让最该重刷的几份全被跳过。
+
+    ⚠ 也不能只看 notPass：**答过的答题页顶部同样会写「未达到及格线，请重做」**
+      （2.6 实测）。那种页面读出来 notPass=true、score=None、isAnswerPage=true，
+      但它的实质是「已点过重做、正等你答」——该做的是**接着答**，不是再点一次重做。
+      所以：有分数就按分数判；没分数时，只有「已批阅但不及格」才算够格重刷；
+      纯答题页交给调用方按「answer」处理。
+    """
+    if not isinstance(d, dict) or not d:
+        return False
+    s = _score_of(d)
+    if s >= 0:
+        try:
+            full = float(d.get('full') or 100) or 100.0
+        except Exception:
+            full = 100.0
+        pct = s * 100.0 / full
+        return pct < float(threshold or 85.0)
+    # 没分数：已批阅 + 未达及格线 → 该重刷
+    if d.get('graded') and d.get('notPass'):
+        return True
+    # 答题页（待完成 / 未及格提示）不算「该重刷」，它本来就在等作答
+    return False
+
+
+def needs_answer(d) -> bool:
+    """这份是不是「就等着作答」——平台已判不及格、但页面已经是答题页。
+
+    真机 2026-10-18：2.6 / 3.10 / 6.6 三份都渲染成 doHomeWorkNew 答题页，
+    顶部写着「未达到及格线，请重做」，可页面上根本没有可点的「重做」按钮
+    （那是已批阅页才有的）。这种份的正确动作是**直接作答交卷**，不是再去找
+    一个不存在的按钮。区分它和「从没做过的待完成」：后者 graded 也是 false，
+    但正文没有「未达到及格线」。
+    """
+    return bool(isinstance(d, dict)
+                and (d.get('pending') or d.get('notPass'))
+                and not d.get('graded'))
+
+# ================================================================ 成绩清单
+# 扫描期「顺带查成绩」：作业列表只给「已完成 / 未完成」，不给分数；分数只在
+# 打开作业卡之后的批阅页上。所以要对章节页里**像作业卡**的节点逐个打开读一次。
+#
+# 成本控制（真机 2026-10-18 实测）：
+#   · 只碰标题带「测试/测验/练习/作业/考试」的节点（章节列表里已经能判），
+#     视频/文档节点一个都不开；
+#   · 每个节点先正常打开作业卡（_wait_hw_iframe 会逐格找选项卡）；
+#   · 主 frame 的 URL 是 doHomeWorkNew = 还没做的作业，直接跳过不读分；
+#     只有 selectWorkQuestionYiPiYue / 正文带「本次成绩」的才读；
+#   · 失败一律记「未知」，绝不把没读到当成 0 分。
+def _norm_node_name(s) -> str:
+    """把「1.8 单元测试」「1.8.1 单元测试」这类节点名归一，用来对齐作业列表。"""
+    s = re.sub(r'\s+', ' ', (s or '')).strip()
+    return s
+
+
+def _reconcile_fake_done(rec, listed_pending) -> bool:
+    """这份是不是「章节列表说已完成、测验卡说没做」。
+
+    真机 2026-10-18（大学物理 4.7 / 5.8）：章节目录里挂的是
+    `icon_yiwanc / 已完成`，可点进去是 doHomeWorkNew 答题页、
+    read_score 给出 pending=True、score=None。平台的目录进度和测验卡
+    各记各的，目录那份是错的。
+
+    判据只认「卡片明确说没做」：
+      · pending=True（答题页顶部的「待完成」）；
+      · 或者 nQ>0 且三样都没有（没分数、没批阅、没未及格提示）——
+        那是「打开了答题页但从没提交过」。
+    章节列表**已经**把它算作欠账的（listed_pending）不算 fake——那种
+    节点本来就在待办里，再标一次只会重复。读不到状态（没作业卡）也不标：
+    不知道的事不能当成「没做」，否则会平白多出一批假任务让用户去点。
+    """
+    if not isinstance(rec, dict):
+        return False
+    if rec.get('inChapterList'):
+        return False
+    if rec.get('pending'):
+        return True
+    return bool(rec.get('nQ')) and not (
+        rec.get('graded') or rec.get('score') is not None
+        or rec.get('notPass') or rec.get('done'))
+
+
+def scan_scores(cfg, page, c, cpi, progress, control=None, deep_nodes=None) -> dict:
+    """逐节点读一份课程里测验/作业的成绩。返回 {'items': [...], 'failed': n}。
+
+    page 必须是**已登录**的一个新标签页（调用方负责 ctx/page 生命周期）。
+
+    items 里每项的字段（界面/报告直接吃）：
+      kid / node / score / full / left(剩余重做次数) / graded / notPass /
+      pending / done / canRedo / url(该节点的作业直达链接)
+
+    只读：不点重做、不填、不交。
+    """
+    control = control or (lambda: 'run')
+    out = {'items': [], 'failed': 0}
+    try:
+        pd = fetch_progress_detail(page, c, cpi, cfg)
+    except Exception as e:
+        return {'items': [], 'failed': 1,
+                'reason': str(e).splitlines()[0][:120]}
+    if pd.get('page_failed'):
+        return {'items': [], 'failed': 1, 'reason': pd.get('reason', '')}
+    nodes = pd.get('all') or []
+    if deep_nodes:
+        nodes = [n for n in nodes if n.get('kid') in deep_nodes]
+    if not nodes:
+        return out
+    # v6.25：章节列表**自己认为欠账**的 kid。作业卡说「待完成」而这里没有它
+    # → 平台的目录标记和测验卡对不上，就是用户报的「显示任务点已完成、其实
+    # 没做」。见 _reconcile_fake_done 的注释。
+    listed_pending = {n.get('kid') for n in (pd.get('pending') or [])
+                      if n.get('kid')}
+
+    for n in nodes:
+        if control() == 'stop':
+            break
+        kid, name = n.get('kid'), n.get('name') or ''
+        url = _cards_url(c, cpi, kid, 0)
+        rec = {'kid': kid, 'node': name, 'url': url,
+               'score': None, 'full': 100, 'left': None, 'graded': False,
+               'notPass': False, 'pending': False, 'done': False,
+               'canRedo': False, 'note': '',
+               # v6.25：章节列表说它完成了，测验卡却说待完成 / 从没做过。
+               # 这类节点以前**根本不会被扫到**（章节列表不给 .catalog_jindu
+               # 就不进待办），用户只能自己一个个点进去才发现。
+               'fakeDone': False, 'inChapterList': kid in listed_pending}
+        try:
+            page.goto(url, wait_until='domcontentloaded')
+            page.wait_for_timeout(1000)
+            tabs = _cards_tabs(page)
+            order = _tab_order(tabs) if tabs else list(range(MAX_CARDS_TABS))
+            hw, note = _wait_hw_iframe(page, url, lambda *a: None, tabs=order)
+            if not hw:
+                if note == 'norender':
+                    rec['note'] = '作业卡打不开'
+                else:
+                    rec['note'] = '没有作业卡'
+                out['items'].append(rec)
+                continue
+            d = read_score(hw)
+            if not d:
+                rec['note'] = '页面读不到'
+                out['items'].append(rec)
+                continue
+            rec.update({'score': d.get('score'), 'full': d.get('full') or 100,
+                        'left': d.get('left'), 'graded': bool(d.get('graded')),
+                        'notPass': bool(d.get('notPass')),
+                        'pending': bool(d.get('pending')),
+                        'done': bool(d.get('done')),
+                        'canRedo': bool(d.get('canRedo')),
+                        'nQ': d.get('nQ') or 0})
+            rec['fakeDone'] = _reconcile_fake_done(rec, listed_pending)
+            if d.get('score') is None and not d.get('graded'):
+                rec['note'] = ('待完成' if d.get('pending')
+                               else ('未及格（无分数）' if d.get('notPass')
+                                     else '无成绩'))
+                rec['pending'] = bool(d.get('pending'))
+            out['items'].append(rec)
+            progress('    · %-24s %s' % (
+                cut(name, 24),
+                ('%s 分' % _fmt_num(rec['score'])) if rec['score'] is not None
+                else (rec['note'] or '无成绩')))
+        except Exception as e:
+            rec['note'] = '读取失败：%s' % str(e).splitlines()[0][:60]
+            out['failed'] += 1
+            out['items'].append(rec)
+        time.sleep(random.uniform(0.6, 1.4))
+    return out
+
+
+def _fmt_num(v) -> str:
+    """分数显示：100.0 → 100，73.3 → 73.3，读不到 → —。"""
+    if v is None:
+        return '—'
+    try:
+        f = float(v)
+        return ('%d' % f) if abs(f - round(f)) < 1e-9 else ('%.1f' % f)
+    except Exception:
+        return str(v)
 
 
 def _looks_graded(frame):
@@ -5496,6 +6195,231 @@ def _dump_page_diag(t, why):
             f.write(json.dumps(rec, ensure_ascii=False) + '\n')
     except Exception:
         pass
+
+
+def retake_one(page, c, cpi, kid, cfg, progress, threshold=85.0,
+               max_retakes=2, control=None) -> dict:
+    """对单个节点：读成绩 → 不够就点「重做」，返回状态给调用方接着答题。
+
+    返回 {'kid','before','left','status'}，status ∈
+      'ok'(已达标) / 'unknown'(读不到) / 'nohw'(没有作业卡) /
+      'nochance'(没重做机会了) / 'noredo'(找不到重做按钮) /
+      'redo'(已点重做，页面正在跳答题页) / 'answer'(本来就是重做态，直接答)
+
+    ⚠ 重做后必须**重新答题**而不是搬批阅页的「正确答案」：
+      真机 2026-10-18（大学物理 4.7）实测，重做后平台连**题目顺序都重排**
+      （批阅页第 10 题在重做页成了第 6 题），只有选项显示字母不变。按题号搬
+      必错；按题干匹配又撞上一堆「题干是图片」的题（只剩「1 【单选题】 A B C D」）。
+      所以老老实实重答一遍——v6.23 的显示字母落答实测能把 1.8/2.2/马原答到 100。
+    """
+    control = control or (lambda: 'run')
+    out = {'kid': kid, 'before': None, 'left': None, 'status': 'nohw'}
+    url = _cards_url(c, cpi, kid, 0)
+    try:
+        page.goto(url, wait_until='domcontentloaded')
+        page.wait_for_timeout(1000)
+        tabs = _cards_tabs(page)
+        order = _tab_order(tabs) if tabs else list(range(MAX_CARDS_TABS))
+        hw, _note = _wait_hw_iframe(page, url, log, tabs=order)
+    except Exception as e:
+        out['status'] = 'error'
+        out['reason'] = str(e).splitlines()[0][:80]
+        return out
+    if not hw:
+        return out
+    d = read_score(hw)
+    out['before'] = d.get('score')
+    out['left'] = d.get('left')
+    if not d:
+        out['status'] = 'unknown'
+        return out
+    # ⚠ 顺序要紧：先判「已在答题页」再判「已达标」。答题页读出来是
+    #   score=None + notPass=True，needs_retake 按设计会返回 False（那是给
+    #   query_scores 区分「该不该点重做」用的），早退成 ok 就把这份漏掉了
+    #   ——真机 2.6 / 3.10 / 6.6 正是这种页面，会一份都答不上。
+    if needs_answer(d) or d.get('pending') or d.get('isAnswerPage'):
+        out['status'] = 'answer'
+        return out
+    if not needs_retake(d, threshold):
+        out['status'] = 'ok'
+        return out
+    if d.get('left') == 0 or not d.get('canRedo'):
+        out['status'] = 'nochance'
+        return out
+    act = _click_redo(hw)
+    if act != 'ok':
+        out['status'] = 'noredo'
+        out['reason'] = act
+        return out
+    out['status'] = 'redo'
+    # 等 retest() 的 302 落到 doHomeWorkNew。真机实测这一步要 3~10 秒
+    # （平台先在服务端重置作答记录，再跳答题页）。等不到不算失败：
+    # 答题页可能下一屏自己出来，answer_one 会重新导航一次，所以照实返回
+    # redo，让调用方接着走答题链。
+    f2, how = _wait_answer_frame(page, timeout=20.0)
+    out['answered_page'] = bool(f2)
+    return out
+
+
+def _read_node_score(page, c, cpi, kid) -> dict:
+    """重新打开某节点的作业卡读一次成绩（重刷交卷后用）。读不到返回 {}。"""
+    url = _cards_url(c, cpi, kid, 0)
+    try:
+        page.goto(url, wait_until='domcontentloaded')
+        page.wait_for_timeout(1000)
+        tabs = _cards_tabs(page)
+        order = _tab_order(tabs) if tabs else list(range(MAX_CARDS_TABS))
+        hw, _n = _wait_hw_iframe(page, url, lambda *a: None, tabs=order)
+    except Exception:
+        return {}
+    return read_score(hw) if hw else {}
+
+
+def query_scores(cfg, only, threshold=85.0, retake=True, max_retakes=2,
+                 progress=None, control=None, headless=None) -> dict:
+    """「查成绩 + 低于阈值重刷」总入口（界面「查成绩 / 重刷」按钮用）。
+
+    每门勾选的课：① 章节页取全部「像作业卡」的节点；② 逐个打开只读成绩；
+    ③ 低于 threshold（或平台明说未达及格线）且还能重做 → 点重做、重新作答
+    并交卷；④ 每份最多尝试 max_retakes 次，记最终成绩。
+
+    ⚠ 重刷会真的消耗平台重做次数并重新交卷——只在用户点按钮、且确实低于阈值时做。
+    ⚠ 报告里的分数是**最后一次读完的结果**；平台批阅可能延迟，读不到时如实
+      记「未确认」，绝不把读不到写成 0 分。
+    """
+    progress = progress or (lambda m, *a: log(m, a[0] if a else 'info'))
+    control = control or (lambda: 'run')
+    t0 = time.time()
+    thr = float(threshold or 85.0)
+    cap = max(int(max_retakes or 2), 1)
+    out = {'items': [], 'retaken': 0, 'improved': 0, 'failed': 0,
+           'stopped': False, 'threshold': thr, 'max_retakes': cap}
+    ctx = launch(cfg, headless=headless)
+    try:
+        page = ctx.new_page()
+    except Exception:
+        close_ctx(ctx)
+        raise
+    try:
+        banner('检查登录状态')
+        if not check_login(page):
+            if restore_state(ctx) and check_login(page):
+                log('已用本地会话自动登录 ✓')
+            else:
+                raise NotLoggedIn('未登录')
+        _quiet_win(page, cfg, headless)
+        courses, cpi = collect_courses(page, cfg)
+        keep, node_keep = split_only(only)
+        picked = [c for c in courses if course_key(c) in keep]
+        if not picked:
+            raise RuntimeError('要查成绩的课程没匹配到（课程可能有变动）')
+        banner('查成绩（%d 门课；%s）'
+               % (len(picked),
+                  ('低于 %s 分自动重刷，每份最多 %d 次'
+                   % (_fmt_num(thr), cap)) if retake else '只看分不重刷'))
+        for i, c in enumerate(picked, 1):
+            if _wait_control(control, progress) == 'stop':
+                out['stopped'] = True
+                break
+            progress('【%d/%d】%s' % (i, len(picked), c['name']))
+            want = node_keep.get(course_key(c))
+            try:
+                sc = scan_scores(cfg, page, c, cpi, progress, control,
+                                 deep_nodes=want)
+            except Exception as e:
+                progress('  ⚠ 这门课成绩没查成（%s），跳过。'
+                         % str(e).splitlines()[0][:80], 'warn')
+                out['failed'] += 1
+                continue
+            for rec in (sc.get('items') or []):
+                rec['course'] = c['name']
+                rec['key'] = course_key(c)
+                out['items'].append(rec)
+                if control() == 'stop':
+                    break
+                if not retake:
+                    continue
+                # 「该重刷」或「平台已判不及格、页面就在等你答」都算要处理。
+                # 后者没有重做按钮可点，直接进作答分支（见下面的 answer_first）。
+                # ⚠ 只看 notPass，不看 pending：pending 的节点既可能是「从没做过
+                #   的作业」，也可能是「点过重做还没交的卷子」，页面分不出来。
+                #   用户要的是「不及格的要重刷」，不是「替我把没做的作业全做了」
+                #   ——所以纯待完成的只报告，不自动动手。
+                answer_first = (not needs_retake(rec, thr)) and \
+                    needs_answer(rec) and bool(rec.get('notPass'))
+                if not needs_retake(rec, thr) and not answer_first:
+                    continue
+                if answer_first:
+                    pass
+                elif not rec.get('canRedo'):
+                    progress('    · %s 低于 %s 分，但平台没有重做入口，跳过。'
+                             % (cut(rec.get('node', ''), 20), _fmt_num(thr)),
+                             'warn')
+                    continue
+                best = _score_of(rec)
+                tries = 0
+                while tries < cap and control() != 'stop':
+                    tries += 1
+                    progress('    ↻ %s：第 %d 次重刷（当前 %s）…'
+                             % (cut(rec.get('node', ''), 20), tries,
+                                ('%s 分' % _fmt_num(rec.get('score')))
+                                if rec.get('score') is not None else '未及格'))
+                    r = retake_one(page, c, cpi, rec['kid'], cfg, progress,
+                                   threshold=thr, max_retakes=1)
+                    if r.get('status') not in ('redo', 'answer'):
+                        progress('    ✗ 第 %d 次重刷没进行下去（%s）。'
+                                 % (tries, r.get('status')), 'warn')
+                        break
+                    out['retaken'] += 1
+                    # 页面此刻已在答题页：走正常作答链（解析→模型→落答→交卷）
+                    try:
+                        st = answer_one(page, c, cpi, rec['kid'], cfg, True,
+                                        progress)
+                    except Exception as e:
+                        progress('    ✗ 重刷作答失败（%s）。'
+                                 % str(e).splitlines()[0][:80], 'warn')
+                        out['failed'] += 1
+                        break
+                    if st not in ('submitted', 'already', 'unverified'):
+                        progress('    ⚠ 重刷后没确认交卷（%s），停止对这题继续重刷。'
+                                 % st, 'warn')
+                        break
+                    d = {}
+                    for _ in range(6):
+                        time.sleep(3)
+                        d = _read_node_score(page, c, cpi, rec['kid'])
+                        if d and _score_of(d) >= 0:
+                            break
+                    cur = _score_of(d) if d else -1
+                    if d:
+                        # 平台对重做取哪次分不公开，所以自己记：对外一律报
+                        # **最高分**（用户选的就是「取最高分」），最后一次另存
+                        # last 供排查。读不到（cur<0）不覆盖已知的最好成绩。
+                        rec['last'] = d.get('score')
+                        rec['left'] = d.get('left')
+                        rec['canRedo'] = bool(d.get('canRedo'))
+                        if cur >= 0:
+                            best = max(best, cur)
+                            rec['after'] = best
+                    if cur >= thr:
+                        progress('    ✓ %s：重刷后 %s 分，达标。'
+                                 % (cut(rec.get('node', ''), 20), _fmt_num(cur)))
+                        break
+                    progress('    · 重刷后 %s，仍未达标。'
+                             % (('%s 分' % _fmt_num(cur)) if cur >= 0 else '读不到成绩'))
+                rec['attempts'] = tries
+                rec['best'] = best if best >= 0 else rec.get('score')
+                # 「改善」= 重刷后的最好成绩比动手前那一次高
+                if (best >= 0 and rec.get('score') is not None
+                        and best > float(rec['score'])):
+                    out['improved'] += 1
+        progress('查成绩结束：%d 份测验，重刷 %d 次，失败 %d 门，用时 %.1f 分钟。'
+                 % (len(out['items']), out['retaken'], out['failed'],
+                    (time.time() - t0) / 60))
+    finally:
+        save_state(ctx)
+        close_ctx(ctx)
+    return out
 
 
 def answer_one(page, c, cpi, kid, cfg, submit, progress, pre=None, detail=None,
@@ -6093,6 +7017,32 @@ def answer_urls(cfg, targets, progress=None, control=None, headless=None,
     return out
 
 
+def _supplement_wanted(nodes, pd, want, progress=None):
+    """把用户明确勾选、但不在待完成清单里的 kid 补回节点列表。
+
+    v6.25。背景：平台的章节目录会把「测验卡其实是空的」节点标成已完成
+    （真机 2026-10-18 大学物理 9/25 个这样），这类节点不在 pending 里。
+    用户是**看着清单勾的**，勾了就该照做——打开后真是做完的，answer_one
+    会走 'already' 并把平台正确答案回灌缓存；真是空的就直接答。
+    """
+    have = {n.get('kid') for n in nodes}
+    miss = [k for k in want if k not in have]
+    if not miss:
+        return nodes
+    meta = {n.get('kid'): n for n in (pd.get('all') or []) if n.get('kid')}
+    extra = []
+    for kid in miss:
+        m = meta.get(kid)
+        # 章节页的 all 清单里没有这个 kid（页面改版/课程变动）也照做：
+        # 用户勾的是 ID，平台按 ID 能打开就行。
+        extra.append({'name': (m or {}).get('name') or ('节点 %s' % kid),
+                      'kid': kid, 'count': 1, 'fakeDone': True})
+    if progress:
+        progress('  勾选的 %d 个节点不在待完成清单里（平台标了已完成），'
+                 '仍按你的勾选打开确认…' % len(extra))
+    return nodes + extra
+
+
 def answer_courses(cfg, only, submit=False, progress=None, control=None,
                    headless=None) -> dict:
     """按课程自动做章节任务点里的作业。
@@ -6161,12 +7111,19 @@ def answer_courses(cfg, only, submit=False, progress=None, control=None,
             nodes = [n for n in (pd.get('pending') or []) if n.get('kid')]
             want = node_keep.get(course_key(c))
             if want is not None:
-                nodes = [n for n in nodes if n['kid'] in want]
+                nodes = _supplement_wanted(nodes, pd, want, progress)
                 if not nodes:
                     progress('  勾选的章节已经不在待完成清单里（可能已完成）。')
                     continue
             if not nodes:
-                progress('  没有待完成的章节节点。')
+                # v6.25：整门课模式下列表只来自章节页的 pending。平台上还有
+                # 一类节点把任务点标成「已完成」、里面其实是空的（本次报的
+                # 问题）。这里不擅自扩展范围——那得逐张卡打开核对，会把时间
+                # 翻倍还可能撞限流——但必须让用户知道去哪儿勾。
+                progress('  没有待完成的章节节点。'
+                         + ('（若这门课有「平台标已完成、实际没做」的测验，'
+                            '请展开这一课单独勾选；先「查成绩」可列出它们）'
+                            if want is None else ''))
                 continue
             progress('  待处理节点 %d 个，逐个找作业卡…' % len(nodes))
             s = su = sk = f = rp = uw = pt = 0
@@ -7043,9 +8000,12 @@ JS_PARSE_QUIZ = r"""
       if (x.type === 'hidden') return;
       if (x.type === 'radio' || x.type === 'checkbox') {
         const lab = x.closest('.optionRadio') || x.closest('li') || x.parentElement;
+        const _im = lab ? lab.querySelector('img') : null;
         opts.push({name: x.name, val: x.value, type: x.type,
                    label: ((lab && lab.textContent) || x.value)
-                          .replace(/\s+/g, ' ').trim().slice(0, 150)});
+                          .replace(/\s+/g, ' ').trim().slice(0, 150),
+                   img: _im ? ((_im.getAttribute('src') || '').split('/').pop()
+                               .split('?')[0]) : ''});
       } else if (x.type === 'text' || x.type === '') {
         if (x.name) fills.push({name: x.name});
       }
@@ -7699,6 +8659,9 @@ def build_report(courses, results, stopped_at=None, scope_total=None,
         return '%s（ID:%s）' % (c['name'], c['cid']) if len(same) > 1 else c['name']
 
     undone_hw, undone_exam, undone_prog, undone_act, overview = [], [], [], [], []
+    grade_rows, low_scores = [], []
+    # v6.25：章节目录标「已完成」、测验卡其实待完成的节点（按课归拢）
+    fake_done = {}
     for i, r in enumerate(results):
         nm = label(i)
         hw, ex = r['hw'], r['exam']
@@ -7729,17 +8692,45 @@ def build_report(courses, results, stopped_at=None, scope_total=None,
                     fid or '2339', it.get('raw'))
             undone_act.append(rec)
 
+        # 成绩（只有本轮开了「顺带查成绩」才有 scores 这个键）
+        for it in (r.get('scores') or {}).get('items') or []:
+            rec = {'course': nm, 'cid': r['cid'], 'clsid': r['clsid'], **it}
+            grade_rows.append(rec)
+            # v6.25：章节目录标「已完成」、点进去其实是答题页 —— 当欠账算。
+            # 这批节点以前根本不出现（章节列表不给 .catalog_jindu），用户
+            # 只能自己一个个点进去才发现，正是本次报的那个问题。
+            if it.get('fakeDone') and it.get('kid'):
+                fake_done.setdefault(i, []).append(it)
+            if it.get('score') is not None:
+                try:
+                    if float(it['score']) < 85.0:
+                        low_scores.append(rec)
+                except Exception:
+                    pass
+            elif it.get('notPass'):
+                low_scores.append(rec)
+
+        # v6.25：这门课的「假完成」节点。它们不在章节列表的待办里，所以
+        # done/total 的进度是满的；但实际有作业没做，必须单独列出来。
+        fake = fake_done.get(i) or []
+        fake_chs = [{'name': (x.get('node') or ('节点 %s' % x.get('kid'))),
+                     'count': 1, 'kid': x.get('kid'), 'fakeDone': True,
+                     'nQ': x.get('nQ') or 0} for x in fake]
         pm = re.search(r'(\d+)\s*/\s*(\d+)', r.get('prog_text') or '')
         if pm:
             done, total = int(pm.group(1)), int(pm.group(2))
-            if done < total:
+            if done < total or fake_chs:
                 pd = r.get('prog_detail') or {}
+                chs = list(pd.get('pending') or [])
+                have = {c.get('kid') for c in chs}
+                chs += [c for c in fake_chs if c.get('kid') not in have]
                 # cid/clsid 是「自动刷视频」的定位参数：界面勾选哪门课要刷，
                 # 后端靠这两个 ID 重新找到这门课的章节页。
                 undone_prog.append({'course': nm, 'done': done, 'total': total,
                                     'rate': done * 100.0 / total if total else 0,
                                     'cid': r['cid'], 'clsid': r['clsid'],
-                                    'chapters': pd.get('pending') or []})
+                                    'chapters': chs,
+                                    'fake': len(fake_chs)})
         if hw.get('page_failed'):
             hw_txt = '⚠ 未加载'
         elif hw.get('no_module'):
@@ -7785,7 +8776,11 @@ def build_report(courses, results, stopped_at=None, scope_total=None,
         'undone_hw': undone_hw,
         'undone_exam': undone_exam,
         'undone_prog': undone_prog,
+        # v6.25：只含「章节目录说完成、实际没做」的节点（明细，界面提示用）
+        'undone_fake': [x for v in fake_done.values() for x in v],
         'undone_act': undone_act,
+        'grades': grade_rows,
+        'low_scores': low_scores,
         'overview': overview,
         'page_failed': failed_courses or [],
     }
@@ -7842,6 +8837,39 @@ def write_outputs(rep: dict) -> dict:
         L.append('无进行中的课堂活动。')
     L.append('')
 
+    # 成绩单（只有本轮开了「顺带查成绩」才非空）
+    gr = rep.get('grades') or []
+    if gr or rep.get('low_scores'):
+        low = rep.get('low_scores') or []
+        L += ['## 一·五、测验成绩（%d 份；低于 85 分 %d 份）'
+              % (len(gr), len(low)), '']
+        L += ['| # | 课程 | 测验 | 成绩 | 满分 | 剩余重做次数 | 状态 |',
+              '|---|------|------|------|------|----------------|------|']
+        for i, it in enumerate(sorted(
+                gr, key=lambda x: (x.get('score') if x.get('score') is not None
+                                   else -1)), 1):
+            sc = it.get('score')
+            sc_txt = ('**%s**' % _fmt_num(sc)) if sc is not None else '—'
+            if (sc is not None and float(sc) < 85.0) or it.get('notPass'):
+                st = '⚠ 低于 85，建议重刷'
+            elif it.get('pending'):
+                st = '待完成'
+            elif sc is not None:
+                st = '已达标'
+            else:
+                st = it.get('note') or '—'
+            L.append('| %d | %s | %s | %s | %s | %s | %s |' % (
+                i, it.get('course'), it.get('node'), sc_txt,
+                _fmt_num(it.get('full') or 100),
+                ('%d 次' % it['left']) if it.get('left') is not None else '—',
+                st))
+        if low:
+            L += ['', '> 低于 85 分的测验可以重刷（工具内「查成绩 / 重刷」按钮）：'
+                      '点「重做」后重新作答并交卷，最多重刷 2 次，取最高分。'
+                      '平台每次重做会**重排题目顺序**，所以必须重新作答，'
+                      '不能照抄上次的答案。']
+        L.append('')
+
     L += ['## 二、未完成作业（%d 项）' % len(rep['undone_hw']), '']
     if rep['undone_hw']:
         L += ['| # | 课程 | 作业名称 | 状态 | 剩余时间 | 直达链接 |',
@@ -7875,12 +8903,25 @@ def write_outputs(rep: dict) -> dict:
                 chs = it.get('chapters') or []
                 L += ['**%s**　%d/%d' % (it['course'], it['done'], it['total']), '']
                 if chs:
-                    L += ['| 章节 | 待完成任务点 |', '|------|--------------|']
+                    L += ['| 章节 | 待完成任务点 | 备注 |',
+                          '|------|--------------|------|']
                     for ch in chs:
-                        L.append('| %s | %d |' % (ch['name'], ch.get('count', 1)))
+                        L.append('| %s | %d | %s |' % (
+                            ch['name'], ch.get('count', 1),
+                            '⚠ 平台标「已完成」，实际没做' if ch.get('fakeDone')
+                            else '—'))
                     L.append('')
                 else:
                     L += ['- （未取到章节明细）', '']
+        # v6.25：单独说明这批节点，否则「完成率 100% 却出现在欠账区」看着像 bug
+        fake_all = rep.get('undone_fake') or []
+        if fake_all:
+            L += ['> **⚠ 有 %d 个任务点平台标成「已完成」，点进去其实是没做的**：'
+                  % len(fake_all),
+                  '> %s。' % '、'.join('%s（%s）' % (x.get('node'), x.get('course'))
+                                      for x in fake_all[:20]),
+                  '> 章节目录的完成图标与测验卡的状态对不上（平台侧不一致）。'
+                  '已按「未完成」计入上表；工具里勾上它们点「做作业」即可补做。', '']
     else:
         L.append('无。')
     L.append('')
@@ -7918,6 +8959,12 @@ def write_outputs(rep: dict) -> dict:
             w.writerow(['课堂活动', it['course'], it.get('name') or '',
                         it.get('kind') or '', it.get('time') or '',
                         it.get('url') or ''])
+        for it in rep.get('grades', []):
+            sc = it.get('score')
+            w.writerow(['成绩', it.get('course'), it.get('node'),
+                        _fmt_num(sc) if sc is not None else (it.get('note') or '无成绩'),
+                        ('剩余重做 %s 次' % it['left'])
+                        if it.get('left') is not None else '', it.get('url') or ''])
 
     # ---- JSON 快照，用于和上次对比
     snap_path = SNAPSHOT_DIR / ('%s.json' % stamp)
@@ -7943,6 +8990,18 @@ def write_outputs(rep: dict) -> dict:
     log('✅ 未完成作业 %d 项 / 未完成考试 %d 项 / 未完成任务点 %d 门 / 进行中活动 %d 项' % (
         len(rep['undone_hw']), len(rep['undone_exam']), len(rep['undone_prog']),
         len(rep.get('undone_act', []))))
+    _fake = rep.get('undone_fake') or []
+    if _fake:
+        # v6.25：这批节点在章节列表里显示「已完成」，不单独报一句用户根本
+        # 不会知道它们其实没做（本次报的就是这个）。
+        log('   ⚠ 另有 %d 个任务点平台标了「已完成」，点进去其实是没做的：'
+            % len(_fake), 'warn')
+        for x in _fake[:12]:
+            log('      [假完成] %s ｜ %s'
+                % (cut(x.get('course') or '', 22),
+                   cut(x.get('node') or '', 30)), 'warn')
+        if len(_fake) > 12:
+            log('      …… 另有 %d 个，见报告。' % (len(_fake) - 12), 'warn')
     for it in rep['undone_hw']:
         log('   [作业] %s ｜ %s ｜ %s ｜ %s' % (
             cut(it['course'], 22), cut(it['title'], 34), it['state'], it.get('left') or '—'))
@@ -7955,6 +9014,11 @@ def write_outputs(rep: dict) -> dict:
         log('   [活动] %s ｜ %s ｜ %s ｜ %s' % (
             cut(it['course'], 22), it.get('kind') or '活动',
             cut(it.get('name') or '', 30), it.get('time') or '—'))
+    for it in rep.get('low_scores') or []:
+        log('   [低分] %s ｜ %s ｜ %s ｜ 可重做 %s 次' % (
+            cut(it.get('course') or '', 22), cut(it.get('node') or '', 30),
+            (_fmt_num(it['score']) + ' 分') if it.get('score') is not None
+            else '未及格', it.get('left') if it.get('left') is not None else '?'))
 
     diff = compare_previous(snap_path)
     if diff:
