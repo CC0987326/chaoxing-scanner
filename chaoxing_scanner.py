@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-学习通（超星）未完成事项巡检工具  v6.25
+学习通（超星）未完成事项巡检工具  v6.31
 ================================================================
 把「登录 → 逐门课翻作业/考试/任务点/课堂活动 → 汇总成清单」这套流程固化成本地程序。
 
@@ -119,6 +119,162 @@ v6.24 要点（成绩与重刷 + 视觉通道的一处真错）：
    重刷**真的会消耗平台的剩余重做次数**，所以只在用户点按钮、且节点确实低于
    阈值时才做。平台重做时会**连题目顺序一起重排**（真机实测：批阅页第 10 题
    在重做后变成第 6 题，选项图 4/4 相同），所以不能照抄上次的答案，必须重答。
+
+v6.31 要点（窗口不入坞 + 一直在桌面上微微闪）：
+① 用户装上 v6.30 后报：「之前都是不显示的窗口，现在都变成显示的了」「这个显示
+   出来的浏览器窗口一直在微微闪烁，好像卡了一样」「以前浏览器窗口都嵌入主窗口
+   预览页面里，现在独立出来了，预览里没东西了」。
+② 根因在 `webui._main_hwnd()`：它用 `FindWindowW(None, WIN_TITLE)` 按**标题**
+   找主窗口。真机（2026-10-20）实测：Windows 11 的 explorer.exe 有一个标题
+   **恰好等于**「学习通巡检工具」的 `Windows.Internal.Shell.TabProxyWindow`
+   （任务栏分组/预览用的 135x37 代理窗，pid 11216）。`FindWindowW` 先命中它，
+   与本工具的主窗口（`WindowsForms10.Window.8.app.*`，本进程 pid）无关。
+③ 后果链：`SetParent(浏览器窗口, explorer 的代理窗)` → 必然失败 →
+   `_dock_new_windows` 走兜底分支 `MoveWindow(hwnd, 60, 60, 1200, 800, True)`，
+   把**屏外**启动（-32000,-32000）的浏览器硬搬到桌面 (60,60) —— 「以前不显示
+   的窗口现在显示了」。守夜线程**每秒**再来一遍（ShowWindow(SW_RESTORE) →
+   改窗口样式 → SetParent 失败 → MoveWindow），窗口于是「一直在微微闪」。
+   「预览里没东西」是因为 `docked` 永远空着，`dock_count()` 恒为 0。
+④ 修法一（别再按标题找）：`_main_hwnd()` 改成 EnumWindows + **本进程 pid** +
+   类名前缀 `WindowsForms10.Window.`，同标题的 explorer 代理窗 pid 对不上，
+   结构上排除。真机探针：修前返回 explorer 的 28182114，修后返回本进程的
+   主窗口；`SetParent` 成功、`parent == main`、`dock_count() == 1`。
+⑤ 修法二（失败别再搬窗口）：入坞失败时**只还原样式，绝不 MoveWindow**。
+   屏外待坞是正常状态（面板没开就看不见），把窗口甩到桌面上才是 bug。
+   同时把失败过的句柄记进 `DESKTOP['_dock_failed']`，主窗口没变就不再每秒重试
+   ——这就是「微微闪烁」的消除办法。主窗口换了（重建）才清空重试表。
+⑥ 别被「找不到主窗口」骗了：`_main_hwnd()` 现在可能返回 0（桌面窗口还没建
+   好/已关闭），那时 `_dock_new_windows` / `_dock_layout` 直接返回，窗口老实
+   留在屏外——**绝不能**退回「枚举全部 Chrome 窗口」或「找任意同标题窗口」。
+
+v6.30 要点（真机「窗口弹出来又消失、重复」——把**自己**当孤儿杀了）：
+① 用户装上 v6.29 打包版后：「一直弹出来这个浏览器窗口然后消失,重复进行
+   这个弹窗口,然后还是没用」。真机 run.log（10:58:55~10:59:11）里，每两秒
+   换一个 pid 重复「发现遗留浏览器 → 收掉 → 被已有实例接管 → 重试」：
+   25584 → 8940 → 21248 → 24432，最后逐候选全红。
+② 根因：启动判定是
+     `if ok and proc.poll() is not None:  # 端口有应答，Popen 的 pid 却退了`
+     → 判成「参数被别的实例转交」→ `_reap_orphan_browser()` 去收那只实例。
+   可 Edge 在某些机器上会先起一个**启动器替身**、自己退出，**真正的浏览器
+   另起 pid 接管同一个 DevTools 端口**。端口是本工具随机挑的空闲端口，
+   别人的实例不可能来听它——所以那个「别的实例」**就是我们刚拉起来的
+   浏览器本身**。于是窗口弹出来 → 被自己杀掉 → 换候选再起一只 → 再杀，
+   用户看到的就是「一直弹窗然后消失、重复」。
+③ 修法一（认得自己人）：新增 `_port_owner()`（iphlpapi 读 LISTEN 表，
+   约 1 毫秒）与 `_port_served_by_us()`——端口属主是浏览器 exe、命令行带
+   **本活动 profile** 且带 `--remote-debugging-port=<本端口>`、且不含
+   `--type=`，才算「我们的人」。有它就**接管**：`_PidProc` 按 pid 给真身做
+   Popen 替身，`_adopt_job_pid()` 把真身也挂进 Job，绝不杀。
+   只有「端口在应答、属主却不是我们的人」才判「被别的实例接管」。
+④ 修法二（收孤儿前排除自己人）：`_reap_orphan_browser` 先按 `_SPAWN_PORTS`
+   把「正在为我们服务的 pid」捞进 `mine`，收孤儿时跳过；复核时
+   `_profile_roots() - mine` 为空且锁被自己人占着 → 直接返回 True，
+   不再误报「有东西在接力重开浏览器」。
+⑤ 修法三（挑端口）：`_free_port()` 只保证「能 bind」，正被监听的口也可能
+   被它返回；现在挑完再用 `_port_owner()` 确认没人听，避免把上一轮还没退
+   干净的浏览器认成这一轮的。
+⑥ 修法四（路径比对）：`_cmd_has_profile()` 统一小写 + 反斜杠后比较——
+   Windows 路径不分大小写，Chromium 也可能写正斜杠；以前一个字母大小写
+   就能让「自己的浏览器」认不出来，直接退化成「收不掉 → 换罐 → 又闪一次」。
+⑦ 修法五（别再起第二只）：`_start_browser_process()` 开头先看
+   `_BROWSER['proc']` 是不是还活着，活着就直接返回。两个线程同时切浏览器
+   形态时，A 的 `stop_browser()` 之后、`ensure_browser()` 之前，B 可能已经
+   又起好一只；A 再起就撞上**自己人**攥着的 Lockfile，三个候选各白等 25 秒
+   （真机探针实测 **73.22 秒**），最后还被逼换罐。同时把「停 + 起」整体包进
+   `_BROWSER_LOCK`（改成 `RLock`，否则自己会锁死自己），形态切换才真原子。
+   注意跳过时**不改** `_BROWSER['hl']`——谎报形态会让上层误判「形态已一致」，
+   拿屏幕外的窗口去干需要用户扫码的登录。
+
+v6.29 要点（只收浏览器主进程；黑窗不再闪）：
+① **v6.28 收错了对象**。真机日志（2026-10-20 07:21:49~07:22:13）是：
+     每轮收掉 4~10 个浏览器进程（pid 3512、10176、12480、24052 …），下一轮
+     **又冒出一批新的**，四轮收不干净，用户看到「终端和浏览器一直在重复闪烁」。
+   探针实测：杀一个 **renderer** 子进程，主进程 2 秒内立刻补一个（14 个进程
+   一个不少）；**只杀主进程**（taskkill /T）→ 1.9 秒后整棵树归零、残留 0。
+   根因：`_profile_pids()` 按「命令行带本 profile」找进程，而 renderer/gpu/
+   utility **都带** `--user-data-dir`，于是把一整窝子进程都当成「遗留浏览器」
+   逐个杀——主进程一直在补人，永远收不完。
+② 本版只认**主进程**（新增 `_profile_roots()`：命令行带本 profile 且
+   **不含 `--type=`**）。主进程没有 `--type=`，子进程有；杀主进程用
+   `taskkill /F /T` 整棵树一次走干净。
+③ **黑窗不再闪**：`powershell`（查命令行）和 `taskkill` 都是控制台程序，
+   从 pythonw.exe 里起会**弹一个黑窗**——每轮都弹，就是用户看到的「终端在闪」。
+   新增 `_run_hidden()` / `_NO_WINDOW`（CREATE_NO_WINDOW），所有控制台子进程
+   一律不带窗口；`webui.py` 的 shutdown 调用同样处理。
+④ **死 pid 不再被当成「别的软件占着」**：进程刚退出时 exe 名查不到，
+   旧代码把它判成「非浏览器进程攥着锁」→ 立刻放弃并换配置目录。真机日志里那
+   一串 12796/18380/21492…「未知」就是这么来的。新增 `_pid_alive()`：
+   已经退出的 pid 直接忽略，不算占用者。
+⑤ 收完再复核：`_profile_free()` **且** `_profile_roots()` 为空才算真放开
+   （Lockfile 偶有删除/重建的空窗，光看它不够）。
+⑥ **中文安装路径下查不到进程**（本版补齐）：PowerShell 往管道里写的是**系统
+   ANSI 代码页**编码（中文系统 GBK），而解压目录本来就叫「学习通巡检工具」，
+   命令行里必然带中文。按 UTF-8 解码后整段变替换字符，`prof in cmd` 一个都
+   不命中——`_profile_free()` 说「锁被占着」、这边却列出 0 个占用者，只能
+   每轮换罐。真机抽验实测：同一份输出 UTF-8 解码命中 **0**，GBK 解码命中
+   **15**。修法：PowerShell 侧先 `ToBase64String`（纯 ASCII），Python 侧再
+   `b64decode`，彻底不依赖代码页；两个查询合并成 `_browser_procs()`。
+
+v6.28 要点（真机上「杀一个冒一个」时换罐启动）：
+① **v6.27 的清理假设错了**。真机日志（2026-10-19 21:31）是这样：
+     pid 6368 → 4788 → 20304 → 21036，每轮 RM 报一个、收掉一个，下一轮
+     **又冒出一个新的**，四轮之后仍报「进程秒退（profile 被别的实例占着）」。
+   Restart Manager 一次只报一个持有人，而 Edge 是十几个进程共用一份 profile；
+   更关键的是，真机上还有东西在**接力重开**浏览器（后台驻留/会话恢复），
+   所以「杀干净」这条路在那种机器上根本收敛不了——继续加轮数只会让用户
+   看着一堆窗口闪进闪出，最后仍然失败。
+② 本版不再赌「能杀干净」，改成**能验证 + 能换罐**：
+   · `_profile_free()` 直接**独占打开 Lockfile**（CreateFileW 共享=0）来判断
+     「到底放开没有」——能打开就是真放开，比「RM 报不报」可靠得多
+     （真机探针：RM 空 vs 独占 ERROR_SHARING_VIOLATION 32，后者才是真相）。
+   · `_reap_orphan_browser` 改成**有限轮**（最多 3 轮，每轮把命令行里带本
+     profile 的进程**全收**，不再只收 RM 报的那一个），每轮之后用
+     `_profile_free()` 复核；收不干净就如实返回 False，不再无限杀。
+   · `_start_browser_process` 在「秒退/起不来 + profile 确实被占」时，**换一份
+     全新的配置目录**（`profile_next`，与 `profile_old` 同级的归档位）再启动。
+     登录态不在 profile 里：cookie 走 `runtime/state.json`，`restore_state`
+     会重新灌回去，所以换罐**不会把用户踢下线**；换罐后子进程被 `_scavenge`
+     清掉，不会留下拖累下次启动的孤儿。
+③ 启动参数加 `--disable-background-mode`：掐掉 Edge 的「关窗后驻留后台」，
+   从源头减少这种会自己复活的浏览器。
+④ `_ACTIVE_PROFILE` 是**这次运行真正在用**的配置目录（默认 `PROFILE_DIR`）；
+   换罐成功后它指向新目录，`_browser_argv` / Stop / 预检都跟着它走。
+
+v6.27 要点（上次留下的浏览器不再挡住下次启动）：
+① **点查询弹出两个浏览器窗口，接着全部内核启动失败**（2026-10-19 打包版
+   真机）。报错原文：「exe(msedge.exe) → 进程秒退（profile 可能被别的实例
+   占着）/ chrome（未安装）/ channel(msedge.exe) → DevTools 未就绪」，同时
+   预览页签一直「无内容」。根因不在这次启动，而在**上一次运行结束后浏览器
+   还活着**：msedge 是独立进程，工具崩溃/被结束/退出路径没走到时它不会跟着
+   死，继续攥着 `runtime/profile/Lockfile`。下次启动拿同一份 profile 起新
+   进程 → Chromium 发现已有实例，把参数**转交**给它、自己秒退（老实例被
+   转交后还会**再开一个窗口**，这就是用户看到的两个窗口）→ 秒退被当成
+   「profile 被占」→ 逐候选全红。
+   本版两道防线：
+   · **提前防**：`_adopt_job` 把浏览器进程挂进一个
+     `KILL_ON_JOB_CLOSE` 的 Job Object——本进程无论怎么没的（正常退出、
+     崩溃、任务管理器结束），内核都会连带收掉浏览器整棵树，不再产生孤儿。
+   · **事后兜**：`_reap_orphan_browser` 在起新进程前问 Restart Manager「谁
+     锁着这份 profile 的 Lockfile」，只收 exe 名是 msedge/chrome 的那个，
+     别的软件占着就只 warn、绝不动手（本项目的铁律：绝不杀用户的浏览器）。
+     转交场景也会先收掉老实例再重试一轮，所以「两个窗口」不会再出现。
+   顺带修掉一条把预检变成摆设的老代码：`_profile_locked` 以前 stat 的是
+   Windows 上根本不存在的 `SingletonLock`（那是 Linux 的），现在改查真的
+   `Lockfile`。
+
+v6.26 要点（假完成能直接补做 + 关窗选择）：
+① **查出来的「假完成」以前只能看，不能做**。v6.25 的对账把它们列进清单了，
+   但查成绩/重刷那条链只处理「低于阈值」和「已判不及格」，`fakeDone` 与
+   `pending` 一律只报告。用户看到「平台标已完成 · 实际没做」却找不到下手的地方
+   ——单独勾章节能做，但谁会去逐个点。本版两条路都补上：
+   · `query_scores(..., answer_pending=True)`：把「待完成 / 假完成」的卷子
+     也纳入作答（默认关，界面上的勾选框才开）。判据是 `pending` 或
+     `fakeDone` 且卡片确实没做过，已批阅/有分数的不碰。
+   · 结果面板每行给「补做」入口，按 `kid` 直接走 `answer_one`，不用回清单找。
+   作答完的份仍按「取最高分」记账，读不到分就如实写「未确认」。
+② **任务进行中关窗**：以前点 × 直接拒绝（只打一行日志），用户以为窗口坏了。
+   现在弹原生选择框「最小化窗口 / 关闭程序」（可记住），选关闭 = 先停任务
+   （CANCEL + 有序收尾）再退。见 `webui._on_window_closing`。
 
 v6.25 要点（「显示任务点已完成、其实没做题」+ 视觉调用省钱）：
 ① **平台的两个标记会打架**。真机（大学物理·软件学院2026，账号 190****6550）
@@ -241,7 +397,7 @@ ACTIVITY_TYPES = {
 # 的「进行中 / 已结束」分桶完全一致（Vue: activeList1=进行中 activeList2=已结束）。
 
 # 版本号：界面侧栏、启动日志、使用说明都引它，别再各处手写一份
-VERSION = 'v6.25'
+VERSION = 'v6.31'
 
 # 平台自身算「已完成」的状态；除此之外都视为未完成
 DONE_STATES = ('已完成', '已互评', '待批阅', '已提交', '待互评', '已结束', '已过期')
@@ -294,6 +450,15 @@ DEFAULT_CONFIG = {
     # 任务运行期间阻止系统自动睡眠（设置里可关；默认开）。
     # 桌面/网页 UI 的 _spawn 在起任务线程时读它，决定要不要 SetThreadExecutionState。
     'keep_awake': True,
+    # v6.26：任务运行中点窗口 × 时的动作（用户勾了「记住我的选择」才写这里）。
+    #   ''       = 每次都问（默认）
+    #   'min'    = 直接最小化，任务继续跑
+    #   'quit'   = 直接停任务并退出
+    # 只认这三个值；别的值一律当没记住（手改坏了不至于让窗口关不掉）。
+    'close_action': '',
+    # v6.26：「查成绩并重刷」是否连「待完成 / 假完成」的卷子一起做。
+    # 默认关——那是在用户账号上真交卷，必须由界面上那个勾选框明确打开。
+    'answer_pending': False,
 }
 
 # ================================================================ 日志
@@ -757,7 +922,27 @@ try {
 #   · 不再每任务冷启动一整只浏览器 → 内存/耗时都降。
 # 进程一旦起来就常驻（进程死了下次 launch 会重启它）。
 _BROWSER = {'proc': None, 'port': None, 'hl': None, 'offscreen': None}
-_BROWSER_LOCK = threading.Lock()      # 只护「确保进程在跑」这一段
+# v6.28：这一次运行**真正在用**的配置目录。默认就是 PROFILE_DIR；只有当它
+# 被外部进程接力占住、`_reap_orphan_browser` 收不干净时，才会换成
+# profile_next（换罐）。换罐不掉登录：cookie 在 state.json 里，launch 时
+# restore_state 会重新灌回上下文。测试与 fresh/restore_profile 会重置它。
+_ACTIVE_PROFILE = {'dir': None}
+# 只护「确保进程在跑」这一段。用 RLock（不是 Lock）：形态切换要「停 + 起」
+# 整体原子，那段自己持锁后还会调进 ensure_browser()（它也要这把锁），
+# 普通 Lock 会把自己锁死。RLock 让同一线程重入、别的线程照样等。
+_BROWSER_LOCK = threading.RLock()
+
+# v6.30：**最近几次启动**用过的 DevTools 端口。收孤儿前按端口反查属主，
+# 把「正在为我们服务的那只浏览器」从「孤儿」名单里排除掉。
+# 真机 bug：Edge 启动器退出、真身接管端口，旧代码把这当成「被别的实例
+# 转交」并把真身收掉——窗口弹出来又消失，反复一轮轮闪。
+# 只留最近 4 个（同一时刻最多一个主进程在用，多留几个是为了覆盖「刚起完
+# 还没登记就被别处调用收孤儿」的窗口期）。
+_SPAWN_PORTS = []
+_PORT_HISTORY = 4
+# 端口反查的总闸：默认开。测试套件把它关掉，避免桩数据里的假端口号
+# 恰好撞上系统真实监听的端口（比如 --remote-debugging-port=1 是 TCPSVCS）。
+_PORT_LOOKUP_ON = True
 
 # 每线程缓存自己的 (playwright, browser, context)。Playwright sync API 必须在
 # 创建它的线程里调用；launch() 在哪个线程调就在该线程 connect，同线程复用。
@@ -804,22 +989,349 @@ def _wait_devtools(port, deadline):
     return False
 
 
-def _profile_locked():
-    """profile 目录是否已被某个 chrome 实例占着。
+def _active_profile():
+    """这一次运行实际使用的浏览器配置目录（v6.28，默认就是 PROFILE_DIR）。"""
+    return _ACTIVE_PROFILE.get('dir') or PROFILE_DIR
 
-    Windows 版 Chromium 不落 SingletonLock 文件（那是 Linux 的做法），真正的
-    保护是「有活着的进程持有 --user-data-dir=PROFILE_DIR」——见 _start_browser_process
-    里的「进程秒退 = profile 被别的实例占着」判据。保留本函数仅为诊断打印。
+
+def _reset_active_profile():
+    """回到默认配置目录（fresh_profile / restore_profile 归档改名后必须调）。"""
+    _ACTIVE_PROFILE['dir'] = None
+
+
+def _profile_lockfile():
+    """profile 目录里那个被 Chromium 独占打开的锁文件（Windows 上是 Lockfile）。
+
+    为什么拿它当「谁占着 profile」的判据：Edge/Chrome 启动时会把
+    `--user-data-dir` 下的 Lockfile 以**独占方式**打开并一直攥着，直到进程
+    退出。要问「还有没有别的浏览器实例占着这个 profile」，问 Restart Manager
+    「谁锁着这个文件」最直接（`_profile_holders`）。注意 Windows 版**没有**
+    SingletonLock（那是 Linux 的东西），别照抄 Linux 的习惯去 stat 一个
+    根本不存在的文件——旧版就是这么写的，于是这条预检永远返回 False。
+    """
+    for name in ('Lockfile', 'lockfile', 'SingletonLock'):
+        f = _active_profile() / name
+        try:
+            if f.exists():
+                return f
+        except Exception:
+            continue
+    return None
+
+
+def _profile_holders():
+    """谁正攥着 PROFILE_DIR 的锁文件（Restart Manager 的「文件被谁占用」查询）。
+
+    返回 [(pid, 显示名)]；查不出来就返回 []（绝不抛）。
+
+    为什么要它：v6.26 真机「点查询后弹出两个浏览器窗口，接着所有内核都启动
+    失败」。根因是**上一次运行留下的失联浏览器还在用同一个 profile**——
+    工具自己死了（崩溃/被关/被结束进程），它拉起的 msedge 并不会跟着死
+    （实测：父进程退出后 Edge 照样活着，还听在原来的 DevTools 端口上）。
+    下一次启动时 `_start_browser_process` 起的新进程会把参数交给那只老实例、
+    自己秒退；「秒退」又被当成「profile 被别的实例占着」，于是逐候选全红。
+    更糟的是老实例被转交参数后**又开了一个窗口**——用户看到的就是两个窗口。
+
+    「我们自己的常驻进程」不算占用：调用方（`_reap_orphan_browser`）会跳过
+    `_BROWSER['proc']` 那个 pid。
+    """
+    out = []
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        f = _profile_lockfile()
+        if f is None:
+            return out
+        rm = ctypes.WinDLL('rstrtmgr', use_last_error=True)
+        rm.RmStartSession.argtypes = [ctypes.POINTER(wintypes.DWORD),
+                                      wintypes.DWORD, wintypes.LPWSTR]
+        rm.RmRegisterResources.argtypes = [
+            wintypes.DWORD, wintypes.UINT, ctypes.POINTER(wintypes.LPCWSTR),
+            wintypes.UINT, ctypes.c_void_p, wintypes.UINT, ctypes.c_void_p]
+        rm.RmGetList.argtypes = [
+            wintypes.DWORD, ctypes.POINTER(wintypes.UINT),
+            ctypes.POINTER(wintypes.UINT), ctypes.c_void_p,
+            ctypes.POINTER(wintypes.DWORD)]
+        rm.RmEndSession.argtypes = [wintypes.DWORD]
+
+        class _FT(ctypes.Structure):
+            _fields_ = [('dwLowDateTime', wintypes.DWORD),
+                        ('dwHighDateTime', wintypes.DWORD)]
+
+        class _UP(ctypes.Structure):
+            _fields_ = [('dwProcessId', wintypes.DWORD),
+                        ('ProcessStartTime', _FT)]
+
+        class _PI(ctypes.Structure):
+            _fields_ = [('Process', _UP), ('strAppName', wintypes.WCHAR * 256),
+                        ('strServiceShortName', wintypes.WCHAR * 64),
+                        ('ApplicationType', ctypes.c_int),
+                        ('AppStatus', wintypes.ULONG),
+                        ('TSSessionId', wintypes.DWORD),
+                        ('bRestartable', wintypes.BOOL)]
+
+        key = ctypes.create_unicode_buffer(33)
+        sess = wintypes.DWORD(0)
+        if rm.RmStartSession(ctypes.byref(sess), 0, key):
+            return out
+        try:
+            arr = (wintypes.LPCWSTR * 1)(str(f))
+            if rm.RmRegisterResources(sess.value, 1, arr, 0, None, 0, None):
+                return out
+            need = wintypes.UINT(0)
+            have = wintypes.UINT(0)
+            reasons = wintypes.DWORD(0)
+            rc = rm.RmGetList(sess.value, ctypes.byref(need),
+                              ctypes.byref(have), None, ctypes.byref(reasons))
+            if rc not in (0, 234) or not need.value:
+                return out
+            infos = (_PI * need.value)()
+            have.value = need.value
+            rc = rm.RmGetList(sess.value, ctypes.byref(need),
+                              ctypes.byref(have),
+                              ctypes.cast(infos, ctypes.c_void_p),
+                              ctypes.byref(reasons))
+            if rc:
+                return out
+            out = [(int(infos[i].Process.dwProcessId),
+                    str(infos[i].strAppName or ''))
+                   for i in range(have.value)]
+        finally:
+            try:
+                rm.RmEndSession(sess.value)
+            except Exception:
+                pass
+    except Exception:
+        return out
+    return out
+
+
+# 从 pythonw.exe 里起控制台程序（powershell / taskkill）会**弹一个黑窗**。
+# 真机日志里「终端一直闪」就是这个：每轮清孤儿都要跑一次 PowerShell 查命令行。
+# CREATE_NO_WINDOW 让子进程不带控制台，用户什么都看不见。
+_NO_WINDOW = getattr(subprocess, 'CREATE_NO_WINDOW', 0x08000000)
+
+
+def _run_hidden(argv, timeout=20):
+    """跑控制台程序但**不弹窗**，返回 CompletedProcess（文本模式）。"""
+    kw = dict(stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+              text=True, encoding='utf-8', errors='replace',
+              timeout=timeout, creationflags=_NO_WINDOW)
+    try:
+        return subprocess.run(argv, **kw)
+    except TypeError:            # 极老的 Python 不认 creationflags
+        kw.pop('creationflags', None)
+        return subprocess.run(argv, **kw)
+
+
+def _pid_alive(pid):
+    """这个 pid 现在还活着吗（进程刚退出时 exe 名查不到，别当成占用者）。"""
+    try:
+        import ctypes
+        from ctypes import wintypes
+        k32 = ctypes.WinDLL('kernel32', use_last_error=True)
+        k32.OpenProcess.restype = ctypes.c_void_p
+        k32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL,
+                                    wintypes.DWORD]
+        k32.CloseHandle.argtypes = [ctypes.c_void_p]
+        h = k32.OpenProcess(0x1000, False, int(pid))
+        if not h:
+            return False
+        k32.CloseHandle(ctypes.c_void_p(h))
+        return True
+    except Exception:
+        return False
+
+
+def _profile_free(timeout=0.0):
+    """profile 现在是否真的没人占着（v6.28）。
+
+    判据：**直接独占打开 Lockfile**（CreateFileW 共享模式 = 0）。能打开就说明
+    Chromium 已经放开；打不开（ERROR_SHARING_VIOLATION 32 / 拒绝访问 5）就是
+    还占着。这比「Restart Manager 报不报持有人」可靠——真机探针实测出现过
+    RM 返回空、独占打开却仍然 32 的情况（RM 只报一个，别的进程还在攥着）。
+
+    没有 Lockfile 文件也算放开（首次运行 / 刚换罐）。timeout > 0 时轮询等待。
+    """
+    deadline = time.time() + max(float(timeout), 0.0)
+    while True:
+        f = _profile_lockfile()
+        if f is None:
+            return True
+        try:
+            import ctypes
+            from ctypes import wintypes
+            k32 = ctypes.WinDLL('kernel32', use_last_error=True)
+            k32.CreateFileW.restype = ctypes.c_void_p
+            k32.CreateFileW.argtypes = [
+                wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+                ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD,
+                ctypes.c_void_p]
+            k32.CloseHandle.argtypes = [ctypes.c_void_p]
+            # GENERIC_READ|GENERIC_WRITE, 共享 0 = 独占；OPEN_EXISTING
+            h = k32.CreateFileW(str(f), 0x80000000 | 0x40000000, 0, None, 3,
+                                0x80, None)
+            bad = ctypes.c_void_p(-1).value
+            if h and h != bad:
+                k32.CloseHandle(h)
+                return True
+        except Exception:
+            # 判断不了就别拦着启动（宁可让后面的启动去报真实错误）
+            return True
+        if time.time() >= deadline:
+            return False
+        time.sleep(0.2)
+
+
+def _browser_procs():
+    """列出 Edge/Chrome 进程的 (pid, 命令行)。查不到返回 []（v6.29）。
+
+    **必须走 base64**：PowerShell 往管道里写的是**系统 ANSI 代码页**编码的
+    文本（中文系统是 GBK），而本工具装在中文路径下极常见——解压出来的目录
+    就叫「学习通巡检工具」，cmdline 里必然带它。按 UTF-8 解码会整段变成
+    替换字符，`prof in cmd` 永远不命中。
+
+    2026-10-20 真机抽验实测：同一份输出按 UTF-8 解命中 **0** 个进程，按 GBK
+    解命中 **15** 个。后果是 `_profile_free()` 说「锁被占着」、这边却一个
+    占用者都找不出来，每轮都只能换配置目录——用户看到的就是「一直重复闪烁」。
+
+    base64 的输出只含 ASCII，与代码页无关。同时把查询合并到一处，别让
+    `_profile_pids` / `_profile_roots` 各抄一份逻辑再各错一次。
+    """
+    out = []
+    try:
+        ps = ("$j = Get-CimInstance Win32_Process -Filter "
+              "\"name='msedge.exe' or name='chrome.exe'\" | "
+              "Select-Object ProcessId,CommandLine | ConvertTo-Json -Compress; "
+              "[Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes("
+              "[string]$j))")
+        r = _run_hidden(['powershell', '-NoProfile', '-NonInteractive',
+                         '-Command', ps], timeout=20)
+        txt = (r.stdout or '').strip()
+        if not txt:
+            return out
+        # 只取最后一行：PowerShell 偶尔会先吐一行警告
+        txt = txt.splitlines()[-1].strip()
+        import base64 as _b64
+        txt = _b64.b64decode(txt, validate=False).decode('utf-8', 'replace')
+        if not txt.strip():
+            return out
+        d = json.loads(txt)
+        if isinstance(d, dict):
+            d = [d]
+        for x in d:
+            try:
+                pid = int(x.get('ProcessId') or 0)
+                cmd = str(x.get('CommandLine') or '')
+            except Exception:
+                continue
+            if pid:
+                out.append((pid, cmd))
+    except Exception:
+        return out
+    return out
+
+
+def _profile_pids():
+    """命令行里带本工具配置目录的进程 pid（v6.28）。
+
+    为什么需要它：Restart Manager 一次只报**一个**持有人，而 Edge 是十几个
+    进程（browser/renderer/gpu/utility）共用同一份 profile。只收 RM 报的那
+    一个，下一轮立刻换另一个上报——真机日志里 pid 6368→4788→20304→21036
+    就是这个现象。
+    只认「命令行里带本 profile 路径」的，绝不按进程名一刀切——用户自己的
+    Edge 用的是别的 profile，不能碰。
+    """
+    out = []
+    prof = str(_active_profile() or '')
+    for pid, cmd in _browser_procs():
+        if _cmd_has_profile(cmd, prof):
+            out.append(pid)
+    return out
+
+
+def _profile_roots():
+    """命令行里带本活动 profile、且**是浏览器主进程**的 pid（v6.29）。
+
+    为什么只认主进程：Chromium 的 renderer/gpu/utility 子进程**也**带
+    `--user-data-dir`，但它们不是占着 profile 的那一个，而且杀了也没用——
+    主进程会立刻补一个新的。真机日志（2026-10-20 07:21）就是每轮杀几个
+    renderer、下一轮又冒出新的，永远收不干净。主进程没有 `--type=` 参数，
+    用这个一眼就分得开；杀主进程（taskkill /T）整棵树一起走。
+    """
+    out = []
+    prof = str(_active_profile() or '')
+    for pid, cmd in _browser_procs():
+        if _cmd_has_profile(cmd, prof) and '--type=' not in cmd:
+            out.append(pid)
+    return out
+
+def _exe_name_of(pid):
+    """进程 exe 文件名（小写，如 'msedge.exe'）；查不到返回 ''。
+
+    只用 QueryFullProcessImageNameW（PROCESS_QUERY_LIMITED_INFORMATION）——
+    读进程命令行要 READ_PROCESS_MEMORY，跨权限常常读不到（本机实测
+    ERROR_PARTIAL_COPY 299），靠不住。
     """
     try:
-        return (PROFILE_DIR / 'SingletonLock').exists() or _BROWSER['proc'] is not None
+        import ctypes
+        from ctypes import wintypes
+        k32 = ctypes.WinDLL('kernel32', use_last_error=True)
+        k32.OpenProcess.restype = ctypes.c_void_p
+        k32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL,
+                                    wintypes.DWORD]
+        k32.CloseHandle.argtypes = [ctypes.c_void_p]
+        k32.QueryFullProcessImageNameW.argtypes = [
+            ctypes.c_void_p, wintypes.DWORD, wintypes.LPWSTR,
+            ctypes.POINTER(wintypes.DWORD)]
+        h = k32.OpenProcess(0x1000, False, int(pid))
+        if not h:
+            return ''
+        try:
+            n = wintypes.DWORD(1024)
+            buf = ctypes.create_unicode_buffer(n.value)
+            if not k32.QueryFullProcessImageNameW(h, 0, buf,
+                                                  ctypes.byref(n)):
+                return ''
+            return os.path.basename(buf.value).lower()
+        finally:
+            k32.CloseHandle(h)
     except Exception:
-        return _BROWSER['proc'] is not None
+        return ''
+
+
+def _is_browser_exe(pid):
+    """这个 pid 是不是浏览器内核进程（Edge/Chrome），而不是别的什么东西。
+
+    清理孤儿绝不能按「谁锁着 Lockfile」一刀切：同一份 profile 也可能被别的
+    软件打开（用户拿文件管理器进去过、杀软在扫）。杀错就是「把用户正在用的
+    东西关了」——本项目第一条纪律是**绝不杀用户的浏览器**。所以只认 exe 名
+    明确是 msedge/chrome 的进程；别的占用者一律只报告、不动手。
+    """
+    name = _exe_name_of(pid)
+    return bool(name) and name.startswith(('msedge', 'chrome'))
+
+
+def _profile_locked():
+    """profile 目录是否已被某个浏览器实例占着（诊断 + 启动前预检）。
+
+    判据是 Lockfile 被活进程持有（见 `_profile_holders`）；本进程自己养着的
+    常驻浏览器也算「占着」，但那种情况走 `ensure_browser` 的幂等短路。
+    """
+    proc = _BROWSER.get('proc')
+    if proc is not None and proc.poll() is None:
+        return True
+    try:
+        return bool(_profile_holders())
+    except Exception:
+        return False
 
 
 def _browser_argv(exe, port, hl, offscreen, ua):
+    # v6.28：用**这次运行真正在用**的配置目录（换罐后就不是 PROFILE_DIR 了）
     argv = [str(exe), '--remote-debugging-port=%d' % port,
-            '--user-data-dir=%s' % PROFILE_DIR]
+            '--user-data-dir=%s' % _active_profile()]
     argv += [
         '--no-sandbox',
         '--disable-dev-shm-usage',
@@ -827,6 +1339,9 @@ def _browser_argv(exe, port, hl, offscreen, ua):
         '--disable-features=Translate,BackForwardCache',
         '--no-first-run',
         '--no-default-browser-check',
+        # v6.28：不让 Edge 在最后一个窗口关掉后驻留后台/被会话恢复拉起来。
+        # 真机上就是这类进程在「接力」重开浏览器，把 profile 锁重新抢走。
+        '--disable-background-mode',
         # 刷课时窗口会最小化到任务栏（brush_minimize，默认开）：这三个开关
         # 保证最小化/被遮挡后计时器与播放不被 Chromium 后台节流，心跳照常
         '--disable-background-timer-throttling',
@@ -858,7 +1373,7 @@ def _kill_tree(proc):
     try:
         subprocess.run(['taskkill', '/F', '/T', '/PID', str(proc.pid)],
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                       timeout=15)
+                       timeout=15, creationflags=_NO_WINDOW)
     except Exception:
         pass
     try:
@@ -870,52 +1385,601 @@ def _kill_tree(proc):
             pass
 
 
+# Windows Job Object 句柄（v6.27）。进程被杀/崩溃时由内核连带收掉里面所有
+# 进程——浏览器是独立进程，父进程死了它不会跟着死，这就是「失联浏览器攥着
+# profile」的源头。句柄放模块级：一旦被关（含进程退出），内核就杀整棵树。
+_JOB = {'handle': None, 'failed': False}
+
+
+def _cmd_has_profile(cmd, prof=None):
+    """这条命令行是不是带着**本工具这次活动**的配置目录（v6.30）。
+
+    比 `prof in cmd` 稳：Windows 路径不分大小写，Chromium 也可能把
+    `--user-data-dir=` 写成正斜杠或改大小写。统一成小写 + 反斜杠再比，
+    免得「明明是我们的浏览器，却因为一个字母大小写认不出来」——那会直接
+    退化成「收不掉 → 换罐 → 又闪一次」。
+    """
+    prof = str(prof if prof is not None else (_active_profile() or ''))
+    if not prof:
+        return False
+    norm = str(cmd or '').replace('/', '\\').lower()
+    return prof.replace('/', '\\').lower() in norm
+
+
+def _port_served_by_us(port):
+    """这个 DevTools 端口是不是**我们刚起的浏览器**在服务（v6.30）。
+
+    判据（三条同时成立才算）：
+      ① 端口属主进程还活着，且 exe 名是 msedge/chrome；
+      ② 它的命令行带**本工具的 profile**（`_active_profile()`）；
+      ③ 它的命令行带 `--remote-debugging-port=<这个端口>`。
+
+    为什么必须这么判（v6.30 真机核心 bug）：`_start_browser_process` 原来
+    只看「`_wait_devtools` 有应答 + Popen 的 pid 已经退出」就断定「参数被别的
+    实例转交了」，然后**把那个实例收掉**。可 Edge 在某些机器上会先起一个
+    启动器替身、自己退出，真身另起 pid 接管同一个端口——端口是我们随机挑的
+    空闲端口，别人的实例不可能来听它。于是工具把自己刚拉起来的浏览器当孤儿
+    杀掉：窗口弹出来又消失，换候选再来一遍，用户看到的就是「一直弹窗然后
+    消失、重复这个动作」，最后报「进程秒退（profile 被别的实例占着）」。
+    """
+    if not _PORT_LOOKUP_ON:
+        return None
+    try:
+        pid = _port_owner(port)
+        if not pid:
+            return None
+        if not _is_browser_exe(pid):
+            return None
+        flag = '--remote-debugging-port=%d' % int(port)
+        prof = str(_active_profile() or '')
+        for p, cmd in _browser_procs():
+            if p != pid:
+                continue
+            if (_cmd_has_profile(cmd, prof) and flag in cmd
+                    and '--type=' not in cmd):
+                return pid
+        return None
+    except Exception:
+        return None
+
+
+def _port_owner(port):
+    """哪个进程在监听这个 TCP 端口（纯 ctypes iphlpapi，约 1 毫秒）。
+
+    v6.30 用它分辨「新起的进程秒退」到底是怎么回事：
+      · 若**同一端口**始终有个浏览器主进程在听，那说明我们启动的只是
+        Edge 的启动器替身，真正的浏览器接管了端口——绝不能当成「参数被
+        别的实例转交」去杀掉（那正是用户看到的「窗口弹出来又消失」）；
+      · 端口属主正好是 `_BROWSER['proc'].pid`，就是最普通的正常情况。
+
+    读法与 _probe 实测一致：`GetExtendedTcpTable(class=3 TCP_TABLE_OWNER_PID_
+    LISTEN, sorted=True)`，`dwLocalPort` 是网络字节序的低 16 位。
+    """
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class _ROW(ctypes.Structure):
+            _fields_ = [('dwState', wintypes.DWORD),
+                        ('dwLocalAddr', wintypes.DWORD),
+                        ('dwLocalPort', wintypes.DWORD),
+                        ('dwRemoteAddr', wintypes.DWORD),
+                        ('dwRemotePort', wintypes.DWORD),
+                        ('dwOwningPid', wintypes.DWORD)]
+
+        ip = ctypes.WinDLL('iphlpapi')
+        ip.GetExtendedTcpTable.argtypes = [
+            ctypes.c_void_p, ctypes.POINTER(wintypes.DWORD), wintypes.BOOL,
+            wintypes.ULONG, wintypes.ULONG, wintypes.DWORD]
+        sz = wintypes.DWORD(0)
+        ip.GetExtendedTcpTable(None, ctypes.byref(sz), True, 2, 3, 0)
+        if not sz.value:
+            return None
+        buf = ctypes.create_string_buffer(sz.value)
+        if ip.GetExtendedTcpTable(buf, ctypes.byref(sz), True, 2, 3, 0):
+            return None
+        n = wintypes.DWORD.from_buffer(buf, 0).value
+        arr = (_ROW * n).from_buffer(buf, 4)
+        for r in arr:
+            local = ((r.dwLocalPort & 0xFF) << 8) | ((r.dwLocalPort >> 8) & 0xFF)
+            # 2 = MIB_TCP_STATE_LISTEN
+            if local == int(port) and r.dwState == 2:
+                return int(r.dwOwningPid) or None
+    except Exception:
+        return None
+    return None
+
+
+def _adopt_job(proc):
+    """把刚起的浏览器进程放进「本进程一死就跟着死」的 Job Object（v6.27）。
+
+    为什么需要：v6.26 真机的那个 bug（两个窗口 + 全部内核启动失败）根子在
+    **上一次运行之后浏览器还活着**——用户关掉/结束工具进程时，它拉起的
+    msedge 是独立进程，父进程死了照样跑，还攥着 runtime/profile 不放。
+    之后每次启动都会把参数转交给那只老实例（于是多开一个窗口），新进程
+    自己秒退（于是报「所有内核启动失败」）。
+
+    现在两道防线：
+      · 这条（提前防）：给浏览器挂一个 KILL_ON_JOB_CLOSE 的 Job Object。
+        本进程无论怎么没的（正常退出、崩溃、被任务管理器结束），内核都会
+        连带把浏览器整棵树收掉，从源头不再产生孤儿；
+      · `_reap_orphan_browser`（事后兜）：万一还是留下了（比如旧版本跑过，
+        或 Job 挂不上），启动前把它认出来收掉。
+
+    挂不上（受限环境 / 进程已在别的不可嵌套 Job 里）不算错：只记一条
+    debug 级日志，照常启动——宁可偶尔留孤儿，也不能因为挂 Job 失败就
+    让工具起不来。返回 True 表示这次挂上了。
+    """
+    if os.name != 'nt':
+        return False
+    if _JOB['failed']:
+        return False
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        k32 = ctypes.WinDLL('kernel32', use_last_error=True)
+        k32.CreateJobObjectW.restype = ctypes.c_void_p
+        k32.CreateJobObjectW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR]
+        k32.SetInformationJobObject.argtypes = [
+            ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD]
+        k32.AssignProcessToJobObject.argtypes = [ctypes.c_void_p,
+                                                 ctypes.c_void_p]
+
+        class _IO(ctypes.Structure):
+            _fields_ = [('ReadOperationCount', ctypes.c_ulonglong),
+                        ('WriteOperationCount', ctypes.c_ulonglong),
+                        ('OtherOperationCount', ctypes.c_ulonglong),
+                        ('ReadTransferCount', ctypes.c_ulonglong),
+                        ('WriteTransferCount', ctypes.c_ulonglong),
+                        ('OtherTransferCount', ctypes.c_ulonglong)]
+
+        class _BASIC(ctypes.Structure):
+            _fields_ = [('PerProcessUserTimeLimit', ctypes.c_longlong),
+                        ('PerJobUserTimeLimit', ctypes.c_longlong),
+                        ('LimitFlags', wintypes.DWORD),
+                        ('MinimumWorkingSetSize', ctypes.c_size_t),
+                        ('MaximumWorkingSetSize', ctypes.c_size_t),
+                        ('ActiveProcessLimit', wintypes.DWORD),
+                        ('Affinity', ctypes.c_size_t),
+                        ('PriorityClass', wintypes.DWORD),
+                        ('SchedulingClass', wintypes.DWORD)]
+
+        class _EXT(ctypes.Structure):
+            _fields_ = [('BasicLimitInformation', _BASIC), ('IoInfo', _IO),
+                        ('ProcessMemoryLimit', ctypes.c_size_t),
+                        ('JobMemoryLimit', ctypes.c_size_t),
+                        ('PeakProcessMemoryUsed', ctypes.c_size_t),
+                        ('PeakJobMemoryUsed', ctypes.c_size_t)]
+
+        if _JOB['handle'] is None:
+            h = k32.CreateJobObjectW(None, None)
+            if not h:
+                _JOB['failed'] = True
+                return False
+            info = _EXT()
+            # 0x2000 = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+            info.BasicLimitInformation.LimitFlags = 0x2000
+            # 9 = JobObjectExtendedLimitInformation
+            k32.SetInformationJobObject(h, 9, ctypes.byref(info),
+                                        ctypes.sizeof(info))
+            _JOB['handle'] = h
+        ok = k32.AssignProcessToJobObject(
+            ctypes.c_void_p(_JOB['handle']),
+            ctypes.c_void_p(int(proc._handle)))
+        if not ok:
+            # 句柄可能已经死了（进程刚起就退出）：这不是配置错误，别把
+            # _JOB['failed'] 置位，后续候选还要接着挂。
+            return False
+        return True
+    except Exception:
+        _JOB['failed'] = True
+        return False
+
+
+def _adopt_job_pid(pid):
+    """把**已存在的**进程按 pid 挂进同一个 Job（v6.30）。
+
+    为什么需要：v6.30 起「浏览器主进程」不一定等于 Popen 返回的 pid——
+    Edge 的启动器替身会退出、真正的浏览器另起一个 pid 接管 DevTools 端口
+    （`_port_owner` 反查得到）。替身挂上了 Job 也没用，必须把真身也挂上，
+    否则真身死了/本进程被杀时它照样变成孤儿。
+    """
+    if os.name != 'nt' or _JOB['failed'] or _JOB['handle'] is None:
+        return False
+    try:
+        import ctypes
+        from ctypes import wintypes
+        k32 = ctypes.WinDLL('kernel32', use_last_error=True)
+        k32.OpenProcess.restype = ctypes.c_void_p
+        k32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL,
+                                    wintypes.DWORD]
+        k32.CloseHandle.argtypes = [ctypes.c_void_p]
+        k32.AssignProcessToJobObject.argtypes = [ctypes.c_void_p,
+                                                 ctypes.c_void_p]
+        # PROCESS_SET_QUOTA | PROCESS_TERMINATE
+        h = k32.OpenProcess(0x0100 | 0x0001, False, int(pid))
+        if not h:
+            return False
+        try:
+            return bool(k32.AssignProcessToJobObject(
+                ctypes.c_void_p(_JOB['handle']), ctypes.c_void_p(h)))
+        finally:
+            k32.CloseHandle(ctypes.c_void_p(h))
+    except Exception:
+        return False
+
+
+class _PidProc(object):
+    """给「不是本进程 Popen 出来的」浏览器主进程做的最小替身（v6.30）。
+
+    `_BROWSER['proc']` 的既有契约是「有 pid、poll()、句柄」三样：
+    `browser_proc_pid()` 要 pid（网页模式按属主 pid 认窗口）、
+    `ensure_browser` 要 `poll()` 判活、`stop_browser` 要能收掉它。
+    Edge 启动器替身退出后真身是别人起的进程，拿不到 Popen 对象，就用这个
+    按 pid 判活的替身顶上——否则「端口明明在应答，却报浏览器没起来」。
+    """
+
+    def __init__(self, pid):
+        self.pid = int(pid)
+        self.returncode = None
+
+    def poll(self):
+        if _pid_alive(self.pid):
+            return None
+        self.returncode = 0
+        return self.returncode
+
+    def wait(self, timeout=None):
+        deadline = time.time() + (timeout if timeout is not None else 15)
+        while time.time() < deadline:
+            if self.poll() is not None:
+                return self.returncode
+            time.sleep(0.1)
+        raise subprocess.TimeoutExpired('pid %d' % self.pid, timeout)
+
+    def kill(self):
+        _kill_pid_tree(self.pid)
+
+
+def _kill_pid_tree(pid, timeout=15):
+    """按 pid 杀掉整棵进程树（与 _kill_tree 同一套 taskkill /F /T）。
+
+    与 _kill_tree(proc) 的分工：那个收的是本进程 Popen 出来的子进程（有
+    proc 句柄、能 wait）；这个收的是**上一次运行遗留**的进程（本进程没有
+    它的句柄，只知道 pid）。两者都必须 /T，否则 renderer/gpu 子进程还会
+    攥着 profile 目录。
+    """
+    try:
+        subprocess.run(['taskkill', '/F', '/T', '/PID', str(int(pid))],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                       timeout=timeout, creationflags=_NO_WINDOW)
+    except Exception:
+        pass
+
+
+def _reap_orphan_browser(why='profile 被上一次留下的浏览器占着'):
+    """收掉**上一次运行遗留**的浏览器进程树，把 profile 放出来（v6.27）。
+
+    真机 2026-10-19（v6.26 打包版）：点「获取课程列表」→ 任务栏冒出**两个**
+    Edge 窗口 → 紧接着报「所有浏览器内核都无法启动：exe(msedge.exe) → 进程
+    秒退 / channel(msedge.exe) → DevTools 未就绪」，预览页签永远空白。
+
+    根因链（本机复现 + 探针实测）：
+      ① 上一次运行结束时浏览器没被收干净（进程崩溃/被结束/退出路径没走到），
+         msedge 是独立进程，父进程死了它照样活着，并且**继续占着 profile**
+         （Lockfile 一直被它独占打开）；
+      ② 下次启动 `_start_browser_process` 用同一份 profile 起新进程 →
+         Chromium 发现已有实例，把参数**转交**给它、自己秒退；
+      ③ 老实例接到转交后**又开一个窗口**（用户看到的第二个窗口）；
+      ④ 新进程秒退被当成「profile 被别的实例占着」→ 逐候选全红 → 报错；
+         预览页签里没有属于本进程登记的浏览器，于是「无内容」。
+    注意 ④ 的报错文案一直是对的——占着 profile 的**确实是**别的实例，
+    只是旧代码只诊断、不处理。
+
+    这里在起新进程**之前**把那只孤儿收掉（`taskkill /F /T` 收整棵树），
+    然后才允许启动。安全边界（本项目铁律：绝不杀用户的浏览器）：
+      · 只处理锁着**本工具 profile** 的进程，不去扫系统里别的 Edge/Chrome；
+      · 只处理 exe 名是 msedge/chrome 的进程（`_is_browser_exe`）；
+      · 正在服务本进程的那个 pid 跳过（`_BROWSER['proc']`）；
+      · 别的软件占着 Lockfile 时**不动手**，只记一条 warn 并返回 False，
+        让调用方照常试——起不来就把真实原因报给用户。
+    返回 True 表示「现在 profile 是空的（本来就没被占，或者已收干净）」。
+    """
+    own = _BROWSER.get('proc')
+    own_pid = own.pid if own is not None and own.poll() is None else None
+    # v6.30：**正在为本次启动服务的浏览器不算孤儿**。
+    # 真机链条是这样的：我们起 Edge → 启动器退出 → 真身接管端口 → 旧代码
+    # 判「秒退=被接管」→ 调这里收孤儿 → 把刚拉起来的真身一并杀了 → 窗口
+    # 一闪即逝 → 换候选再来一次。所以这里先把「自己人」的 pid 全捞出来。
+    mine = set()
+    if own_pid:
+        mine.add(own_pid)
+    try:
+        for _p in (_port_served_by_us(port) for port in _SPAWN_PORTS):
+            if _p:
+                mine.add(_p)
+    except Exception:
+        pass
+    # 先问「真的放开没有」——直接独占打开 Lockfile，比 Restart Manager
+    # 报不报持有人可靠（真机探针见过 RM 空、独占仍 32）。
+    if _profile_free():
+        return True
+
+    killed = set()
+    refused = {}                   # pid -> exe 名（去重：别把同一个人报三遍）
+    # **只收浏览器主进程**（v6.29）：renderer/gpu/utility 也带 --user-data-dir，
+    # 但它们不是占着 profile 的那一个，杀了主进程会立刻补一个新的——真机日志
+    # （2026-10-20 07:21:49~07:22:13）就是每轮杀几个子进程、下一轮又冒出来，
+    # 收四轮也收不干净，用户看到的是「浏览器一直在闪」。杀主进程用 taskkill /T
+    # 整棵树一起走，一次就够。
+    #
+    # 仍然**有限轮**（v6.28）：真机出现过主进程也被接力重开的情况；三轮还不
+    # 放开就如实返回 False，交给上层换一份新配置目录。
+    for rnd in range(3):
+        pids = set(_profile_roots())
+        pids -= mine
+        pids -= killed
+        pids -= set(refused)
+        if not pids:
+            break
+        killed_now = False
+        for pid in sorted(pids):
+            if not _is_browser_exe(pid):
+                # v6.29：进程已经退出了（exe 名自然查不到）——那不是「别的软件
+                # 占着」，别拿它当理由放弃。真机日志里那 9 个「未知」就是查询
+                # 结束后正在退出的 renderer，被误报成「非浏览器进程占着」。
+                if _pid_alive(pid):
+                    refused[pid] = _exe_name_of(pid) or '未知'
+                continue
+            log('发现上次运行遗留的浏览器进程（pid %d）还占着浏览器配置目录，'
+                '先收掉它（第 %d 轮）。' % (pid, rnd + 1), 'warn')
+            _kill_pid_tree(pid)
+            killed.add(pid)
+            killed_now = True
+        # 有活着的非浏览器进程攥着：再收多少轮都放不开，立刻如实返回——
+        # 让上层换罐，而不是在这儿白等 3 轮 × 3 秒。
+        if refused or not killed_now:
+            break
+        # Windows 释放文件句柄有滞后：等锁真放开再复核。
+        if _profile_free(timeout=3.0):
+            break
+
+    if refused:
+        who = '、'.join('%d(%s)' % (pid, name)
+                        for pid, name in sorted(refused.items()))
+        log('profile 还被非浏览器进程占着：%s。不动它（绝不杀用户的东西），'
+            '改用一份新的浏览器配置目录启动。' % who, 'warn')
+        return False
+    # 复核：先看文件锁放没放开；再确认没有**别人的**主进程还带着本 profile
+    # 活着（Lockfile 偶有删除/重建的空窗，光看它不够）。自己人（`mine`）
+    # 不算——它们正是我们接下来要用的那只。
+    others = set(_profile_roots()) - mine
+    if _profile_free(timeout=1.0) and not others:
+        return True
+    if _profile_free(timeout=1.0):
+        # 锁放开了但主进程还在（多半是刚起来还没建锁 / 正在退出）：等它一下。
+        for _ in range(10):
+            if not (set(_profile_roots()) - mine):
+                return True
+            time.sleep(0.2)
+    if not others and mine:
+        # v6.30：锁被占着，但占着的是**我们自己人**（刚起的浏览器 / 已登记在
+        # _BROWSER 里的那只）。这不需要「清场」，更不该说「有东西在接力重开
+        # 浏览器」——直接用那只即可。
+        #
+        # `and mine` 不能省：`others` 只统计浏览器主进程，用户拿别的软件
+        # （记事本、杀软、文件管理器）打开过 Lockfile 时它同样是空的，那种
+        # 情况必须如实返回 False——否则上层以为「profile 空了」，紧接着的
+        # 启动又会被锁挡住，白白多闪一轮。
+        return True
+    try:
+        left = [pid for pid, _n in _profile_holders() if pid not in mine]
+    except Exception:
+        left = []
+    log('收掉 %d 个遗留浏览器进程后 profile 仍被占着（%s）——这台机器上'
+        '有东西在接力重开浏览器。改用一份新的浏览器配置目录启动。'
+        % (len(killed), '、'.join(str(x) for x in left) or '锁未放开'), 'warn')
+    return False
+
+
+def _switch_profile_dir():
+    """换一份全新的浏览器配置目录，并返回是否换成了（v6.28）。
+
+    什么时候走到这里：`_reap_orphan_browser` 连收三轮，`_profile_free()`
+    仍说 Lockfile 被占——真机出现过（杀一个、另一个顶上来）。这时候继续
+    用同一份 profile 起进程，Chromium 只会把参数转交给老实例、自己秒退，
+    永远起不来。换罐是唯一能往前走的路。
+
+    **必须换路径**：原地把旧目录删掉再 mkdir 同一个路径没用——抢锁的老实例
+    还攥着那个路径的 Lockfile，新进程照样被转交。所以这里另起 `profile_next`
+    （与 `profile_old` 同级），活动目录跟着换过去（`_ACTIVE_PROFILE`）。
+
+    **不掉登录**：cookie/登录态在 `runtime/state.json`（`save_state` /
+    `restore_state`），不在 profile 里；launch 之后 `restore_state` 会把
+    会话灌回新上下文。所以这里只是丢掉浏览器缓存，不动账号。
+    """
+    global PROFILE_DIR
+    try:
+        stop_browser()
+    except Exception:
+        pass
+    # 以**当前活动目录**为基准：第二次换罐时 PROFILE_DIR 早不是在用的那个。
+    cur = _active_profile()
+    old = cur.with_name('profile_stale')
+    _rmtree_retry(old)              # 上一次换罐留下的残骸（句柄滞后时重试）
+    # 当前目录能改名就改名归档（改名成功 = 没人占着，最干净）；改不动就
+    # 就地弃用——反正这次运行不再用它。
+    moved = False
+    if cur.exists():
+        moved = _rename_retry(cur, old)
+        if not moved:
+            log('旧配置目录改不动（被占着），就地弃用、另起一份新的。',
+                'warn')
+    if moved:
+        # state.json / identity.json 归 runtime 根部，不在 profile 里；
+        # 万一旧版本留在里面，挪回来（与 fresh_profile 的处理一致）。
+        for nm, tgt in (('state.json', STATE_FILE),
+                        ('identity.json', IDENTITY_FILE)):
+            src = old / nm
+            try:
+                if src.exists() and not tgt.exists():
+                    shutil.move(str(src), str(tgt))
+            except Exception:
+                pass
+    # **新目录必须是另一个路径**（v6.28 修）：原地 mkdir 出来还是同一个被锁
+    # 的路径，Chromium 照样把参数转交给抢锁的老实例——等于没换。
+    new = None
+    for i in range(1, 6):
+        cand = PROFILE_DIR.with_name('profile_next' if i == 1
+                                     else 'profile_next%d' % i)
+        if not cand.exists() or _rmtree_retry(cand):
+            new = cand
+            break
+    if new is None:
+        log('换新配置目录失败（profile_next* 都被占着）。', 'warn')
+        return False
+    try:
+        new.mkdir(parents=True, exist_ok=True)
+    except Exception as e:
+        log('新建浏览器配置目录失败：%s' % str(e)[:100], 'warn')
+        return False
+    _ACTIVE_PROFILE['dir'] = new
+    log('已启用新的浏览器配置目录（登录态不受影响，启动后会自动恢复会话）。')
+    return True
+
+
 def _start_browser_process(cfg, hl, offscreen):
-    """起常驻 chrome 进程（逐候选试），成功就登记到 _BROWSER。"""
+    """起常驻 chrome 进程（逐候选试），成功就登记到 _BROWSER。
+
+    v6.28：整轮失败且 profile 确实被外部占着时，**换一份新配置目录重来一次**。
+    真机（2026-10-19）出现过收不干净的情况：每轮都冒出一个新的浏览器进程
+    抢回 Lockfile（pid 6368→4788→20304→21036），沿用同一份 profile 只会
+    无限失败。换罐不掉登录（cookie 在 state.json），是唯一能往前走的路。
+    """
+    # v6.30 补：已经有一只活着就**别再起一只**。两个线程同时切形态时，
+    # A 线程 stop_browser() 之后、ensure_browser() 之前，B 线程可能已经又起
+    # 好了一只——这时再起，profile 的 Lockfile 被自己人攥着，新进程起不来，
+    # 每个候选白等 25 秒（三个候选 = 75 秒），最后还被迫换罐。
+    # 真机探针实测过这 73 秒。
+    # 注意：**不要**把 _BROWSER['hl'] 改成调用方要的形态——进程实际是什么形态
+    # 就登记什么。谎报会让上层「形态比对」误判成一致，拿屏幕外的窗口去干
+    # 需要用户扫码的活（登录）。形态不一致由 ensure_browser 的调用方负责
+    # stop + 重起。
+    _cur = _BROWSER.get('proc')
+    if _cur is not None:
+        try:
+            _alive = _cur.poll() is None
+        except Exception:
+            _alive = False
+        if _alive and _BROWSER.get('port') is not None:
+            return
     exe = _chrome_candidates(cfg)
     attempts = []
     if exe:
         attempts.append(('exe', str(exe)))
     attempts += [('channel', 'chrome'), ('channel', 'msedge')]
     errors = []
-    for kind, val in attempts:
-        if kind == 'exe':
-            real = Path(val)
-        else:
-            real = _resolve_channel_exe(val)
-            if not real:
-                errors.append('%s（未安装）' % val)
+    for _round in range(2):
+        for kind, val in attempts:
+            if kind == 'exe':
+                real = Path(val)
+            else:
+                real = _resolve_channel_exe(val)
+                if not real:
+                    errors.append('%s（未安装）' % val)
+                    continue
+            # 每个候选最多试两轮：第一轮撞上「上一次运行遗留的浏览器占着
+            # profile」时，把遗留进程收掉再来一轮（v6.27）。
+            for _try in range(2):
+                # UA 按**这一次真用的内核**算：channel 名解析回真实 exe 是为了
+                # 拿真实版本号（否则 UA 版本对不上内核）。
+                ua = fake_user_agent(cfg, real)
+                port = _free_port()
+                # v6.30：端口必须**没被任何浏览器听着**。`_free_port()` 只是
+                # 「bind 一下能拿到」（TIME_WAIT/SO_REUSEADDR 都会让它返回一个
+                # 正被监听的口），紧接着的 `_port_served_by_us()` 就会把**上一轮
+                # 那只还没退干净的浏览器**认成「这一轮我们起的」。重挑几次。
+                if _PORT_LOOKUP_ON:
+                    for _ in range(8):
+                        if _port_owner(port) is None:
+                            break
+                        port = _free_port()
+                _SPAWN_PORTS.append(port)
+                del _SPAWN_PORTS[:-_PORT_HISTORY]
+                # 起进程之前先把占着 profile 的遗留浏览器收掉（我们自己养着的
+                # 那个 pid 不会被误伤，见 _reap_orphan_browser 的安全边界）。
+                if _try == 0:
+                    # 收完还放不开 = 这一份 profile 这次注定用不了：Chromium
+                    # 只会把参数转交给占着它的实例、自己秒退。别白等 25 秒的
+                    # DevTools 超时（真机 3 个候选 × 2 轮 = 两分半，用户只
+                    # 看到窗口闪），直接判这一轮没戏，交给下面的换罐。
+                    if not _reap_orphan_browser():
+                        errors.append('%s(%s) → profile 被别的进程占着（收不掉）'
+                                      % (kind, real.name))
+                        break
+                try:
+                    proc = subprocess.Popen(
+                        _browser_argv(real, port, hl, offscreen, ua),
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                except Exception as e:
+                    errors.append('%s(%s) → %s'
+                                  % (kind, real.name, str(e)[:80]))
+                    break
+                _adopt_job(proc)
+                ok = _wait_devtools(port, time.time() + 25)
+                # v6.30：端口有应答之后，先确认「是谁在应答」。
+                #
+                # 旧代码在这里只看 `proc.poll() is not None` 就断定「参数被
+                # 别的实例转交」，然后把那只实例收掉。真机上 Edge 会先起一个
+                # 启动器替身、自己退出，真身另起 pid 接管同一个端口——于是
+                # 工具**把自己刚拉起来的浏览器当孤儿杀了**：窗口弹出来又消失，
+                # 换候选再闪一次（用户原话「一直弹出来这个浏览器窗口然后消失，
+                # 重复进行」）。判据改成按端口反查属主（`_port_served_by_us`）：
+                # 端口是我们随机挑的空闲端口 + 属主带本 profile 和本端口参数，
+                # 那它就是我们自己人，接管即可；Popen 的 pid 退没退不影响结论。
+                owner = _port_served_by_us(port) if ok else None
+                if ok and owner:
+                    if owner != proc.pid:
+                        # 替身退了、真身接管：照着真身登记并挂进 Job。
+                        log('%s 由启动器拉起（pid %d → %d），直接接管。'
+                            % (real.name, proc.pid, owner))
+                        _adopt_job_pid(owner)
+                        proc = _PidProc(owner)
+                    _BROWSER['proc'], _BROWSER['port'] = proc, port
+                    _BROWSER['hl'], _BROWSER['offscreen'] = hl, offscreen
+                    log('常驻浏览器已启动（%s%s，%s）' % (
+                        '无头' if hl else '有窗口',
+                        '·屏幕外' if offscreen else '', real.name))
+                    return
+                if ok and not owner:
+                    # 端口在应答，但不是我们起的浏览器在服务（参数确实被
+                    # 转交给了别人）。这才是真正的「被别的实例接管」：收掉
+                    # 那只实例再试一轮。
+                    _kill_tree(proc)
+                    _reap_orphan_browser()
+                    if _try == 0:
+                        log('%s 的启动参数被已有浏览器实例接管，已收掉那个实例'
+                            '后重试。' % real.name, 'warn')
+                        continue
+                    errors.append('%s(%s) → 进程秒退（profile 被别的实例占着）'
+                                  % (kind, real.name))
+                    break
+                if not ok:
+                    _kill_tree(proc)
+                    # 起失败也可能留下攥着 profile 的子进程/重新拉起的进程，
+                    # 不清掉会拖累下一个候选（真机 2026-10-19 的连环失败）。
+                    _reap_orphan_browser()
+                    errors.append('%s(%s) → DevTools 未就绪'
+                                  % (kind, real.name))
+                    break
+        # 整轮候选全失败：如果根子在 profile 根本抢不回来，就换罐再来一轮。
+        # 只在**确实还占着**时换（不是无脑换，免得白丢缓存）。
+        if _round == 0 and not _profile_free():
+            if _switch_profile_dir():
+                errors.clear()
                 continue
-        # UA 按**这一次真用的内核**算：channel 名解析回真实 exe 是为了拿真实
-        # 版本号（否则 UA 版本对不上内核）。
-        ua = fake_user_agent(cfg, real)
-        port = _free_port()
-        try:
-            proc = subprocess.Popen(
-                _browser_argv(real, port, hl, offscreen, ua),
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        except Exception as e:
-            errors.append('%s(%s) → %s' % (kind, real.name, str(e)[:80]))
-            continue
-        ok = _wait_devtools(port, time.time() + 25)
-        # 若另一个实例已占着 profile：新进程会把参数转交给它、自己秒退，
-        # 而端口其实是那个既有实例在听。这里必须确认「这个端口确实是刚起的
-        # 进程在服务」，否则后续会连到别人的浏览器上。
-        if ok and proc.poll() is not None:
-            _kill_tree(proc)          # 连子进程收干净，别让它们占着 profile 拖累下一候选
-            errors.append('%s(%s) → 进程秒退（profile 可能被别的实例占着）'
-                          % (kind, real.name))
-            continue
-        if not ok:
-            _kill_tree(proc)
-            errors.append('%s(%s) → DevTools 未就绪' % (kind, real.name))
-            continue
-        _BROWSER['proc'], _BROWSER['port'] = proc, port
-        _BROWSER['hl'], _BROWSER['offscreen'] = hl, offscreen
-        log('常驻浏览器已启动（%s%s，%s）' % (
-            '无头' if hl else '有窗口', '·屏幕外' if offscreen else '',
-            real.name))
-        return
+        break
     raise RuntimeError('所有浏览器内核都无法启动：\n    ' + '\n    '.join(errors))
 
 
@@ -928,7 +1992,7 @@ def ensure_browser(cfg, hl, offscreen):
         proc = _BROWSER['proc']
         if proc is not None and proc.poll() is None:
             return
-        PROFILE_DIR.mkdir(parents=True, exist_ok=True)
+        _active_profile().mkdir(parents=True, exist_ok=True)
         _start_browser_process(cfg, hl, offscreen)
 
 
@@ -1017,8 +2081,13 @@ def launch(cfg, headless=None, offscreen=None, auto_download=True):
         log('浏览器形态切换为%s，重启常驻浏览器 …'
             % ('无头' if hl else ('屏幕外有窗口' if offscreen else '有窗口')),
             'warn')
-        stop_browser()
-        ensure_browser(cfg, hl, offscreen)
+        # v6.30 补：停 + 起必须**整体**持锁。否则两个线程同时切形态时，
+        # A 的 stop_browser() 之后、ensure_browser() 之前，B 会看到「没进程」
+        # 又起一只；随后 A 也起——第二只撞上自己人攥着的 Lockfile，三个候选
+        # 各白等 25 秒（真机探针实测 73 秒），最后被迫换罐。
+        with _BROWSER_LOCK:
+            stop_browser()
+            ensure_browser(cfg, hl, offscreen)
 
     if getattr(_TLS, 'ctx', None) is not None:
         # 进程可能被别的线程换号时停掉重启过（pid 变了）——旧 _TLS.ctx 会指向
@@ -1351,9 +2420,13 @@ def fresh_profile():
     profile 重启。所有调用方（cs / webui）都走这里，不必各自 stop。
     """
     stop_browser()
+    # v6.28：归档**活动目录**，不是写死的 PROFILE_DIR——本次运行若换过罐，
+    # 真正的 cookie 罐在 profile_next 里；归档错了旧账号的痕迹会留在原地，
+    # 下一步新账号接着用同一罐 cookie（换号共用痕迹，正是这里要防的事）。
+    cur = _active_profile()
     old = PROFILE_DIR.with_name('profile_old')
     _rmtree_retry(old)          # 清掉上一份归档（句柄滞后时重试，不静默留残）
-    if not PROFILE_DIR.exists():
+    if not cur.exists():
         # 本来就没有 profile（首次使用），只需清掉旧会话文件
         try:
             if STATE_FILE.exists():
@@ -1362,7 +2435,7 @@ def fresh_profile():
             pass
         drop_identity()
         return True
-    if not _rename_retry(PROFILE_DIR, old):
+    if not _rename_retry(cur, old):
         log('归档旧浏览器痕迹失败（文件夹被占用，可能有浏览器窗口还开着）。',
             'warn')
         log('请关闭工具重开后再点登录，否则新旧账号会共用同一个浏览器痕迹。',
@@ -1378,6 +2451,7 @@ def fresh_profile():
             shutil.move(str(IDENTITY_FILE), str(old / 'identity.json'))
     except Exception:
         pass
+    _reset_active_profile()
     log('已归档旧账号的浏览器痕迹（runtime/profile_old），本次登录使用全新会话。')
     return True
 
@@ -1394,32 +2468,34 @@ def restore_profile():
     旧 profile 重启。
     """
     stop_browser()
+    tgt = _active_profile()     # v6.28：回滚到本次运行真正在用的目录
     old = PROFILE_DIR.with_name('profile_old')
     if not old.exists():
         return False
     # 目标必须**确实删干净**再改名：chrome 进程树刚被杀，句柄滞后释放时
     # ignore_errors 的 rmtree 会静默留下半个 profile，随后 rename 撞
     # WinError 183。删不掉就如实返回 False，绝不带病改名。
-    if not _rmtree_retry(PROFILE_DIR):
+    if not _rmtree_retry(tgt):
         log('回滚旧浏览器痕迹失败：runtime/profile 目录被占用（删不掉）。',
             'warn')
         log('旧痕迹还在 runtime/profile_old，可手动改名回 runtime/profile。',
             'warn')
         return False
-    if not _rename_retry(old, PROFILE_DIR):
+    if not _rename_retry(old, tgt):
         log('旧痕迹还在 runtime/profile_old，可手动改名回 runtime/profile。',
             'warn')
         return False
     try:
-        if (PROFILE_DIR / 'state.json').exists():
-            shutil.move(str(PROFILE_DIR / 'state.json'), str(STATE_FILE))
+        if (tgt / 'state.json').exists():
+            shutil.move(str(tgt / 'state.json'), str(STATE_FILE))
     except Exception:
         pass
     try:
-        if (PROFILE_DIR / 'identity.json').exists():
-            shutil.move(str(PROFILE_DIR / 'identity.json'), str(IDENTITY_FILE))
+        if (tgt / 'identity.json').exists():
+            shutil.move(str(tgt / 'identity.json'), str(IDENTITY_FILE))
     except Exception:
         pass
+    _reset_active_profile()
     log('登录没有成功，已把上一个账号的浏览器痕迹与会话挪回原位。')
     return True
 
@@ -5628,6 +6704,23 @@ def needs_answer(d) -> bool:
                 and (d.get('pending') or d.get('notPass'))
                 and not d.get('graded'))
 
+
+def needs_fresh_answer(d) -> bool:
+    """这份是不是「从没做过、等着从头答」的卷子（v6.26）。
+
+    与 needs_answer 的区别：needs_answer 也覆盖「已判不及格、页面在等你答」，
+    那份上面可能写着「未达到及格线，请重做」；这里只认**干干净净没做过**的：
+      · pending=True（答题页顶部的「待完成」）；
+      · 或者 fakeDone（章节列表说完成、测验卡说没做，v6.25 的对账结论）。
+    已批阅 / 有分数 / 有未及格提示的一律不算——那些归重刷链，不能被
+    「补做」再抢一次（重复交卷会白白消耗平台的重做次数）。
+    """
+    if not isinstance(d, dict) or not d:
+        return False
+    if d.get('graded') or d.get('score') is not None or d.get('notPass'):
+        return False
+    return bool(d.get('pending') or d.get('fakeDone'))
+
 # ================================================================ 成绩清单
 # 扫描期「顺带查成绩」：作业列表只给「已完成 / 未完成」，不给分数；分数只在
 # 打开作业卡之后的批阅页上。所以要对章节页里**像作业卡**的节点逐个打开读一次。
@@ -6276,12 +7369,22 @@ def _read_node_score(page, c, cpi, kid) -> dict:
 
 
 def query_scores(cfg, only, threshold=85.0, retake=True, max_retakes=2,
-                 progress=None, control=None, headless=None) -> dict:
+                 progress=None, control=None, headless=None,
+                 answer_pending=False) -> dict:
     """「查成绩 + 低于阈值重刷」总入口（界面「查成绩 / 重刷」按钮用）。
 
     每门勾选的课：① 章节页取全部「像作业卡」的节点；② 逐个打开只读成绩；
     ③ 低于 threshold（或平台明说未达及格线）且还能重做 → 点重做、重新作答
     并交卷；④ 每份最多尝试 max_retakes 次，记最终成绩。
+
+    answer_pending（v6.26）：把「待完成 / 假完成」的卷子也纳入作答。
+      v6.25 的对账能把「平台标已完成、实际没做」查出来，但这条链只动手刷低分，
+      查出来就结束了——用户说「只能查出来，该怎么进行做题啊」。打开后：
+        · `fakeDone`（章节列表说完成、测验卡说没做）→ 直接作答交卷；
+        · `pending`（真·待完成的卷子）→ 同样作答交卷。
+      判据只用卡片自己的状态，**已批阅/有分数/有未及格提示的一律不碰**（那些
+      走上面的重刷链，两条路不会抢同一份）。默认关：那是在账号上真交卷，
+      必须由界面勾选框明确打开。
 
     ⚠ 重刷会真的消耗平台重做次数并重新交卷——只在用户点按钮、且确实低于阈值时做。
     ⚠ 报告里的分数是**最后一次读完的结果**；平台批阅可能延迟，读不到时如实
@@ -6293,7 +7396,8 @@ def query_scores(cfg, only, threshold=85.0, retake=True, max_retakes=2,
     thr = float(threshold or 85.0)
     cap = max(int(max_retakes or 2), 1)
     out = {'items': [], 'retaken': 0, 'improved': 0, 'failed': 0,
-           'stopped': False, 'threshold': thr, 'max_retakes': cap}
+           'answered': 0, 'stopped': False, 'threshold': thr,
+           'max_retakes': cap}
     ctx = launch(cfg, headless=headless)
     try:
         page = ctx.new_page()
@@ -6317,6 +7421,9 @@ def query_scores(cfg, only, threshold=85.0, retake=True, max_retakes=2,
                % (len(picked),
                   ('低于 %s 分自动重刷，每份最多 %d 次'
                    % (_fmt_num(thr), cap)) if retake else '只看分不重刷'))
+        if answer_pending:
+            progress('另：把「待完成 / 平台标已完成、实际没做」的卷子也作答交卷'
+                     '（已批阅、有分数的不碰）。', 'warn')
         for i, c in enumerate(picked, 1):
             if _wait_control(control, progress) == 'stop':
                 out['stopped'] = True
@@ -6338,6 +7445,55 @@ def query_scores(cfg, only, threshold=85.0, retake=True, max_retakes=2,
                 if control() == 'stop':
                     break
                 if not retake:
+                    continue
+                # v6.26：待完成 / 假完成 → 直接作答交卷（用户勾了才走这条）。
+                # 判据只认「卡片明确说没做过」：已批阅、有分数、有未及格提示
+                # 的一律不碰——那些归下面的重刷链，两条路不抢同一份。
+                if answer_pending and needs_fresh_answer(rec):
+                    progress('    ✎ %s：待完成，开始作答交卷…'
+                             % cut(rec.get('node', ''), 20))
+                    try:
+                        st = answer_one(page, c, cpi, rec['kid'], cfg, True,
+                                        progress)
+                    except Exception as e:
+                        progress('    ✗ 作答失败（%s）。'
+                                 % str(e).splitlines()[0][:80], 'warn')
+                        out['failed'] += 1
+                        continue
+                    rec['answerStatus'] = st
+                    if st in ('submitted', 'already', 'unverified'):
+                        out['answered'] += 1
+                    # 交完当场读一次分（批阅可能没跟上，读不到就留空，
+                    # 绝不把「读不到」写成 0 分）
+                    d = {}
+                    for _ in range(3):
+                        time.sleep(3)
+                        d = _read_node_score(page, c, cpi, rec['kid'])
+                        if d and _score_of(d) >= 0:
+                            break
+                    if d:
+                        rec['after'] = d.get('score')
+                        rec['left'] = d.get('left')
+                        rec['canRedo'] = bool(d.get('canRedo'))
+                        if d.get('score') is not None:
+                            rec['score'] = d.get('score')
+                            rec['graded'] = bool(d.get('graded'))
+                    # 已经交出去了就摘掉「假完成」的帽子——哪怕批阅还没跟上、
+                    # 这次读不到分。留着标记会让面板再给一行「补做」，
+                    # 用户顺手再点一次就是白耗一次重做。
+                    if st in ('submitted', 'already', 'unverified'):
+                        rec['fakeDone'] = False
+                    progress('    %s %s'
+                             % ('✓' if st in ('submitted', 'already') else '⚠',
+                                {'submitted': '已交卷',
+                                 'already': '平台显示已批阅（此前已交）',
+                                 'unverified': '已发出，待平台确认',
+                                 'partial': '部分已暂存，需补完再交',
+                                 'report': '要上传附件，需本人完成',
+                                 'unsupported': '题型不支持，需人工',
+                                 'unsolved': '模型没答上，需人工',
+                                 'norender': '答题页没渲染出来',
+                                 'nohw': '没有作业卡'}.get(st, st)))
                     continue
                 # 「该重刷」或「平台已判不及格、页面就在等你答」都算要处理。
                 # 后者没有重做按钮可点，直接进作答分支（见下面的 answer_first）。
@@ -7008,6 +8164,94 @@ def answer_urls(cfg, targets, progress=None, control=None, headless=None,
                 rec['stems'] = detail.get('stems') or {}
                 rec['total'] = detail.get('total')
             out['items'].append(rec)
+    finally:
+        try:
+            save_state(ctx)
+        except Exception:
+            pass
+        close_ctx(ctx)
+    return out
+
+
+def answer_score_items(cfg, items, submit=True, progress=None, control=None,
+                       headless=None) -> dict:
+    """对「查成绩」面板里的行按 kid 直接作答（v6.26 每行的「补做」）。
+
+    items: [{'key': 'cid:clsid', 'kid': ..., 'course': ..., 'node': ...}]。
+           key 由 course_key() 生成，cid:clsid 拆得回来；拆不出来的行跳过。
+
+    为什么要单独一条入口：查成绩面板里的行是「扫出来的节点」，用户对着它点
+    「补做」时不该再回主清单里逐个勾——那正是 v6.25「只能查出来、没法做」
+    的体验。判别 / 作答 / 交卷全部复用 answer_one，行为与「做作业」一致。
+
+    只答**确实没做过**的行是调用方的责任（界面上按钮只对 pending/fakeDone
+    的行出现）；这里仍按 rec 判断一次，已批阅的在 answer_one 里会走 already。
+    """
+    progress = progress or (lambda m, *a: log(m, a[0] if a else 'info'))
+    control = control or (lambda: 'run')
+    cfg = cfg or {}
+    t0 = time.time()
+    tgt = [it for it in (items or [])
+           if isinstance(it, dict) and it.get('kid') and it.get('key')]
+    out = {'total': len(tgt), 'submitted': 0, 'unverified': 0, 'saved': 0,
+           'skipped': 0, 'fail': 0, 'stopped': False, 'items': []}
+    if not tgt:
+        raise RuntimeError('没有可补做的作业（缺少课程/节点定位信息）')
+    ctx = launch(cfg, headless=headless)
+    try:
+        page = ctx.new_page()
+    except Exception:
+        close_ctx(ctx)
+        raise
+    try:
+        banner('检查登录状态')
+        if not check_login(page):
+            if restore_state(ctx) and check_login(page):
+                log('已用本地会话自动登录 ✓')
+            else:
+                raise NotLoggedIn('未登录')
+        _quiet_win(page, cfg, headless)
+        courses, cpi = collect_courses(page, cfg)
+        by_key = {course_key(c): c for c in courses}
+        banner('补做 %d 份待完成 / 假完成的测验（%s）'
+               % (len(tgt), '答完交卷' if submit else '答完暂存'))
+        for i, it in enumerate(tgt, 1):
+            if _wait_control(control, progress) == 'stop':
+                out['stopped'] = True
+                log('已停止。', 'warn')
+                break
+            key = str(it.get('key') or '')
+            cid, _, clsid = key.partition(':')
+            c = by_key.get(key) or {'cid': cid, 'clsid': clsid,
+                                    'name': it.get('course') or key}
+            nm = it.get('node') or ('节点 %s' % it['kid'])
+            progress('【%d/%d】%s ｜ %s'
+                     % (i, len(tgt), cut(c.get('name') or '', 18), cut(nm, 26)))
+            try:
+                r = answer_one(page, c, cpi, str(it['kid']), cfg, submit,
+                               progress)
+            except Exception as e:
+                progress('    这份出错了：%s' % str(e)[:120], 'warn')
+                r = 'failed'
+            if r in ('submitted', 'already'):
+                out['submitted'] += 1
+            elif r == 'unverified':
+                out['unverified'] += 1
+            elif r == 'ok':
+                out['saved'] += 1
+            elif r in ('nohw', 'norender', 'unsupported', 'unsolved', 'report'):
+                out['skipped'] += 1
+            else:
+                out['fail'] += 1
+            out['items'].append({
+                'key': key, 'kid': it['kid'],
+                'course': it.get('course') or c.get('name'),
+                'node': nm, 'status': r})
+            time.sleep(max(float(cfg.get('course_delay', 3.0)), 1.0))
+        progress('补做结束：交卷 %d，未确认 %d，已暂存 %d，需人工/跳过 %d，'
+                 '失败 %d，用时 %.0f 分钟。'
+                 % (out['submitted'], out['unverified'], out['saved'],
+                    out['skipped'], out['fail'], (time.time() - t0) / 60))
     finally:
         try:
             save_state(ctx)

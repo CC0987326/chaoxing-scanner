@@ -156,6 +156,7 @@ TASK_NAME = {
     'refresh_one': '刷新单门课程状态',
     'grades': '查成绩（逐节点读分）',
     'retake': '查成绩并重刷低于 85 分的测验',
+    'makeup': '补做待完成 / 假完成的测验',
     'brush_urls': '上传链接刷课',
     'answer_urls': '上传链接刷题',
     'combo_urls': '上传链接刷课+刷题',
@@ -174,8 +175,11 @@ def _shutdown_pc():
     cs.log('⚡ 任务完成：60 秒后自动关机（想取消可在 cmd 里运行 shutdown /a）',
            'warn')
     try:
+        # CREATE_NO_WINDOW：从 pythonw 里起控制台程序会弹黑窗（v6.29）
         r = subprocess.run(['shutdown', '/s', '/t', '60'], capture_output=True,
-                           text=True, errors='ignore')
+                           text=True, errors='ignore',
+                           creationflags=getattr(subprocess,
+                                                 'CREATE_NO_WINDOW', 0))
         if r.returncode != 0:
             # 关机请求被系统/安全软件拒绝时必须说出来，不能静默装成功
             detail = (r.stderr or '').strip() or ('返回码 %s' % r.returncode)
@@ -735,6 +739,9 @@ def _retake_worker(opts):
     except (TypeError, ValueError):
         cap = 2
     retake = bool(opts.get('retake', True))
+    # v6.26：「顺带把待完成 / 假完成的卷子做掉」。只在「重刷」任务里有意义，
+    # 且必须由界面勾选框明确打开（那是真交卷）。
+    answer_pending = bool(opts.get('answer_pending')) and retake
 
     cs.log('')
     cs.log('▶ 任务开始：%s' % TASK_NAME['retake' if retake else 'grades'])
@@ -768,7 +775,8 @@ def _retake_worker(opts):
 
         out = cs.query_scores(cfg, only, threshold=threshold,
                               retake=retake, max_retakes=cap,
-                              progress=progress, control=control)
+                              progress=progress, control=control,
+                              answer_pending=answer_pending)
         items = out.get('items') or []
         with LOCK:
             STATE['summary'] = {
@@ -776,17 +784,28 @@ def _retake_worker(opts):
                 '低于阈值': sum(1 for x in items
                                 if cs.needs_retake(x, threshold)),
                 '重刷次数': out.get('retaken', 0),
-                '失败': out.get('failed', 0),
             }
+            if answer_pending:
+                STATE['summary']['补做交卷'] = out.get('answered', 0)
+            STATE['summary']['失败'] = out.get('failed', 0)
             if out.get('stopped'):
                 STATE['summary']['状态'] = '已停止'
-        # 复用「交卷结果」面板：逐份列出成绩/重刷结果
+        # 复用「交卷结果」面板：逐份列出成绩/重刷结果。
+        # v6.26 起把判定依据（pending/fakeDone/graded/canRedo/answerStatus）
+        # 一并带给界面——面板据此决定这一行要不要出「补做」按钮，以及
+        # 「补做」请求里该带哪些定位字段。
         _set_ares({'time': time.strftime('%H:%M'), 'items': [
             {'key': x.get('key'), 'kid': x.get('kid'), 'course': x.get('course'),
              'node': x.get('node'), 'status': _grade_status(x, threshold),
              'score': x.get('score'), 'after': x.get('after'),
              'left': x.get('left'), 'attempts': x.get('attempts') or 0,
-             'url': x.get('url') or ''}
+             'url': x.get('url') or '',
+             'pending': bool(x.get('pending')),
+             'fakeDone': bool(x.get('fakeDone')),
+             'graded': bool(x.get('graded')),
+             'notPass': bool(x.get('notPass')),
+             'canRedo': bool(x.get('canRedo')),
+             'answerStatus': x.get('answerStatus') or ''}
             for x in items]})
     except cs.NotLoggedIn as e:
         cs.log('%s' % e, 'err')
@@ -813,6 +832,17 @@ def _grade_status(x, threshold):
     """一行成绩在面板里的状态文案。"""
     sc = x.get('score')
     after = x.get('after')
+    if x.get('answerStatus'):
+        # v6.26：这一行是本次「补做」答完的——它自己的结果比分数更说明问题。
+        return {'submitted': 'madeup', 'already': 'already',
+                'unverified': 'unverified', 'partial': 'partial',
+                'report': 'report', 'unsupported': 'unsupported',
+                'unsolved': 'unsolved', 'norender': 'norender',
+                'nohw': 'skip'}.get(x['answerStatus'], x['answerStatus'])
+    if x.get('fakeDone'):
+        # 「平台标已完成、实际没做」：这行最重要的信息不是分数（它是空的），
+        # 而是「你以为做完了，其实没做」。单独一个状态，别混进 noscore。
+        return 'fake'
     if x.get('attempts'):
         if after is not None and float(after) >= float(threshold):
             return 'retaken-ok'
@@ -970,6 +1000,84 @@ def _answer_single_worker(opts):
         cs.log(traceback.format_exc()[-900:], 'err')
         # 结果区给一版错误卡片：不然「查询中…」占位永远挂着（rv 没变
         # 前端不会重画），用户只看到无限转圈，失败原因却藏在日志页签
+        _set_result({'error': str(e)[:200] or type(e).__name__})
+    finally:
+        cs.set_control_hook(None)
+        PAUSE.clear()
+        CANCEL.clear()
+        with LOCK:
+            STATE['running'] = False
+            STATE['done'] = True
+            STATE['paused'] = False
+            STATE['phase'] = ''
+        cs.log('■ 任务结束')
+
+
+def _makeup_worker(opts):
+    """「补做」后台线程：对查成绩面板里点中的待完成 / 假完成行直接作答（v6.26）。
+
+    v6.25 能把这些节点查出来列成清单，但查完就没下文了——用户要的是
+    「查出来之后把它做掉」。这里按行的 key(cid:clsid)+kid 定位，逐份走
+    answer_one（与「做作业」同一条链）：附件题整份跳过、题干读不出跳过、
+    同题干复用上次答案，答完交卷。
+    """
+    items = [it for it in (opts.get('items') or []) if isinstance(it, dict)]
+    submit = not bool(opts.get('draft'))
+    cs.log('')
+    cs.log('▶ 任务开始：补做待完成 / 假完成的测验（共 %d 份，%s）'
+           % (len(items), '答完交卷' if submit else '答完暂存不交卷'))
+    PAUSE.clear()
+    CANCEL.clear()
+    with LOCK:
+        STATE['paused'] = False
+        STATE['phase'] = 'answering'
+    try:
+        cfg = cs.load_config()
+        if not cs.llm_ready(cfg):
+            cs.log('还没有配置大模型：补做要重新作答，请先在「设置 · 大模型」里配好。',
+                   'err')
+            with LOCK:
+                STATE['summary'] = {'提示': '先配置大模型接口'}
+            return
+
+        def progress(msg, *a):
+            cs.log(msg, a[0] if a else 'info')
+            with LOCK:
+                STATE['task'] = '补做 · ' + (msg[:54] if msg else '')
+
+        def control():
+            if CANCEL.is_set():
+                return 'stop'
+            if PAUSE.is_set():
+                return 'pause'
+            return 'run'
+
+        out = cs.answer_score_items(cfg, items, submit=submit,
+                                    progress=progress, control=control)
+        with LOCK:
+            STATE['summary'] = {'补做份数': out.get('total', 0),
+                                '交卷': out.get('submitted', 0),
+                                '未确认': out.get('unverified', 0),
+                                '已暂存': out.get('saved', 0),
+                                '需人工/跳过': out.get('skipped', 0),
+                                '失败': out.get('fail', 0)}
+            if out.get('stopped'):
+                STATE['summary']['状态'] = '已停止'
+        if out.get('items'):
+            # 复用「交卷结果」面板；每行带 key/kid，面板里可再核实/再补做。
+            _set_ares({'time': time.strftime('%H:%M'), 'items': [
+                {'key': x.get('key'), 'kid': x.get('kid'),
+                 'course': x.get('course'), 'node': x.get('node'),
+                 'status': x.get('status'), 'url': ''}
+                for x in out['items']]})
+    except cs.NotLoggedIn as e:
+        cs.log('%s' % e, 'err')
+        with LOCK:
+            STATE['summary'] = {'提示': '未登录，请先登录'}
+    except Exception as e:
+        cs.log('任务失败：%s' % e, 'err')
+        import traceback
+        cs.log(traceback.format_exc()[-900:], 'err')
         _set_result({'error': str(e)[:200] or type(e).__name__})
     finally:
         cs.set_control_hook(None)
@@ -2012,6 +2120,18 @@ PAGE = r"""<!DOCTYPE html>
   .mini.pri{background:var(--ac);border-color:var(--ac);color:var(--ac-on);font-weight:600;}
   .mini.pri .ic{color:var(--ac-on);}
   .mini.pri:hover:not(:disabled){background:var(--ac-hi);border-color:var(--ac-hi);}
+  /* v6.26：停止键要一眼能看见。以前 .btn.dgr 只作用于大按钮，停止键是
+     .mini.dgr，没定义 → 实际是灰色的，用户到处找「停止」在哪。 */
+  .mini.dgr{color:var(--err);border-color:color-mix(in srgb,var(--err) 45%,transparent);
+    font-weight:600;}
+  .mini.dgr .ic{color:var(--err);}
+  .mini.dgr:hover:not(:disabled){
+    background:color-mix(in srgb,var(--err) 14%,transparent);
+    border-color:color-mix(in srgb,var(--err) 70%,transparent);}
+  /* 任务真在跑的时候实心红：比只描边更醒目，且不误伤禁用态。 */
+  .mini.dgr:not(:disabled){
+    background:color-mix(in srgb,var(--err) 14%,transparent);}
+  .mini.dgr:not(:disabled):hover{background:color-mix(in srgb,var(--err) 24%,transparent);}
   .bmenu{
     position:fixed;z-index:90;min-width:250px;padding:4px;
     background:var(--raise);border:1px solid var(--line-2);border-radius:8px;
@@ -2470,12 +2590,19 @@ PAGE = r"""<!DOCTYPE html>
             只查成绩</button>
           <button class="btn pri" id="bretake"><span class="ic" data-i="play"></span>
             查成绩并重刷低于阈值</button>
+          <label class="chk" title="勾上后，同一次任务里还会把「待完成 / 平台标已完成、
+实际没做」的卷子直接作答交卷。这是真交卷，会记录成绩。">
+            <input type="checkbox" id="makeupon">
+            顺带把「待完成 / 平台标已完成、实际没做」的卷子做掉</label>
           <p class="note guide">作业列表只给「已完成 / 未完成」，分数要打开作业卡才看得到，
             所以「顺带查成绩」会让查询慢一些（每门课多 1~4 分钟）。「查成绩并重刷」会对
             勾选课程里低于阈值的测验点「重做」，然后重新作答并交卷，每份最多 2 次、取最高分。
             <b>重做会消耗平台的剩余重做次数</b>；平台重做时会把题目顺序重排，所以工具会
-            重新作答而不是照抄上次的答案。只动<b>平台已判不及格</b>的卷子；
-            「待完成」（从没做的作业）只报告、不替你动手。</p>
+            重新作答而不是照抄上次的答案。不勾下面那项时，只动<b>平台已判不及格</b>的卷子；
+            「待完成」（从没做的作业）只报告、不替你动手。
+            <br>勾上「顺带做掉」后，「待完成」和「平台标已完成 · 实际没做」的卷子也会被
+            作答交卷；已批阅、有分数的一律不碰。结果面板里每一行也还有单独的「补做」按钮，
+            可以只挑几份做。</p>
         </section>
 
         <section class="blk" id="cardsblk" style="display:none">
@@ -2709,6 +2836,16 @@ PAGE = r"""<!DOCTYPE html>
             <div class="st"><b>显示引导提示</b>
               <i>页面上的帮助说明类文字，关掉后更清爽</i></div>
             <button class="sw on" id="swGuide" aria-label="显示引导提示"></button>
+          </div>
+          <div class="setrow">
+            <div class="st"><b>任务运行中点窗口 ×</b>
+              <i>每次询问 / 直接最小化（任务继续）/ 停止任务并退出。
+                 在关窗时勾「记住我的选择」也会写到这里</i></div>
+            <select id="closeAct" style="width:auto;flex:none">
+              <option value="">每次询问</option>
+              <option value="min">最小化窗口</option>
+              <option value="quit">关闭程序（先停任务）</option>
+            </select>
           </div>
         </section>
 
@@ -4032,11 +4169,63 @@ const AST = {
   norender:   ['需人工 · 打开没渲染出题目', 'warn'],
   partial:    ['已暂存 · 待补完再交', 'warn'],
   skip:       ['已跳过', 'mut'],
+  // v6.26：查成绩面板里「待完成 / 平台标已完成、实际没做」的行。
+  // 这两类以前只显示「无成绩」，用户看不出它们是可做的。
+  pending:    ['待完成 · 没做过', 'warn'],
+  fake:       ['平台标已完成 · 实际没做', 'warn'],
+  madeup:     ['已补做 · 已交卷', 'ok'],
+  dry:        ['预演 · 未落库', 'mut'],
 };
 
 // 课堂活动行由后端打 kind:'act'（它的 kid 是活动 activeId，不是作业 knowledgeid）：
 // 「重新核实」按作业卡查，对活动永远核实不到，所以只对作业行生效。
 function isActItem(it){ return !!(it && it.kind === 'act'); }
+
+// v6.26：这一行能不能「补做」——必须带得动定位信息（key=cid:clsid + kid），
+// 且平台确实还没做过。已批阅 / 有分数 / 有未及格提示的不出这个按钮
+// （那些归重刷，点了也只会被告知已做过）。
+function makeupable(it){
+  if (!it || isActItem(it)) return false;
+  if (!it.key || !it.kid) return false;
+  if (String(it.key).indexOf(':') < 0) return false;
+  if (it.graded || it.notPass || it.score != null) return false;
+  if (it.status === 'madeup' || it.status === 'done'
+      || it.status === 'already' || it.status === 'retaken-ok'
+      || it.status === 'retaken-low') return false;
+  return !!it.pending || !!it.fakeDone || it.status === 'noscore'
+      || it.status === 'pending' || it.status === 'fake';
+}
+
+// 「补做」：把这一行（或全面板里所有可补做的行）交给后端，按 kid 直接作答交卷。
+function makeupAnswer(ev, idx){
+  if (ev) ev.stopPropagation();
+  const rows = (idx == null || idx === 'all')
+    ? aitems.filter(makeupable)
+    : [aitems[idx]].filter(makeupable);
+  if (!rows.length){ toast('没有可补做的（待完成 / 实际没做）的作业', 'warn'); return; }
+  if (!confirm('让大模型做这 ' + rows.length + ' 份并交卷？\n\n'
+      + rows.slice(0, 5).map(x => '· ' + (x.course || '') + ' / '
+                                 + (x.node || '')).join('\n')
+      + (rows.length > 5 ? '\n…等 ' + rows.length + ' 份' : '')
+      + '\n\n答完直接正式提交、记录成绩。要上传附件的题整份跳过，不会乱填。')) return;
+  fetch('/api/makeup', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({items: rows.map(it => ({
+      key: it.key, kid: it.kid, course: it.course, node: it.node}))})})
+    .then(r => {
+      if (r.status === 409){ toast('当前有任务在跑，等它结束再做', 'warn'); return; }
+      if (!r.ok){ toast('补做没能启动（HTTP ' + r.status + '）', 'err'); return; }
+      since = 0; logEl.innerHTML = '';
+      setCardsShown(false); cardFp = '';
+      autoBack = true; brushLike = true;
+      $('resTaskBody').innerHTML = '<div class="empty taskph">正在后台补做 '
+        + rows.length + ' 份…（进度看「运行日志」，可以随时暂停 / 停止）</div>';
+      $('bartip').textContent = '补做中…';
+      showRes('task');
+      switchTab('log');
+      clearTimeout(timer);
+      poll();
+    }).catch(() => toast('连不上本地程序，请确认程序还在运行', 'err'));
+}
 
 function renderAnswerResult(a){
   if (!a || !a.items) return;
@@ -4050,16 +4239,20 @@ function renderAnswerResult(a){
   const need = aitems.filter(it =>
     ['report','unsupported','unsolved','norender','partial','ok']
       .includes(it.status));
+  const todo = aitems.filter(makeupable);
   const tags = [[aitems.length, '', '份']];
   if (uv.length) tags.push([uv.length, 'warn', '份待核实']);
   if (need.length) tags.push([need.length, 'warn', '份需人工']);
+  if (todo.length) tags.push([todo.length, 'warn', '份可补做']);
   let h = '<div class="sec"><h2>交卷结果'
        + tags.map(t => ' <span class="n' + (t[1] ? ' ' + t[1] : '') + '">'
                        + t[0] + '</span> ' + t[2]).join('')
        + '</h2>'
        + '<div class="meta">生成时间 ' + esc(a.time)
        + '　·　「待平台确认」= 提交已发出、平台还没翻转状态（可能延迟几分钟到十几分钟），'
-       + '点「重新核实」自动翻案；也可以点开网址自己确认。</div>';
+       + '点「重新核实」自动翻案；也可以点开网址自己确认。'
+       + '「待完成 / 平台标已完成 · 实际没做」的行可以直接点「补做」，'
+       + '不用回清单里逐个勾。</div>';
   if (uvHw.length){
     h += '<div class="brushbar"><button class="mini pri"'
        + ' onclick="verifyAnswer(event)"><span class="ic">' + icon('refresh')
@@ -4067,13 +4260,20 @@ function renderAnswerResult(a){
        + '<span class="note">逐份重开查平台状态（作业查「已批阅」卡、'
        + '课堂活动查答题页），隔一分钟一轮，最多三轮，可随时停止。</span></div>';
   }
+  if (todo.length){
+    h += '<div class="brushbar"><button class="mini pri"'
+       + ' onclick="makeupAnswer(event,\'all\')"><span class="ic">' + icon('play')
+       + '</span>补做全部（' + todo.length + ' 份）</button>'
+       + '<span class="note">把「待完成 / 平台标已完成、实际没做」的卷子交给大模型'
+       + '作答交卷；已批阅、有分数的不碰。也可以点每行自己的「补做」只做那一份。</span></div>';
+  }
   // 有任一条带「逐题答案」就补一列把答案列出来——「暂存」的意义就是答完
   // 给你看、你核对后再自己交（作业交卷结果同样带上，一并供核对）。
   const hasAns = aitems.some(it => it.answers && Object.keys(it.answers).length);
   h += '<table><thead><tr><th>课程</th><th>项目 / 名称</th><th>状态</th>'
      + (hasAns ? '<th>逐题答案（供核对）</th>' : '')
      + '<th class="col-act">操作</th></tr></thead><tbody>';
-  aitems.forEach((it) => {
+  aitems.forEach((it, ri) => {
     const st = AST[it.status] || [it.status, 'mut'];
     // 用显式 kind 判，别拿 kid 里有没有冒号猜：课堂活动行的 kid 就是活动
     // activeId（不含冒号），猜的话活动永远被判成作业 → 文案写成「打开作业」。
@@ -4091,6 +4291,11 @@ function renderAnswerResult(a){
        + (safeUrl(it.url) ? '<a href="' + safeUrl(it.url)
                             + '" class="go-work" rel="noopener">'
                             + (isAct ? '打开活动' : '打开作业') + '</a>' : '')
+       + (makeupable(it)
+          ? ' <button class="mini" onclick="makeupAnswer(event,' + ri + ')"'
+            + ' title="让大模型把这一份做掉并交卷（附件题会整份跳过）">'
+            + '<span class="ic">' + icon('play') + '</span>补做</button>'
+          : '')
        + '</td></tr>';
   });
   h += '</tbody></table></div>';
@@ -4539,12 +4744,15 @@ if ($('blinkbrush')){
       toast('阈值要填 0~100 之间的数', 'warn');
       return;
     }
+    const mk = api === '/api/retake' && !!($('makeupon') && $('makeupon').checked);
     if (api === '/api/retake' && !confirm(
         '将对勾选的 ' + only.length + ' 门课查成绩，并自动重刷低于 ' + thr +
-        ' 分的测验（每份最多 2 次，取最高分）。\n\n' +
-        '重做会消耗平台的剩余重做次数，并且会重新交卷。继续？')) return;
+        ' 分的测验（每份最多 2 次，取最高分）。' +
+        (mk ? '\n\n另外会把「待完成 / 平台标已完成、实际没做」的卷子也作答交卷。' : '') +
+        '\n\n重做会消耗平台的剩余重做次数，并且会重新交卷。继续？')) return;
     fetch(api, {method:'POST', headers:{'Content-Type':'application/json'},
       body: JSON.stringify({only: only, threshold: thr, max_retakes: 2,
+                            answer_pending: mk,
                             retake: api === '/api/retake'})})
       .then(r => {
         if (r.status === 409){ toast('上一个任务还在跑，等它结束再点', 'warn'); return; }
@@ -4779,6 +4987,20 @@ $('bstop').onclick = () => {
     }
   };
 
+  // ---- 关窗动作（v6.26）：与后端 config.json 的 close_action 双向同步 ----
+  const closeAct = document.getElementById('closeAct');
+  if (closeAct) closeAct.onchange = () => {
+    fetch('/api/llm-config', {method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({close_action: closeAct.value})
+    }).then(r => r.ok ? toast(closeAct.value
+        ? '已记住：任务运行中点 × 时' + (closeAct.value === 'min'
+            ? '直接最小化窗口' : '直接停止任务并退出')
+        : '已改回：每次关窗前都询问', 'ok')
+      : toast('关窗偏好没存上，详见运行日志', 'warn'))
+      .catch(() => toast('连不上本地程序', 'err'));
+  };
+
   // ---- 两个开关 ----
   const swGuide = document.getElementById('swGuide');
   if (swGuide) swGuide.onclick = () => {
@@ -4847,6 +5069,8 @@ $('bstop').onclick = () => {
     if (typeof j.keep_awake === 'boolean'){
       lsSet('cx_keep', j.keep_awake ? '1' : '0'); applyKeepAwake();
     }
+    if (closeAct && typeof j.close_action === 'string')
+      closeAct.value = j.close_action;
   }).catch(() => {});
 })();
 </script>
@@ -4983,6 +5207,7 @@ class Handler(BaseHTTPRequestHandler):
             # 顺手把刷课倍速也带给前端（页面加载时回填下拉框的上次选择）
             payload['brush_rate'] = cfg.get('brush_rate', 1.25)
             payload['keep_awake'] = bool(cfg.get('keep_awake', True))
+            payload['close_action'] = cfg.get('close_action') or ''
             return self._send(200, json.dumps(payload, ensure_ascii=False).encode('utf-8'))
         return self._send(404, b'{"error":"not found"}')
 
@@ -4992,7 +5217,7 @@ class Handler(BaseHTTPRequestHandler):
     # 清单保留作对照：曾经只对这里列的端点设闸，/api/answer-one 恰好
     # 漏在名单外 —— 按端点挑名单的维护方式本身就是缺陷。
     _JSON_PATHS = ('/api/run', '/api/brush', '/api/answer', '/api/combo',
-                   '/api/grades', '/api/retake',
+                   '/api/grades', '/api/retake', '/api/makeup',
                    '/api/answer-one', '/api/answer-verify',
                    '/api/brush-act', '/api/answer-act', '/api/combo-act',
                    '/api/llm-config', '/api/llm-test',
@@ -5115,7 +5340,10 @@ class Handler(BaseHTTPRequestHandler):
                              started=time.time(), login_fail=None)
             _spawn(_retake_worker, {'only': only, 'retake': retake,
                                     'threshold': data.get('threshold') or 85,
-                                    'max_retakes': data.get('max_retakes') or 2})
+                                    'max_retakes': data.get('max_retakes') or 2,
+                                    # v6.26：顺带把待完成 / 假完成做掉
+                                    'answer_pending': bool(
+                                        data.get('answer_pending'))})
             return self._send(200, b'{"ok":true}')
         if u.path == '/api/answer':
             # 「做勾选课程的章节作业」。only 必填；draft=True 走暂存，
@@ -5136,6 +5364,30 @@ class Handler(BaseHTTPRequestHandler):
                              lines=[], done=False, summary=None,
                              started=time.time(), login_fail=None)
             _spawn(_answer_worker, {'only': only,
+                                    'draft': bool(data.get('draft'))})
+            return self._send(200, b'{"ok":true}')
+        if u.path == '/api/makeup':
+            # v6.26：「补做」——对查成绩/交卷面板里点中的待完成 / 假完成行
+            # 直接答题交卷。items 必须带 key(cid:clsid) 与 kid 才能定位；
+            # 缺定位的行直接拒掉，绝不猜（猜错就是把别人的题答了）。
+            try:
+                data = json.loads(raw.decode('utf-8') or '{}')
+            except Exception:
+                data = {}
+            items = [it for it in (data.get('items') or [])
+                     if isinstance(it, dict) and it.get('kid') and it.get('key')]
+            if not items:
+                return self._send(400, json.dumps(
+                    {'error': '没有可补做的作业（缺少课程/节点定位信息）'},
+                    ensure_ascii=False).encode('utf-8'))
+            _close_work_window()
+            with LOCK:
+                if STATE['running']:
+                    return self._send(409, b'{"error":"busy"}')
+                STATE.update(running=True, task=TASK_NAME['makeup'],
+                             lines=[], done=False, summary=None,
+                             started=time.time(), login_fail=None)
+            _spawn(_makeup_worker, {'items': items,
                                     'draft': bool(data.get('draft'))})
             return self._send(200, b'{"ok":true}')
         if u.path == '/api/answer-one':
@@ -5314,6 +5566,11 @@ class Handler(BaseHTTPRequestHandler):
             # 运行期阻止休眠开关（设置页）：单独一个布尔，走同一条 patch 通道。
             if 'keep_awake' in data:
                 patch['keep_awake'] = bool(data.get('keep_awake'))
+            # v6.26：关窗动作（每次询问 / 最小化 / 关闭程序）。只认这三个值，
+            # 别的值当「每次询问」——手改坏了也不能让窗口关不掉。
+            if 'close_action' in data:
+                ca = str(data.get('close_action') or '').strip()
+                patch['close_action'] = ca if ca in ('min', 'quit') else ''
             # 平台：预设平台只接受用户改过的那几项（地址默认用预设的）；
             # 自定义平台则地址与模型都听用户的。
             plat = str(data.get('llm_platform') or '').strip()
@@ -5431,7 +5688,8 @@ class Handler(BaseHTTPRequestHandler):
                  'vision_key_set': bool(vkey_now),
                  'vision_key_mask': cs.mask_key(vkey_now),
                  'vision_ready': cs.llm_vision_ready(back),
-                 'keep_awake': bool(back.get('keep_awake', True))},
+                 'keep_awake': bool(back.get('keep_awake', True)),
+                 'close_action': back.get('close_action') or ''},
                 ensure_ascii=False).encode('utf-8'))
         if u.path == '/api/llm-test':
             # 「测试连接」：拿界面**当前填的**模型信息真调一次 LLM（短问答）。
@@ -5791,14 +6049,65 @@ def _claim_single_instance():
         return True
 
 
-def _set_foreground():
-    """按窗口标题把本工具的窗口提到最前。"""
+def _tool_main_hwnd(pid=None):
+    """本工具**桌面窗口**的句柄。pid 给定时限那个进程，否则只按类名认。
+
+    v6.31：`FindWindowW(None, WIN_TITLE)` 已经不能用（真机 2026-10-20）：
+    Windows 11 的 explorer.exe 有一个标题恰好等于 WIN_TITLE 的
+    `Windows.Internal.Shell.TabProxyWindow`，`FindWindowW` 先命中它——
+    `_main_hwnd()` 因此拿到别人的 135x37 代理窗，`SetParent` 永远失败，
+    浏览器被兜底搬到桌面上、每秒重刷一次（用户说的「一直微微闪」）。
+
+    认法改成 EnumWindows + pywebview 的 WinForms 顶层窗口类名前缀
+    `WindowsForms10.Window.`。pid 能给就给：同进程内找主窗口时 pid 是
+    **必要条件**（同标题的 explorer 代理窗 pid 对不上，结构上排除）；
+    跨进程调（`_set_foreground` 要唤醒的是**上一个进程**的窗口）时 pid
+    拿不到，就只能靠类名 + 标题；但 `WindowsForms10.Window.` 这个前缀本身
+    就把 explorer 的 `Windows.Internal.Shell.TabProxyWindow` 挡在外面了，
+    所以跨进程也不会再认错。
+    """
+    import ctypes
+    u32 = _u32()
+    found = []
+
+    CB = ctypes.WINFUNCTYPE(ctypes.c_int, ctypes.c_void_p,
+                            ctypes.c_void_p)
+
+    def _on(hwnd, _lparam):
+        if not u32.IsWindowVisible(hwnd):
+            return 1
+        if pid is not None and _window_pid(hwnd) != pid:
+            return 1
+        buf = ctypes.create_unicode_buffer(96)
+        u32.GetClassNameW(hwnd, buf, 96)
+        if not buf.value.startswith('WindowsForms10.Window.'):
+            return 1
+        tbuf = ctypes.create_unicode_buffer(256)
+        u32.GetWindowTextW(hwnd, tbuf, 256)
+        found.append((tbuf.value != WIN_TITLE, hwnd))
+        return 1
+
     try:
-        import ctypes
-        u32 = ctypes.WinDLL('user32', use_last_error=True)
-        u32.FindWindowW.restype = ctypes.c_void_p
-        u32.FindWindowW.argtypes = [ctypes.c_wchar_p, ctypes.c_wchar_p]
-        hwnd = u32.FindWindowW(None, WIN_TITLE)
+        u32.EnumWindows(CB(_on), None)
+    except Exception:
+        return 0
+    if not found:
+        return 0
+    # 标题精确相同的优先（WebView2 的子窗口类名不同，进不来这一支）
+    found.sort(key=lambda x: x[0])
+    return found[0][1]
+
+
+def _set_foreground():
+    """按窗口类名 + 标题把本工具的窗口提到最前。
+
+    跨进程用（单实例唤醒时目标窗口属于**上一个进程**），所以不能按
+    `os.getpid()` 过滤；靠 `WindowsForms10.Window.` 类名前缀把 explorer 的
+    同标题代理窗挡在外面（v6.31，见 `_tool_main_hwnd`）。
+    """
+    try:
+        u32 = _u32()
+        hwnd = _tool_main_hwnd()
         if not hwnd:
             return False
         u32.ShowWindow(hwnd, 9)          # SW_RESTORE：最小化/最大化都还原
@@ -5846,13 +6155,113 @@ def focus_window():
     return _set_foreground()
 
 
+def _native_close_choice():
+    """任务运行中点 × 的原生选择框（v6.26）。
+
+    返回 'min'（最小化，任务继续）| 'quit'（停任务并退出）| None（什么都不做）。
+
+    为什么必须是原生 WinForms：closing 事件是 should_lock=True，回调在 UI
+    线程**同步**执行；这里如果走 evaluate_js 等 JS 返回，会当场死锁。
+    pywebview 自带的 confirm_close 只有「确定/取消」两个按钮，放不下
+    「最小化 / 关闭程序 / 记住我的选择」，所以自己搭一个 Form。
+    """
+    try:
+        import clr                      # noqa: F401  pythonnet 的入口
+        clr.AddReference('System.Windows.Forms')
+        clr.AddReference('System.Drawing')
+        import System.Windows.Forms as WF
+        from System.Drawing import Size
+
+        form = WF.Form()
+        form.Text = WIN_TITLE
+        form.FormBorderStyle = WF.FormBorderStyle.FixedDialog
+        form.StartPosition = WF.FormStartPosition.CenterScreen
+        form.MaximizeBox = False
+        form.MinimizeBox = False
+        form.ShowInTaskbar = False
+        form.TopMost = True
+        form.ClientSize = Size(396, 176)
+
+        lab = WF.Label()
+        lab.Text = ('任务正在运行。\n\n'
+                    '· 最小化窗口：任务继续跑，窗口收进任务栏。\n'
+                    '· 关闭程序：先停止任务、收尾，再退出。')
+        lab.SetBounds(16, 12, 364, 68)
+        form.Controls.Add(lab)
+
+        chk = WF.CheckBox()
+        chk.Text = '记住我的选择（以后不再询问）'
+        chk.SetBounds(16, 88, 320, 24)
+        form.Controls.Add(chk)
+
+        bmin = WF.Button()
+        bmin.Text = '最小化窗口'
+        bmin.SetBounds(90, 126, 128, 32)
+        bmin.DialogResult = WF.DialogResult.Yes
+        form.Controls.Add(bmin)
+
+        bquit = WF.Button()
+        bquit.Text = '关闭程序（先停止任务）'
+        bquit.SetBounds(226, 126, 156, 32)
+        bquit.DialogResult = WF.DialogResult.No
+        form.Controls.Add(bquit)
+        form.AcceptButton = bmin
+        # 不设 CancelButton：Esc 关不掉这个框，等于「先别动」——正是我要的。
+
+        r = form.ShowDialog()
+        pick = ('min' if r == WF.DialogResult.Yes
+                else 'quit' if r == WF.DialogResult.No else None)
+        if pick and chk.Checked:
+            _remember_close_action(pick)
+        return pick
+    except Exception as e:
+        # 原生框起不来（缺 pythonnet / 非 Windows 桌面后端）时退回系统
+        # MessageBox：三个按钮刚好对上三种意图，只是没有「记住」。
+        try:
+            import clr                    # noqa: F401
+            clr.AddReference('System.Windows.Forms')
+            import System.Windows.Forms as WF
+            r = WF.MessageBox.Show(
+                '任务正在运行。\n\n是 = 最小化窗口（任务继续）\n'
+                '否 = 停止任务并关闭程序\n取消 = 什么都不做',
+                WIN_TITLE, WF.MessageBoxButtons.YesNoCancel,
+                WF.MessageBoxIcon.Question)
+            return ('min' if r == WF.DialogResult.Yes
+                    else 'quit' if r == WF.DialogResult.No else None)
+        except Exception:
+            cs.log('关窗选择框起不来（%s），这次先不动：'
+                   '要退出请点界面上的「停止」，等任务收尾后再关窗口。'
+                   % type(e).__name__, 'warn')
+            return None
+
+
+_CLOSE_ACTIONS = ('min', 'quit')
+
+
+def _remember_close_action(action):
+    """把「记住我的选择」写进 config.json（原子 patch，不冲别的设置）。"""
+    if action not in _CLOSE_ACTIONS:
+        return False
+    try:
+        cs.patch_config({'close_action': action})
+        cs.log('已记住关窗选择：%s（可在「设置 · 通用」里改回每次询问）'
+               % ('最小化窗口' if action == 'min' else '关闭程序'), 'ok')
+        return True
+    except Exception as e:
+        cs.log('关窗选择没存上（%s），下次仍会询问。' % type(e).__name__, 'warn')
+        return False
+
+
 def _on_window_closing():
-    """点窗口的 × 时：任务还在跑就先别关。
+    """点窗口的 × 时，任务在跑就弹原生选择框：最小化 / 关程序（v6.26）。
 
     返回 False 会让 pywebview 取消这次关闭。任务收尾涉及保存进度、关浏览器，
-    直接退会把平台侧刷到一半的状态丢在那儿，用户还得从头再来。
-    这里**不能**用 evaluate_js 去弹提示：closing 是在 UI 线程同步跑的，
-    而 evaluate_js 要等 JS 返回结果，会当场死锁。所以只写日志 + 把窗口唤起。
+    直接退会把平台侧刷到一半的状态丢在那儿，用户还得从头再来——所以「停任务
+    + 有序收尾」这件事必须由我们自己做（CANCEL + _shutdown_async），
+    而不是靠用户先去点停止。
+
+    这里**不能**用 evaluate_js：closing 是在 UI 线程同步跑的，
+    而 evaluate_js 要等 JS 返回结果，会当场死锁。
     """
     if DESKTOP.get('force'):
         return None
@@ -5861,8 +6270,31 @@ def _on_window_closing():
     if not running:
         return None
     _set_foreground()
-    cs.log('窗口没有关闭：任务还在运行。要退出请先在界面上点「停止」，再关窗口。',
-           'warn')
+    # 用户勾过「记住我的选择」就不再问
+    try:
+        remembered = str(cs.load_config().get('close_action') or '')
+    except Exception:
+        remembered = ''
+    pick = remembered if remembered in _CLOSE_ACTIONS else _native_close_choice()
+    if pick == 'min':
+        win = DESKTOP.get('win')
+        try:
+            if win is not None:
+                win.minimize()
+        except Exception:
+            pass
+        cs.log('窗口已最小化，任务继续在后台跑。', 'info')
+        return False
+    if pick == 'quit':
+        # 顺序很重要：先置停止信号让任务线程收尾（保存进度），再由
+        # _shutdown_async 关浏览器、销毁窗口、停 HTTP 服务。
+        CANCEL.set()
+        PAUSE.set()          # 解除暂停挂起，别让任务卡在暂停循环里
+        cs.log('正在停止任务并退出，等它收尾（几秒）…', 'warn')
+        _shutdown_async(delay=0.2)
+        return False
+    # None = 用户按 Esc / 点了别的：这次先不动
+    cs.log('窗口没有关闭（你取消了）。任务继续跑。', 'info')
     return False
 
 
@@ -5982,12 +6414,23 @@ def _enum_chrome_windows(own_pid=None):
 
 
 def _main_hwnd():
-    """主窗口句柄（找不到返回 0）。"""
-    import ctypes
-    u32 = _u32()
-    u32.FindWindowW.restype = ctypes.c_void_p
-    u32.FindWindowW.argtypes = [ctypes.c_wchar_p, ctypes.c_wchar_p]
-    return u32.FindWindowW(None, WIN_TITLE) or 0
+    """主窗口句柄（找不到返回 0）。
+
+    v6.31：**不能再按标题 FindWindowW 找**。真机（2026-10-20）实测：
+    Windows 11 的 explorer.exe 会有一个标题恰好等于 WIN_TITLE 的
+    `Windows.Internal.Shell.TabProxyWindow`（就是任务栏分组/预览用的那个
+    135x37 的小代理窗）。`FindWindowW(None, WIN_TITLE)` 命中的是它，
+    不是本工具的窗口——于是 `SetParent(浏览器, 那个代理窗)` 必然失败，
+    入坞永远不成功，`_dock_new_windows` 每轮都走「入坞失败」的兜底分支
+    把屏外的浏览器搬到屏幕 (60,60)，每秒重来一次 → 用户看到「窗口一直
+    在屏上微微闪」，预览页签里却什么都没有。
+
+    改成按**本进程 pid + 窗口类名**认：pywebview 的 edgechromium 后端用
+    WinForms，顶层窗口类是 `WindowsForms10.Window.8.app.0.*`。同名窗口在
+    别的进程里（explorer 那个）pid 对不上，自然排除。
+    """
+    import os
+    return _tool_main_hwnd(os.getpid())
 
 
 def _is_foreground(hwnd):
@@ -6160,13 +6603,29 @@ def _dock_new_windows():
             continue
         if u32.GetParent(hwnd):
             continue                      # 已经是子窗口（不会发生，双保险）
+        with LOCK:
+            # v6.31：入坞失败过的窗口**不再每秒重试**。原来的写法每轮都
+            # ShowWindow(SW_RESTORE) + 改样式 + SetParent 失败 + MoveWindow，
+            # 一秒一次，窗口就一直在屏幕上「微微闪」。主窗口换了（重建）才
+            # 清空重试表。
+            if DESKTOP.get('_dock_owner') != main:
+                DESKTOP['_dock_failed'] = set()
+                DESKTOP['_dock_owner'] = main
+            if hwnd in DESKTOP['_dock_failed']:
+                continue
         u32.ShowWindow(hwnd, 9)           # SW_RESTORE：最小化的先还原
         old = _dock_style_apply(hwnd)
         if not u32.SetParent(hwnd, main):
-            # 入坞失败就还原样式，别把用户的浏览器搞成无框孤儿；
-            # 屏外启动的窗口还要退回屏上有窗（否则用户面对一个隐形浏览器）
+            # 入坞失败：还原样式，**不碰窗口位置**。旧代码在这里 MoveWindow
+            # 到 (60,60)，把屏外启动的浏览器硬搬到屏幕正中——这就是真机
+            # 2026-10-20「以前不显示的窗口现在都显示出来了」的直接来路。
+            # 屏外待坞是用户预期内的状态（预览里看不见 = 面板没开），
+            # 绝不能为了让用户「看得见」而把窗口甩到桌面上。
             u32.SetWindowLongW(hwnd, GWL_STYLE, old)
-            u32.MoveWindow(hwnd, 60, 60, 1200, 800, True)
+            with LOCK:
+                DESKTOP.setdefault('_dock_failed', set()).add(hwnd)
+            cs.log('浏览器窗口没能嵌进「预览」（SetParent 失败），先留在后台；'
+                   '重新打开本工具会再试一次。', 'warn')
             continue
         with LOCK:
             DESKTOP['docked'].append(hwnd)
@@ -6347,9 +6806,10 @@ def _shutdown_async(delay: float = 0.35):
     def _bye():
         time.sleep(delay)
         # 桌面模式：先关原生窗口。置 force 是因为「退出程序」是明确意图，
-        # 不该再被 _on_window_closing 那条「任务在跑就别关」拦住
+        # 不该再被 _on_window_closing 那条「任务在跑就先问一句」拦住
         # —— 拦住的后果是窗口关不掉、服务已停，用户对着一个死窗口。
-        # CANCEL 在 /api/quit 里已经置过了，任务这边很快就能收尾。
+        # 调用方（/api/quit、关窗选「关闭程序」）已经置过 CANCEL，
+        # 任务这边很快就能收尾。
         if DESKTOP.get('win') is not None:
             DESKTOP['force'] = True
         # 网页模式也要等任务收尾：主线程一退，daemon 任务线程被硬杀，
