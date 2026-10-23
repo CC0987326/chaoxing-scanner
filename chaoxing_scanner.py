@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-学习通（超星）未完成事项巡检工具  v6.31
+学习通（超星）未完成事项巡检工具  v6.32
 ================================================================
 把「登录 → 逐门课翻作业/考试/任务点/课堂活动 → 汇总成清单」这套流程固化成本地程序。
 
@@ -119,6 +119,24 @@ v6.24 要点（成绩与重刷 + 视觉通道的一处真错）：
    重刷**真的会消耗平台的剩余重做次数**，所以只在用户点按钮、且节点确实低于
    阈值时才做。平台重做时会**连题目顺序一起重排**（真机实测：批阅页第 10 题
    在重做后变成第 6 题，选项图 4/4 相同），所以不能照抄上次的答案，必须重答。
+
+v6.32 要点（阅读理解题组一道都答不上）：
+  真机作业：线性代数B「求解线性方程组」，4 道题全是 answertype=15 的
+  **阅读理解题组**，共 13 道子题。旧版 ATYPES/STYPES 里没有 15，answer_one
+  判「不支持的题型」→ 整份跳过，一道都答不上。本版：
+    ① 解析侧把题组按**子题**展开成普通题目（全局连续题号），子题自带 qtype
+       0/1/2/3/4，落答/回读/截图全部沿用老链路；
+    ② 子题的隐藏答案域只有 id 没有 name、qid 带 uuid —— 落答按 id 兜底、
+       不再限纯数字；
+    ③ 平台的选择控件是 **toggle**：只补点该选的会与上次暂存**叠加**
+       （上次 AC + 这次 BD = ABCD 判错）。落答前先点掉同组里不该勾的；
+    ④ 回读补 hidden #answer<qid>（题组页 0 个 radio，旧判据永远「读不了」）；
+    ⑤ 交卷前补 setReadComprehensionAnswer()——题组外层答案是 JSON，只在
+       saveWork/ready2Submit 里聚合（我们直接调 confirmSubmitWork，绕过了它）；
+    ⑥ 截图连同**题组材料**一起框；太高先缩再截；跨屏必须 full_page（否则被
+       视口裁断），而窗口最小化时 Chromium 会节流渲染导致截图超时——截图期间
+       临时把窗口亮出来，截完立刻收回。
+  实测：同一份作业从「整份跳过」到 13 题全答、平台判 88.7 分。
 
 v6.31 要点（窗口不入坞 + 一直在桌面上微微闪）：
 ① 用户装上 v6.30 后报：「之前都是不显示的窗口，现在都变成显示的了」「这个显示
@@ -397,7 +415,7 @@ ACTIVITY_TYPES = {
 # 的「进行中 / 已结束」分桶完全一致（Vue: activeList1=进行中 activeList2=已结束）。
 
 # 版本号：界面侧栏、启动日志、使用说明都引它，别再各处手写一份
-VERSION = 'v6.31'
+VERSION = 'v6.32'
 
 # 平台自身算「已完成」的状态；除此之外都视为未完成
 DONE_STATES = ('已完成', '已互评', '待批阅', '已提交', '待互评', '已结束', '已过期')
@@ -2186,6 +2204,56 @@ def minimize_window(page):
     except Exception as e:
         log('最小化浏览器窗口失败（不影响刷课）：%s' % e, 'warn')
         return False
+
+
+def _win_state_get(page):
+    """读工具自己那个浏览器窗口的当前状态（'normal'/'minimized'/'maximized'）。"""
+    try:
+        cdp = page.context.new_cdp_session(page)
+        wid = cdp.send('Browser.getWindowForTarget')['windowId']
+        b = cdp.send('Browser.getWindowBounds', {'windowId': wid})
+        return wid, (b.get('bounds') or {}).get('windowState') or 'normal'
+    except Exception:
+        return None, None
+
+
+def _win_state_set(page, state):
+    """把窗口切到 state（normal/minimized）。只动工具自己的窗口，不抢焦点。"""
+    try:
+        cdp = page.context.new_cdp_session(page)
+        wid = cdp.send('Browser.getWindowForTarget')['windowId']
+        cdp.send('Browser.setWindowBounds',
+                 {'windowId': wid, 'bounds': {'windowState': state}})
+        return True
+    except Exception:
+        return False
+
+
+def _shot_visible(page):
+    """截图期间把窗口临时亮出来（不激活）；截完还原。
+
+    为什么必须有这一层（真机 2026-10-23，线代B 阅读理解，整页 10877px）：
+    Chromium 对**最小化/不可见**的窗口会节流渲染，full_page 截图（要重新
+    排版整页）直接卡死——实测可见时 0.19 秒，最小化后 15 秒超时。而答题
+    链路上 _quiet_win 会在登录后就把窗口收进任务栏，于是 13 道题一多半
+    截不到图、模型没图可看、整份答不上。
+
+    返回还原函数（调用方在 finally 里执行）；本来就是 normal 就返回 None。
+    ⚠ 只切 windowState，不动窗口位置/大小，也不调 focus()——用户屏幕不会
+      被弹窗打断，任务栏图标仍是最小化态。
+    """
+    wid, st = _win_state_get(page)
+    if wid is None or st == 'normal':
+        return None
+    if not _win_state_set(page, 'normal'):
+        return None
+
+    def _restore():
+        try:
+            _win_state_set(page, st)
+        except Exception:
+            pass
+    return _restore
 
 
 def _quiet_win(page, cfg, headless):
@@ -4476,6 +4544,10 @@ def brush_pace_rest(done_total, cfg, progress, control, state=None):
 #   · 答案按题干哈希落本地缓存（runtime/answer_cache.json），同题不重复花钱
 ATYPES = {'0': '单选', '1': '多选', '3': '判断'}   # 客观题：直接选
 STYPES = {'2': '填空', '4': '简答'}                # 主观题：LLM 写文本
+# v6.32：阅读理解 / 材料题组（answertype=15、19）不在这里登记——解析侧
+# （JS_PARSE_TIMUS）会把题组按**子题**展开成普通题目，子题自己的 qtype
+# 就是 0/1/2/3/4，落答/回读/截图全部沿用老链路。真机 2026-10-23（线代B）
+# 整份 4 组 13 道子题都是 15，旧版在这里判「不支持的题型」整份跳过。
 # 「上传附件」型主观题（题干要求交实验报告/附件）LLM 替不了，单独跳过并说明。
 # ⚠ 这份规则与 JS_PARSE_TIMUS 里的 stemUpload 必须一致（两处一起改）：
 #   JS 那份管「一进来就认出附件题」，这份管「模型给了占位答案时兜底回头判」。
@@ -4558,6 +4630,14 @@ JS_PARSE_TIMUS = r"""
   const _lis = [...document.querySelectorAll('.questionLi')];
   const _tms = [...document.querySelectorAll('.TiMu')];
   const _boxes = (_lis.length && _tms.length <= 1) ? _lis : _tms;
+  // 题组按子题展开后，题号必须**全卷连续**：落答、回读、截图定位与提示词里
+  // 的「第 N 题」共用同一个序号空间（t.no = 全局序号 + 1）。
+  let gidx = 0;
+  const _imgSigOf = (node) => {
+    const im = node ? node.querySelector('img') : null;
+    return im ? ((im.getAttribute('src') || '').split('/').pop()
+                 .split('?')[0]) : '';
+  };
   // 上标/下标转普通字符：平台把 10 的 5 次方写成 <sup>5</sup>，textContent
   // 读出来是「6×105Pa」——模型会当成「一百零五」而不是「十的五次方」，
   // 真机实测就栽在这上面（作业 1.2 第 2 题，答案差了一个数量级）。
@@ -4578,6 +4658,76 @@ JS_PARSE_TIMUS = r"""
   };
   _boxes.forEach((li, idx) => {
     const at = li.querySelector('input[name^=answertype]');
+    // ---- v6.32 阅读理解 / 材料题组（answertype=15 / 19）----
+    // 一个 .questionLi 里装着 N 道子题，每道子题有**自己的** qid、题型与
+    // 隐藏答案域 input#answer<子qid>；选项是 div[onclick=addChoice…] +
+    // span[data=<真实值>]，显示字母（.num_option）与真实值**错位**。
+    // 旧版把整组当「不支持的题型」整份跳过（真机 2026-10-23 线代B：4 组
+    // 13 道子题全中，一道都答不上）。这里按子题展开成独立题目。
+    if (at && (String(at.value) === '15' || String(at.value) === '19')) {
+      const grpStem = _txt(li.querySelector('.mark_name'))
+        .replace(/\s+/g, ' ').trim().slice(0, 300);
+      const grpImgs = [...li.querySelectorAll('.mark_name img')]
+        .map(im => (im.getAttribute('src') || '').split('/').pop()
+                   .split('?')[0]).filter(Boolean);
+      const grpUpload = !!li.querySelector('input[type=file]');
+      const grpId = li.id || ('question' + (li.getAttribute('data') || ''));
+      const items = [...li.querySelectorAll('.reading_answer[data]')];
+      items.forEach((it) => {
+        const iq = it.getAttribute('data') || '';
+        if (!iq) return;
+        let qt = String(it.getAttribute('qtype') || '0').trim() || '0';
+        if (qt === '19') qt = '0';
+        const subStem = _txt(it.querySelector('.reader_answer_tit'))
+          .replace(/\s+/g, ' ').trim();
+        const subNo = (subStem.match(/^[（(]\s*(\d+)\s*[)）]/) || [])[1] || '';
+        const stem2 = (grpStem + ' ' + subStem)
+          .replace(/\s+/g, ' ').trim().slice(0, 500);
+        const opts2 = [], fills2 = [];
+        // ⚠ 必须是 [onclick*=Choice]：单选是 addChoice、多选是
+        // addMultipleChoice，后者的字符串里**不含** addChoice 子串。
+        it.querySelectorAll(
+          '[onclick*=Choice],[role=radio],[role=checkbox]').forEach(box => {
+          const sp = box.querySelector('span[data]');
+          if (!sp) return;
+          const numEl = box.querySelector('.num_option,.num_option_dx');
+          const dlTxt = ((numEl && numEl.textContent) || '')
+            .replace(/\s+/g, '').trim();
+          const lb = (box.textContent || '').replace(/\s+/g, ' ')
+            .trim().slice(0, 150);
+          opts2.push({name: 'answer' + iq, val: sp.getAttribute('data') || '',
+                      type: 'divradio', label: lb, dl: dlTxt,
+                      img: _imgSigOf(box)});
+        });
+        it.querySelectorAll('textarea, input[type=text]').forEach(x => {
+          fills2.push({name: x.name || x.id || '',
+                       tag: x.tagName.toLowerCase()});
+        });
+        opts2.forEach((o, i) => {
+          o.pos = i;
+          const m = String(o.label || '').trim()
+            .match(/^[（(]?\s*([A-Za-z])(?=[)）.．、:：\s]|$)/);
+          o.dl = String(o.dl || (m ? m[1]
+                                  : 'ABCDEFGHIJKLMNOP'.charAt(i))).toUpperCase();
+        });
+        if (!opts2.length && !fills2.length) return;
+        const imgs2 = [...it.querySelectorAll('img')]
+          .map(im => (im.getAttribute('src') || '').split('/').pop()
+                     .split('?')[0]).filter(Boolean);
+        const sig2 = grpImgs.concat(imgs2).slice(0, 12).join(',');
+        const iv = gidx++;
+        it.setAttribute('data-cx-idx', iv);
+        it.setAttribute('data-cx-grp', grpId);
+        out.push({no: iv + 1, stem: stem2, atype: qt, opts: opts2,
+                  fills: fills2, upload: grpUpload,
+                  hasMedia: !!li.querySelector(
+                    'img, svg, math, .MathJax, canvas'),
+                  scrambled: false, li_html: null, doc_counts: null,
+                  mediaSig: sig2, group: true, sub_no: subNo,
+                  groupStem: grpStem});
+      });
+      return;
+    }
     // 题干提取三级兜底。真机实测踩过：某课作业卡的题干不在 .Zy_TItle 里
     // （结构差异），取到空题干 → 附件规则无从匹配 → 模型只看到「1.【简答】」
     // 就瞎编了一段「进入课程作业中的实验报告，点击上传文件……提交即可」当
@@ -4673,7 +4823,10 @@ JS_PARSE_TIMUS = r"""
         'input[type=hidden][name^=answer]:not([name^=answertype])');
       const nm2 = hid2 ? hid2.name : '';
       if (nm2) {
-        li.querySelectorAll('[onclick*=addChoice],[role=radio],[role=checkbox]')
+        // ⚠ 必须是 [onclick*=Choice]：单选 addChoice、多选
+        // addMultipleChoice，后者不含 addChoice 子串，写窄了会把
+        // 整道多选题漏掉（真机 2026-10-23 线代B：13 道只认出 9 道）。
+        li.querySelectorAll('[onclick*=Choice],[role=radio],[role=checkbox]')
           .forEach(box => {
             const sp = box.querySelector('span[data]');
             if (!sp) return;
@@ -4768,8 +4921,9 @@ JS_PARSE_TIMUS = r"""
       scrambled = probe.some(e => RE_CX.test(fam(e)));
     } catch (e) { /* 取不到计算样式就当没加密，宁可多走一次文本通道 */ }
     // 供截图按题定位（Playwright 侧用 [data-cx-idx="N"] 抓这一题的图）
-    li.setAttribute('data-cx-idx', idx);
-    out.push({no: idx + 1, stem: stem.slice(0, 500),
+    const _iv = gidx++;
+    li.setAttribute('data-cx-idx', _iv);
+    out.push({no: _iv + 1, stem: stem.slice(0, 500),
               atype: at ? at.value : '',
               opts, fills, upload, hasMedia, scrambled, li_html, doc_counts: li_doc,
               mediaSig: mediaSig});
@@ -4788,20 +4942,50 @@ JS_FILL_ANSWERS = r"""
         .find(x => x.value === v && x.type !== 'hidden');
       if (el) { el.click(); ok++; return; }
       // div 选区变体：点 span[data] 所在的选块，再回读 hidden input 校验
-      // 真的写进去了——点了个寂寞也按 miss 计，让安全阀拦住不交低分卷
+      // 真的写进去了——点了个寂寞也按 miss 计，让安全阀拦住不交低分卷。
+      // v6.32：题组子题的隐藏域**只有 id、没有 name**，qid 也不是纯数字
+      // （2146809882a477578-cdba-4c39-9b3f-bcc3a0d352ac），所以按 id 兜底
+      // 找、qid 不再限数字；再按 qid 属性认选块，一个题组里好几道子题才不
+      // 会串到别的子题上。已选中的不能再点（平台是 toggle，会点掉）。
       const hid = document.querySelector(
-        'input[type=hidden][name="' + a.name + '"]');
-      const base = hid ? (hid.id || hid.name) : '';
-      const qid = /^answer\d+$/.test(base) ? base.replace(/^answer/, '') : null;
-      const sp = qid
-        ? document.querySelector('span.choice' + qid + '[data="' + v + '"]')
-        : null;
-      const box = sp && sp.closest(
-        '[onclick*=addChoice],[role=radio],[role=checkbox]');
+        'input[type=hidden][name="' + a.name + '"], input[type=hidden][id="'
+        + a.name + '"]');
+      const base = hid ? (hid.id || hid.name || '') : '';
+      const qid = base.indexOf('answer') === 0 ? base.slice(6) : '';
+      const valOf = b => {
+        const s = b.querySelector('span[data]');
+        return s ? (s.getAttribute('data') || '') : null;
+      };
+      const isOn = b => {
+        const s = b.querySelector('span[data]');
+        return !!(s && /check_answer/.test(s.className || ''));
+      };
+      let box = null;
+      if (qid) {
+        const all = [...document.querySelectorAll(
+          '[onclick*=Choice],[role=radio],[role=checkbox]')]
+          .filter(b => String(b.getAttribute('qid') || '') === qid);
+        // v6.32：平台的选择控件是 **toggle**，而且页面加载时会把上次暂存的
+        // 勾选还原出来。只补点「该选的」而不清「不该选的」，新答案就会和
+        // 旧答案**叠加**：上次 AC、这次要 BD → 平台收到 ABCD，判错 0 分
+        // （真机 2026-10-23 线代B 第 4 组第 (2) 题）。
+        // 这里先点掉同组里「勾着但不在本次答案里」的，再点该勾的。
+        const want = new Set((a.vals || []).map(x => String(x)));
+        all.forEach(b => {
+          if (isOn(b) && !want.has(String(valOf(b)))) b.click();
+        });
+        box = all.find(b => valOf(b) === v) || null;
+        if (!box) {
+          const sp = document.querySelector('span.choice'
+            + qid.replace(/[^\w-]/g, '') + '[data="' + v + '"]');
+          box = sp && sp.closest(
+            '[onclick*=Choice],[role=radio],[role=checkbox]');
+        }
+      }
       if (box) {
-        box.click();
-        const got = (hid.value || '').trim();
-        if (got === v || got.split(/[,;，；]/).includes(v)) { ok++; return; }
+        if (!isOn(box)) box.click();       // 已勾的再点会取消（toggle）
+        const got = ((hid && hid.value) || '').trim();
+        if (got === v || got.indexOf(v) >= 0) { ok++; return; }
       }
       miss++;
     });
@@ -4908,6 +5092,15 @@ JS_DO_SUBMIT = r"""
   // 两份作业 unverified、重开仍是待完成，根因即此）。
   // 完整性/字数检查由本工具的填答逻辑保证（缺题不提交）；提交次数
   // 超限或平台要求验证码时服务端会拒绝，响应监听如实上报，不假成功。
+  // v6.32：阅读理解题组的外层 #answer<组qid> 是 JSON，只在 saveWork /
+  // ready2Submit 里由 setReadComprehensionAnswer() 聚合。我们直接调
+  // confirmSubmitWork()（绕过 ready2Submit），不补这一下，交上去的题组
+  // **全是空**。没有题组的页面它就是空转，无副作用。
+  try {
+    if (typeof setReadComprehensionAnswer === 'function') {
+      setReadComprehensionAnswer();
+    }
+  } catch (e) {}
   if (typeof confirmSubmitWork === 'function') {
     try { confirmSubmitWork(); return 'ok'; }
     catch (e) { return 'err:' + String(e).slice(0, 80); }
@@ -4934,12 +5127,26 @@ JS_READ_CHECKED = r"""
   // ⚠ 一个可选项都没找到 = 这页面结构我们不认识，**返回 null 表示「读不了」**，
   //   绝不能返回 {}：空对象与「页面上一道都没勾」长得一模一样，调用方会据此
   //   把整份判成答案全丢。宁可漏报也不能谎报。
-  if (!boxes.length) return null;
   const out = {};
+  let n = 0;
   boxes.forEach(x => {
+    n++;
     if (!x.checked) return;
     (out[x.name] = out[x.name] || []).push(x.value || '');
   });
+  // v6.32：div 选区变体（阅读理解题组等）根本没有 radio，答案落在
+  // input[type=hidden]#answer<qid>。不回读这一路，「丢答案检测」在题组页
+  // 上永远是「读不了」，形同虚设。
+  document.querySelectorAll('input[type=hidden][id^=answer]').forEach(h => {
+    const id = h.id || '';
+    if (/^answertype/.test(id)) return;
+    n++;
+    const val = (h.value || '').trim();
+    if (!val) return;
+    out[id] = String(val).split('');
+  });
+  // ⚠ 一个可选项都没找到 = 这页面结构我们不认识，**返回 null 表示「读不了」**
+  if (!n) return null;
   return out;
 }
 """
@@ -5785,6 +5992,12 @@ def _opt_map(t):
             # 选项文字自带显示字母（真机：「A P1和P2两点」）。选项一换位
             # 这个前缀就跟着变，不剥掉的话同一个选项永远对不上、缓存全 miss。
             v = re.sub(r'^[（(]?[A-Za-z][)）.．、:：]?', '', v)
+            # v6.32：选项既没有图、文字剥掉字母后又空了（纯图片选项的
+            # label 往往只剩「A」）——留空会让一整题的指纹全是空串，
+            # 缓存把不同字母映射到同一个选项上。用 @<显示字母> 占位：
+            # 只要求「这个位置上还是同一个字母」，不会错指到别的选项。
+            if not v:
+                v = '@' + dl
         out[dl] = v
     return out
 
@@ -5897,6 +6110,108 @@ def _need_vision(t) -> bool:
     return bool(t.get('hasMedia')) or bool(t.get('scrambled'))
 
 
+# 题组子题的截图范围：从题组题干（.mark_name，材料图在这里）顶到子题底。
+# 真机 2026-10-23（线代B 阅读理解）实测：子题题干只是「将系数矩阵化为行最简
+# 形矩阵」这种一句话，矩阵本体在**题组题干**的图里——只截子题那一块，模型
+# 根本没有数据可算。
+# 用户原话「有些题太长，可能截图截一次截不全，可以把网页缩小再截图吧」：
+# 框出来太高就临时把整组 CSS zoom 缩到 1600px 以内再截，截完立刻还原
+# （坐标必须是缩放后的，所以还原放在截图之后，见 JS_GROUP_SHOT_UNZOOM）。
+JS_GROUP_SHOT_RECT = r"""
+([gid, idx]) => {
+  const li = document.getElementById(gid);
+  if (!li) return null;
+  const it = li.querySelector('[data-cx-idx="' + idx + '"]');
+  if (!it) return null;
+  const head = li.querySelector('.mark_name') || li;
+  const a0 = head.getBoundingClientRect(), b0 = it.getBoundingClientRect();
+  const h0 = Math.max(0, b0.bottom - a0.top);
+  const TARGET = 1600;
+  const z = h0 > TARGET ? Math.max(0.35, TARGET / h0) : 1;
+  window.__cxZoom = {el: li, prev: li.style.zoom || '', z: z};
+  if (z < 1) li.style.zoom = String(z);
+  void li.offsetHeight;
+  const a = head.getBoundingClientRect(), b = it.getBoundingClientRect();
+  const x = Math.min(a.left, b.left) + window.scrollX;
+  const y = Math.min(a.top, b.top) + window.scrollY;
+  const w = Math.max(a.right, b.right) - Math.min(a.left, b.left);
+  const h = Math.max(a.bottom, b.bottom) - Math.min(a.top, b.top);
+  // ⚠ 键名必须是 width/height：Playwright 的 clip 只认这四个键，
+  // 写 w/h 会被当成 undefined 直接抛（Page.screenshot: clip.width:
+  // expected float, got undefined）。真机 2026-10-23 踩过。
+  return {x: Math.round(x), y: Math.round(y),
+          width: Math.round(Math.max(w, 10)),
+          height: Math.round(Math.max(h, 10)),
+          zoom: z, raw: Math.round(h0)};
+}
+"""
+
+JS_GROUP_SHOT_UNZOOM = r"""
+() => {
+  const s = window.__cxZoom;
+  if (s && s.el) { try { s.el.style.zoom = s.prev; } catch (e) {} }
+  window.__cxZoom = null;
+  return true;
+}
+"""
+
+
+def _shot_page(hw):
+    """拿到能整页截图的对象。
+
+    直链答题页（mooc2/work/dowork）里 hw **就是** Page，没有 .page 属性；
+    章节作业链里 hw 是 iframe Frame，Page 在 .page 上。旧写法只认 .page，
+    直链模式下裁剪兜底/题组截图全部静默失效（真机 2026-10-23 踩过）。
+    """
+    pg = getattr(hw, 'page', None)
+    if pg is None and hasattr(hw, 'screenshot'):
+        pg = hw
+    return pg
+
+
+def _shot_group_timu(hw, gid, idx):
+    """题组子题截图：题组材料 + 这一小题一起框；太高先缩再截。失败 None。
+
+    真机 2026-10-23（线代B 阅读理解，整页 10877px）实测的三条：
+      ① 普通 clip（不带 full_page）在「框跨屏」时**只能截到视口那一截**，
+         甚至直接报 Clipped area is either empty or outside the resulting
+         image —— 用户原话「有些题太多，截一次截不全」就是它；
+      ② full_page=True + clip 是唯一能跨屏截全的写法（实测 55KB 完整图）；
+      ③ full_page 慢（整页 10000px 要重新排版），超时给到 30 秒，并且
+         **只截一次**：先量、再缩、再截，不做重复抓取。
+    """
+    pg = _shot_page(hw)
+    if pg is None:
+        return None
+    try:
+        r = hw.evaluate(JS_GROUP_SHOT_RECT, [gid, idx])
+    except Exception:
+        r = None
+    if not r:
+        return None
+    out = None
+    restore = _shot_visible(pg)      # 最小化窗口下 full_page 会被节流成超时
+    try:
+        out = pg.screenshot(
+            clip={'x': r['x'], 'y': r['y'],
+                  'width': r['width'], 'height': r['height']},
+            type='jpeg', quality=65, timeout=30000,
+            full_page=True, animations='disabled', caret='hide')
+    except Exception as e:
+        log('    第 %d 题（题组）截图失败：%s' % (idx + 1, str(e)[:70]), 'warn')
+    finally:
+        try:
+            hw.evaluate(JS_GROUP_SHOT_UNZOOM)
+        except Exception:
+            pass
+        if restore:
+            restore()
+    if out and r.get('zoom', 1) < 1:
+        log('    第 %d 题（题组）题面太高（%dpx），已缩小到 %.0f%% 再截图。'
+            % (idx + 1, int(r.get('raw') or 0), 100 * r['zoom']), 'info')
+    return out
+
+
 def _shot_timu(hw, idx):
     """把第 idx 道题（0 基）整块截成 JPEG 字节；失败返回 None。
 
@@ -5920,15 +6235,33 @@ def _shot_timu(hw, idx):
         el = None
     if not el:
         return None
+    # 题组子题：连同题组材料一起框（见 _shot_group_timu）；拿不到再退回
+    # 普通元素截图。
+    try:
+        gid = el.get_attribute('data-cx-grp')
+    except Exception:
+        gid = None
+    if gid:
+        png = _shot_group_timu(hw, gid, idx)
+        if png:
+            return png
     kw = dict(type='jpeg', quality=60, timeout=8000,
               animations='disabled', caret='hide')
-    for _ in (1, 2):
-        try:
-            return el.screenshot(**kw)
-        except Exception:
-            continue
+    # 窗口最小化时 Chromium 会节流渲染，连元素截图都会超时（真机 2026-10-23）。
+    # 截完立刻收回任务栏，用户屏幕上不会多出一个窗口。
+    _pg = _shot_page(hw)
+    _restore = _shot_visible(_pg) if _pg is not None else None
+    try:
+        for _ in (1, 2):
+            try:
+                return el.screenshot(**kw)
+            except Exception:
+                continue
+    finally:
+        if _restore:
+            _restore()
     # ---- 兜底：整页截图 + 裁剪框 ----
-    pg = getattr(hw, 'page', None)
+    pg = _shot_page(hw)
     if pg is not None:
         try:
             el.scroll_into_view_if_needed(timeout=3000)
@@ -5940,8 +6273,11 @@ def _shot_timu(hw, idx):
             bb = None
         if bb:
             try:
+                # 同 _shot_group_timu：不带 full_page 时跨屏的框只能截到视口
+                # 那一截；带 full_page 才能截全，代价是慢 → 超时给足。
                 return pg.screenshot(clip=bb, type='jpeg', quality=70,
-                                     timeout=10000, animations='disabled')
+                                     timeout=30000, full_page=True,
+                                     animations='disabled')
             except Exception as e:
                 log('    第 %d 题截图失败（%s）。' % (idx + 1, str(e)[:70]),
                     'warn')
@@ -6024,6 +6360,11 @@ def _ask_one_vision(cfg, t):
         hint = '选择题：只输出所选选项的大写字母，多选连写（如 AC）。'
     stem = (t.get('stem') or '').strip()
     parts = ['图片是作业里的一道%s题，请**直接看图**作答。%s' % (tn, hint)]
+    if t.get('group'):
+        sub = t.get('sub_no')
+        parts.append('这是**阅读理解题组**：图里有多道小题和一段材料，'
+                     + ('只回答标着「(%s)」的那一道小题，不要答别的小题。'
+                        % sub if sub else '只回答题干里点名的那一道小题。'))
     # 字体反爬的题：题干是「惪想惥惦」这类替换码位的乱码，喂给模型只会把它
     # 带偏（真机 2026-10-17：把乱码题干一起发过去，模型答非所问）。
     # 这种情况**一个字都不给**，只让它看图。
@@ -6214,14 +6555,27 @@ def llm_solve(cfg, timus, progress):
     # 主观题（填空/简答）仍然一题一发：它们的作答要求各不相同，而且历史
     # 上正是混在一起发导致答案错位。
     if vis:
-        batch = [t for t in vis if t['atype'] in ATYPES]
-        solo = [t for t in vis if t['atype'] not in ATYPES]
+        # v6.32：题组子题一题一发。它们的截图里必然带着同组别的小题，
+        # 合批时模型极易答到别的小题上（真机 2026-10-23 线代B，4 组 13 小题）。
+        batch = [t for t in vis
+                 if t['atype'] in ATYPES and not t.get('group')]
+        # ⚠ 题组子题也得进 solo：它们 atype 是 0/1（在 ATYPES 里），被
+        #   batch 的 not group 挡掉后如果不在这里补收，就是**两边都不收**
+        #   → 13 道题一张图都没发给模型，日志却写着「已给 13/13 道题截了图」。
+        #   真机 2026-10-23 线代B 实锤：「大模型返回：{}」整份没答上。
+        solo = [t for t in vis
+                if t['atype'] not in ATYPES or t.get('group')]
         if batch:
             progress('    %d 道图片题合并成一次视觉请求（省调用次数）。'
                      % len(batch))
             got.update(_solve_vision_batch(cfg, batch, progress))
         if solo:
-            progress('    %d 道主观题逐题看图。' % len(solo))
+            n_sub = sum(1 for t in solo if t.get('group'))
+            progress('    %d 道%s逐题看图。'
+                     % (len(solo),
+                        '主观题' if not n_sub
+                        else ('题组小题' if n_sub == len(solo)
+                              else '主观题/题组小题')))
             got.update(_solve_by_vision(cfg, solo, progress))
     # ---- 文本通道：其余题照旧整卷一次发 ----
     if txt:
