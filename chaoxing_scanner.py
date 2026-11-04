@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-学习通（超星）未完成事项巡检工具  v6.32
+学习通（超星）未完成事项巡检工具  v6.34
 ================================================================
 把「登录 → 逐门课翻作业/考试/任务点/课堂活动 → 汇总成清单」这套流程固化成本地程序。
 
@@ -431,7 +431,7 @@ ACTIVITY_TYPES = {
 # 的「进行中 / 已结束」分桶完全一致（Vue: activeList1=进行中 activeList2=已结束）。
 
 # 版本号：界面侧栏、启动日志、使用说明都引它，别再各处手写一份
-VERSION = 'v6.33'
+VERSION = 'v6.34'
 
 # 平台自身算「已完成」的状态；除此之外都视为未完成
 DONE_STATES = ('已完成', '已互评', '待批阅', '已提交', '待互评', '已结束', '已过期')
@@ -4356,7 +4356,14 @@ JS_VIDEO_CLAIM = r"""
       const cls = (ct.className || "").toString();
       const job = ct.querySelector(".ans-job-icon");
       const lbl = job ? (job.getAttribute("aria-label") || "") : "";
-      if (/已完成/.test(lbl) || /ans-job-finished/.test(cls)) return false;
+      // v6.34 真机实证：ans-job-finished class 会撒谎——同一个节点 8 张视频卡
+      // 里有 3 张「aria-label=任务点未完成」却挂着 ans-job-finished，旧版
+      // || 判断把它们全误判成已完成 → done=0 报「没有可刷的视频」。
+      // aria-label 才是真值：明确说了「未完成」就一定没完成；label 缺失才
+      // 退回 class 判断。
+      if (/未完成/.test(lbl)) { /* 继续走，这卡要刷 */ }
+      else if (/已完成/.test(lbl)) return false;
+      else if (/ans-job-finished/.test(cls)) return false;
     }
   } catch (e) { /* 跨源/取不到就当未完成，保持旧行为 */ }
   return true;
@@ -9511,7 +9518,10 @@ JS_LEFTOVER_TASKS = r"""
     if (!job) return;                                  // 非任务点卡，不算账
     const lbl = job.getAttribute('aria-label') || '';
     const cls = (ct.className || '').toString();
-    if (/已完成/.test(lbl) || /ans-job-finished/.test(cls)) return;  // 已完成
+    // v6.34：ans-job-finished class 会撒谎（实测 3 张「未完成」卡带该类）。
+    // aria-label 明说「未完成」的不算已完成；label 缺失才退回 class。
+    if (/未完成/.test(lbl)) { /* 未完成，照样记账 */ }
+    else if (/已完成/.test(lbl) || /ans-job-finished/.test(cls)) return;  // 已完成
     const ifr = ct.querySelector('iframe');
     const src = ifr ? (ifr.src || '') : '';
     // 视频是刷课自己的活（刷不动有 fail 计数兜底），不算「残余」——
@@ -9525,6 +9535,21 @@ JS_LEFTOVER_TASKS = r"""
     out[kind] = (out[kind] || 0) + 1;
   });
   return out;
+}
+"""
+
+
+# 把每张任务卡滚进视口：视频 iframe 是懒加载的，不滚进视口就永远不会挂出
+# modules/video 的 frame——一个任务挂好几个视频时，第一张之外的卡「查不到」，
+# 全被误报成「没有可刷的视频」（v6.34）。scrollIntoView 逐张过一遍即可。
+JS_FORCE_MOUNT = r"""
+() => {
+  const cts = document.querySelectorAll('.ans-attach-ct');
+  cts.forEach(ct => {
+    try { ct.scrollIntoView({block: 'center', behavior: 'instant'}); }
+    catch (e) { try { ct.scrollIntoView(); } catch (e2) {} }
+  });
+  return cts.length;
 }
 """
 
@@ -9563,6 +9588,7 @@ def brush_node(page, c, cpi, kid, cfg, progress, control):
                ' / '.join('%d.%s' % (t['num'], t['title'] or '?') for t in _tabs)))
     done = fail = 0
     leftover = {}
+    nov_frames = set()      # 本格内 novideo 过的 frame：不再反复捞起白等
     for _num in _nums:
         if _num != 0:
             try:
@@ -9576,6 +9602,13 @@ def brush_node(page, c, cpi, kid, cfg, progress, control):
         # 一个节点挂好几张卡（视频/文档/测验混排），视频卡是懒加载的：
         # 刷完一张再扫一遍 frame，扫不到新的才算这一格完事
         for _ in range(12):
+            # 每轮扫描前先把所有卡滚进视口：懒加载视频 iframe 不滚到就不挂出，
+            # 多视频节点第一张之外的全「查不到」（v6.34）
+            try:
+                page.evaluate(JS_FORCE_MOUNT)
+                page.wait_for_timeout(600)
+            except Exception:
+                pass
             vf = None
             for f in page.frames:
                 if 'modules/video' not in (f.url or ''):
@@ -9599,11 +9632,21 @@ def brush_node(page, c, cpi, kid, cfg, progress, control):
                         continue
             if vf is None:
                 break
+            if vf.url in nov_frames:
+                break
+            # 旧版在开刷前就盖 __cx_brushed 戳：一旦这帧 brush_video_frame
+            # 返回 novideo（懒加载慢、<video> 15 秒没就绪很常见），这帧被
+            # 永久跳过还不计数——多视频节点里第二个视频就这么被「跳过去、
+            # 查不到」（v6.34）。改成刷完再盖戳；novideo 不盖戳不计数，
+            # 下一轮扫描（含强制挂载）还能再捞起它。
+            r = brush_video_frame(vf, cfg, progress, control)
+            if r == 'novideo':
+                nov_frames.add(vf.url)   # 这帧真没有 <video>，别反复捞白等
+                continue
             try:
                 vf.evaluate("() => { window.__cx_brushed = true; }")
             except Exception:
                 pass
-            r = brush_video_frame(vf, cfg, progress, control)
             # 卡住/超时后原地重试（网络抖动、临时卡顿最常见）：同一个页面还在，
             # 清掉防重刷标记重跑一遍即可，不用重新导航（重新导航会把已完成的
             # 视频卡也重播一遍，浪费时间还重复心跳）
@@ -9626,6 +9669,16 @@ def brush_node(page, c, cpi, kid, cfg, progress, control):
             if r == 'done':
                 done += 1
                 log('    ✓ 这个视频刷完了')
+                # 多段视频共用一个 iframe：播完一段播放器会自动装下一段。
+                # 清掉戳等几秒，若这帧又出现未完成视频（平台没判完成），
+                # 不盖戳、让外层循环继续刷；判了完成才盖戳收工（v6.34）。
+                try:
+                    vf.evaluate("() => { window.__cx_brushed = false; }")
+                    time.sleep(3)
+                    if not vf.evaluate(JS_VIDEO_CLAIM):
+                        vf.evaluate("() => { window.__cx_brushed = true; }")
+                except Exception:
+                    pass
             elif r in ('stuck', 'timeout'):
                 fail += 1
             # 'novideo'：这卡是文档/音频之类，不算账
