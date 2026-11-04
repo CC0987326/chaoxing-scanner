@@ -340,6 +340,7 @@ import threading
 import time
 import urllib.request
 import zipfile
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
 
@@ -379,6 +380,21 @@ IDENTITY_FILE = RUNTIME / 'identity.json'
 # 大模型答案的本地缓存（按题干哈希复用，省重复问模型的钱）。
 # 放 runtime/ 里——打包流程本来就排除 runtime，天然不会带进分发包。
 ANSWER_CACHE_FILE = RUNTIME / 'answer_cache.json'
+# 学习通 font-cxsecret 字体反爬的还原表（v6.33）：md5(字形路径) 后 8 位 hex
+# → 真实汉字。表内容抄自大学搜题酱插件内置的对照字典（20881 条，几乎全
+# 覆盖 CJK 常用字）。**这是随包分发的静态数据，不是运行期产物**，所以放
+# data/（进分发包）而不是 runtime/（打包时整个被排除）；再落一份到
+# runtime/ 当首选路径——解压后首次运行时从 data/ 拷过去，之后就算用户把
+# data/ 目录删了也照常用。丢了不影响主流程：查不到的字形仍按 scrambled
+# 走视觉通道。
+DATA_DIR = HERE / 'data'
+CX_FONT_TABLE_FILE = RUNTIME / 'cx_font_table.json'
+CX_FONT_TABLE_FALLBACK = DATA_DIR / 'cx_font_table.json'
+# Typr + md5 的页面内解析库（同样取自搜题酱插件的 lib/TyprMd5.js），
+# 注入答题页后由 JS 探针调用，把 font-cxsecret 的 base64 字体还原成文本。
+# 与还原表同一套存放策略：data/ 随包走，runtime/ 是运行期首选。
+CX_TYPR_FILE = RUNTIME / 'cx_TyprMd5.js'
+CX_TYPR_FALLBACK = DATA_DIR / 'cx_TyprMd5.js'
 CHROME_DIR = RUNTIME / 'chrome'
 SHOT_DIR = RUNTIME / 'screenshots'
 LOG_FILE = RUNTIME / 'run.log'
@@ -415,7 +431,7 @@ ACTIVITY_TYPES = {
 # 的「进行中 / 已结束」分桶完全一致（Vue: activeList1=进行中 activeList2=已结束）。
 
 # 版本号：界面侧栏、启动日志、使用说明都引它，别再各处手写一份
-VERSION = 'v6.32'
+VERSION = 'v6.33'
 
 # 平台自身算「已完成」的状态；除此之外都视为未完成
 DONE_STATES = ('已完成', '已互评', '待批阅', '已提交', '待互评', '已结束', '已过期')
@@ -453,6 +469,10 @@ DEFAULT_CONFIG = {
     'llm_vision_url': '',
     'llm_vision_key': '',
     'llm_vision_model': '',
+    # v6.33：逐题 LLM 调用（视觉逐题/批量补问）的并发路数，1~6，默认 3。
+    # 纯 HTTP 等待，多一路省一段排队时间；再高容易触发服务端限流（429），
+    # 行为也更像机器。只影响模型调用，截图 / 填表永远是单线程。
+    'llm_concurrency': 3,
     # 点选验证码默认留给用户手点：弹验证码本身就说明已被风控关注，
     # OCR 识别率有限，点错重试反而加重标记。确要自动识别才改 true。
     'auto_captcha': False,
@@ -588,10 +608,13 @@ def _norm_cfg(cfg):
 
 
 def load_config() -> dict:
+    global _CFG_LAST
     cfg = dict(DEFAULT_CONFIG)
     if not CONFIG_FILE.exists():
         save_config(cfg)
-        return _norm_cfg(cfg)
+        cfg = _norm_cfg(cfg)
+        _CFG_LAST = cfg
+        return cfg
     # 读文件先容忍「瞬时不可读」：Windows 上 os.replace 进行中时，
     # 并发读方会拿到 PermissionError（Python 开文件不带 FILE_SHARE_DELETE）。
     # 这种情况重试就行；当成解析失败会把好端端的 config 归档成 .bad。
@@ -625,7 +648,15 @@ def load_config() -> dict:
                 '用默认值继续。' % (e, bak.name), 'warn')
         except Exception:
             log('配置文件解析失败，用默认值：%s' % e, 'warn')
-    return _norm_cfg(cfg)
+    cfg = _norm_cfg(cfg)
+    _CFG_LAST = cfg
+    return cfg
+
+
+# 最近一次 load_config 的结果。统计落盘（_llm_stats_record）想知道「当时用的
+# 是哪个模型」，但 _cache_graded 一路没传 cfg——重穿整条调用链就为记个统计
+# 不值当，这里留个模块级引用就够了（任务开始时必先 load_config）。
+_CFG_LAST = {}
 
 
 def save_config(cfg: dict):
@@ -4920,6 +4951,11 @@ JS_PARSE_TIMUS = r"""
         [...li.querySelectorAll('li')].slice(0, 4));
       scrambled = probe.some(e => RE_CX.test(fam(e)));
     } catch (e) { /* 取不到计算样式就当没加密，宁可多走一次文本通道 */ }
+    // v6.33：若页面注入器（_inject_cx_font_tools + JS_CX_UNSCRAMBLE）已把
+    // 加密文本还原、摘掉了 .font-cxsecret，这里检测到的 scrambled 就是
+    // false，题干/选项直接以真文本进入正常流水线（文本通道 + 缓存）。
+    // 没注上库或字典缺字形时 scrambled 仍为 true，走老的视觉通道——两条路
+    // 互为兜底，还原失败绝不比改前更差。
     // 供截图按题定位（Playwright 侧用 [data-cx-idx="N"] 抓这一题的图）
     const _iv = gidx++;
     li.setAttribute('data-cx-idx', _iv);
@@ -4929,6 +4965,58 @@ JS_PARSE_TIMUS = r"""
               mediaSig: mediaSig});
   });
   return out;
+}
+"""
+
+# v6.33 font-cxsecret 离线还原。设计要点：
+#   · __cxUnscrambleFix() 是**全局一次**的：整页只有一份加密字体样式，解析
+#     一次建好 window.__cxFixMap（乱码码位 → 真字），然后把全页
+#     .font-cxsecret 元素的文本就地改回真字、摘掉类名。
+#   · 必须在 JS_PARSE_TIMUS **之前**跑：题干、选项、附件规则全部从 DOM 提取，
+#     DOM 改好了，探针一行都不用动，提取出来天然是干净文本。
+#   · 覆盖率不足（页面里有字形但表里没有）时不动 DOM——返回 false，题目保持
+#     scrambled 走视觉通道，绝不出现「解了一半的文本」喂给模型。
+#   · 表的键是 md5(字形路径) 的后 8 位 hex 字符串，值是真实汉字。
+#     Typr.parse 失败直接返回 false。
+JS_CX_UNSCRAMBLE = r"""
+(tbl) => {
+  try {
+    if (window.__cxFixMap && window.__cxFixMap.size) return true;   // 已建好
+    if (!window.__cxTyprReady || typeof Typr === 'undefined'
+        || typeof md5 !== 'function') return false;
+    const styleEl = [...document.head.querySelectorAll('style')]
+      .find(s => (s.textContent || '').includes('font-cxsecret'));
+    if (!styleEl) return false;
+    const m = (styleEl.textContent || '').match(/base64,([\w\W]+?)'/);
+    if (!m) return false;
+    const bin = window.atob(m[1]);
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    const font = Typr.parse(bytes)[0];
+    if (!font) return false;
+    const fixMap = new Map();
+    let miss = 0, total = 0;
+    for (let cp = 0x4E00; cp <= 0x9FA5; cp++) {
+      const glyph = Typr.U.codeToGlyph(font, cp);
+      if (!glyph) continue;
+      total++;
+      const path = Typr.U.glyphToPath(font, glyph);
+      const key = md5(JSON.stringify(path)).slice(24);
+      const real = tbl[key];
+      if (real && real.length === 1) fixMap.set(cp, real);
+      else miss++;
+    }
+    if (!fixMap.size || miss > fixMap.size) return false;   // 覆盖率太低：不动
+    window.__cxFixMap = fixMap;
+    document.querySelectorAll('.font-cxsecret').forEach(el => {
+      el.innerHTML = el.innerHTML.replace(/[一-龥]/g, ch => {
+        const v = fixMap.get(ch.codePointAt(0));
+        return v || ch;
+      });
+      el.classList.remove('font-cxsecret');
+    });
+    return true;
+  } catch (e) { return false; }
 }
 """
 
@@ -5634,6 +5722,21 @@ def _llm_net_err_text(e: Exception) -> str:
 LLM_MAX_BYTES = 2 * 1024 * 1024     # 响应体上限，防对方回超大内容把内存吃满
 
 
+def _llm_workers(cfg):
+    """LLM 并发路数。config 的 llm_concurrency 可调（1~6），默认 3。
+
+    之所以默认 3 而不是更大：LLM 服务端按请求计费限流，路数太多容易触发
+    429，而且一次作业里并发的模型调用越多，行为越像机器。想省时间调到 4~5
+    也行，别再高了。
+    """
+    try:
+        raw = cfg.get('llm_concurrency')
+        n = 3 if raw is None else int(raw)
+    except (TypeError, ValueError):
+        n = 3
+    return max(1, min(n, 6))
+
+
 def llm_chat(cfg, prompt, timeout=120, key=None, images=None, purpose=None):
     """OpenAI 兼容 /chat/completions。返回回复文本；失败抛 RuntimeError。
 
@@ -6287,18 +6390,119 @@ def _shot_timu(hw, idx):
     return None
 
 
+def _cx_font_table():
+    """读 font-cxsecret 还原表（md5 十进制 → 汉字）。丢了/坏了返回 None，
+    探针侧自动退回「不解密、照旧走视觉通道」——绝不因为字典缺失挡答题。
+
+    首选 runtime/；没有就从随包的 data/ 拷一份过去（首跑搬家，之后
+    runtime/ 里永远有）。两个地方都没有才算真丢。
+    """
+    for f in (CX_FONT_TABLE_FILE, CX_FONT_TABLE_FALLBACK):
+        try:
+            d = json.loads(f.read_text(encoding='utf-8'))
+            if isinstance(d, dict) and d:
+                if f == CX_FONT_TABLE_FALLBACK:
+                    try:
+                        RUNTIME.mkdir(exist_ok=True)
+                        shutil.copyfile(f, CX_FONT_TABLE_FILE)
+                    except OSError:
+                        pass        # 拷不动就直接用 fallback 里的那份
+                return d
+        except Exception:
+            continue
+    return None
+
+
+def _cx_typr_js():
+    """Typr+md5 库的页面注入源码。丢了返回 None（同上，降级不挡路）。
+    与还原表同一套 runtime/ 优先、data/ 兜底搬家逻辑。"""
+    for f in (CX_TYPR_FILE, CX_TYPR_FALLBACK):
+        try:
+            src = f.read_text(encoding='utf-8')
+            if f == CX_TYPR_FALLBACK:
+                try:
+                    RUNTIME.mkdir(exist_ok=True)
+                    shutil.copyfile(f, CX_TYPR_FILE)
+                except OSError:
+                    pass
+            return src
+        except Exception:
+            continue
+    return None
+
+
+def _inject_cx_font_tools(hw):
+    """把 Typr/md5 库注进答题页（幂等：window.__cxTyprReady 已设就跳过）。
+
+    返回注入用的表对象（md5→汉字）或 None。hw 可能是 Frame（章节链）
+    或 Page（直链），add_script_tag 两者都有。
+    """
+    tbl = _cx_font_table()
+    if not tbl:
+        return None
+    try:
+        already = hw.evaluate("() => !!window.__cxTyprReady")
+    except Exception:
+        return None                     # frame 已分离等，直接放弃还原
+    if not already:
+        js = _cx_typr_js()
+        if not js:
+            return None
+        try:
+            hw.evaluate(js)             # 库文件是普通脚本，evaluate 即可定义全局
+            hw.evaluate("() => { window.__cxTyprReady = true; }")
+        except Exception:
+            return None
+    return tbl
+
+
+def _cache_prefilter(timus, progress):
+    """答题流水线第一道工序：先查本地缓存，命中缓存的题标记 t['hit_cache']。
+
+    v6.33。以前截图（_attach_shots）排在查缓存之前——带图/反爬题不管在不在
+    缓存里都要先截一张图（full_page 截图很慢），查缓存却在 llm_solve 里
+    才发生。重刷场景下同一份作业几乎全在缓存里，等于每次都白截十几张图。
+    现在顺序倒过来：解析出题干 → 立刻查缓存 → 命中的题连截图都省了，
+    _attach_shots 跳过它们。
+
+    ⚠ 只做「命中标记」，不直接产答案——答案的拼装、选项指纹校验
+    （_cache_get 的字母映射校验）仍在 llm_solve 里走同一套代码，
+    这里只负责「这道题不用截图」。校验失败（选项重排等）时 llm_solve
+    会把它当普通题重问，行为不变。
+    """
+    try:
+        cache = _answer_cache_load()
+    except Exception:
+        return
+    hit = 0
+    for t in timus:
+        if not _need_vision(t):
+            continue
+        if t.get('scrambled') and not _q_fp(t):
+            continue                 # 反爬且没指纹：缓存键不可靠，照旧截图
+        if not _cache_key(t):
+            continue
+        if _cache_get(cache, t):
+            t['hit_cache'] = True
+            hit += 1
+    if hit:
+        progress('    %d 道题本地缓存已命中，跳过截图（答题时直接用缓存）。' % hit)
+
+
 def _attach_shots(hw, timus, cfg):
     """给需要看图的题挂上截图（t['shot']）。视觉模型没配就原样返回。
 
     「配了一半」（填了地址却没填 Key 之类）会明确提示一句——否则用户会以为
     填了地址就能看图，白等一场还不知道为什么没生效。
+    v6.33：缓存命中的题（_cache_prefilter 打的 hit_cache 标记）不截——
+    答案已在本地，图截了也没人看。
     """
     if not llm_vision_ready(cfg):
         if llm_vision_configured(cfg):
             log('    视觉模型没配全（地址 / 模型名 / Key 要都填上），'
                 '这次仍按纯文本答题。', 'warn')
         return timus
-    want = [t for t in timus if _need_vision(t)]
+    want = [t for t in timus if _need_vision(t) and not t.get('hit_cache')]
     if not want:
         return timus
     got = 0
@@ -6404,20 +6608,41 @@ def _solve_by_vision(cfg, timus, progress):
 
     逐题发而不是整卷一次发：一题一张图时模型不会把题号串起来，答完也好对应；
     这类题（公式 / 图表）通常就那么一两道，多几次调用换准确率是划算的。
+
+    v6.33：LLM 调用是纯 HTTP 等待，串行发就是排队干等。现在 2~3 路并发
+    （llm_concurrency 可在 config 调，默认 3）——题目之间的模型调用互不依赖，
+    唯一共享物是 progress 日志（log() 本身线程安全，print/文件追加；
+    webui 的 STATE 更新带锁）。并发只加在这里和批量补问里；截图与填表
+    仍是单线程（同一页面 DOM 操作不能并发）。
     """
     out = {}
-    for t in timus:
+    lock = threading.Lock()
+
+    def _one(t):
         try:
             a = _clean_vision_answer(_ask_one_vision(cfg, t), t.get('atype'))
         except RuntimeError as e:
             progress('    第 %d 题视觉模型调用失败：%s'
                      % (t['no'], str(e)[:110]), 'warn')
-            continue
+            return
         if a:
-            out[t['no']] = a
+            with lock:
+                out[t['no']] = a
             progress('    第 %d 题（看图作答）→ %s' % (t['no'], a[:60]))
         else:
             progress('    第 %d 题看图后仍没把握，按未答处理。' % t['no'])
+
+    nw = max(min(_llm_workers(cfg), len(timus)), 1)
+    if nw <= 1 or len(timus) <= 1:
+        for t in timus:
+            _one(t)
+        return out
+    progress('    %d 道题 %d 路并发看图。' % (len(timus), nw))
+    pool = ThreadPoolExecutor(max_workers=nw)
+    try:
+        list(pool.map(_one, timus))
+    finally:
+        pool.shutdown(wait=False)
     return out
 
 
@@ -6478,6 +6703,38 @@ def _solve_vision_batch(cfg, timus, progress):
     if not out:
         progress('    批量看图的回答解析不出来，改回逐题。', 'warn')
         return _solve_by_vision(cfg, timus, progress)
+    # ---- v6.33 二轮校验：合批的答案没有第二意见就直接交，识图串题/看错图
+    # 一错就是一批。隔两秒把同一批图再问一次，**只对比客观题**：两次一致的
+    # 题放心用；不一致的（以及任一次没答上的）降级逐题重问——那才是真正
+    # 拿不准的少数题，单独看图比合批准。
+    # 代价：多一次合批请求。省下来的逐题调用远比这一次多（15 题卷合批是
+    # 3 次请求 vs 15 次），准确率换这点成本是划算的。
+    _disagree = [t for t in timus
+                 if t['atype'] in ATYPES and t['no'] in out]
+    if len(_disagree) >= 2:
+        try:
+            time.sleep(2.0)
+            resp2 = llm_chat(cfg, '\n'.join(parts), timeout=240, images=imgs)
+            got2 = _parse_llm_answers(resp2, max(t['no'] for t in timus),
+                                      types={t['no']: t['atype']
+                                             for t in timus})
+            shake = []
+            for t in _disagree:
+                c2 = _clean_vision_answer(got2.get(t['no']) or '',
+                                          t.get('atype'))
+                if not c2 or c2 != out[t['no']]:
+                    shake.append(t['no'])
+            if shake:
+                progress('    二轮校验发现 %d 题两次回答不一致（第 %s 题），'
+                         '逐题重问。'
+                         % (len(shake), '、'.join(map(str, shake[:8]))))
+                for t in timus:
+                    if t['no'] in shake:
+                        out.pop(t['no'], None)
+        except RuntimeError as e:
+            # 二轮调用失败不算事故：一轮答案照用，日志里说一声即可
+            progress('    二轮校验调用失败（%s），按一轮答案继续。'
+                     % str(e)[:80], 'warn')
     miss = [t['no'] for t in timus if t['no'] not in out]
     if miss:
         # 合批没答上的少量题单独补问一次：总代价仍远低于每题都发
@@ -6830,6 +7087,46 @@ def _strip_blank_prefix(s):
     return s
 
 
+def _llm_stats_path():
+    return RUNTIME / 'llm_accuracy.jsonl'
+
+
+def _llm_stats_record(cfg, entries):
+    """把一次批阅页回收到的「模型答案 vs 平台正确答案」写成统计行（v6.33）。
+
+    entries: [{stem, mine, right, atype}]。只做追加（jsonl，一行一次批阅），
+    不读不改——统计是给用户/后续调优看的，绝不能反过来拖慢答题主流程，
+    任何异常都静默吞掉。
+
+    用途：跑一阵后按行聚合就能看到 文本通道 vs 视觉合批 vs 视觉逐题、
+    各模型 的真实正确率（批阅页的「我的答案」就是模型给的），作为调
+    llm_concurrency / 换模型 / 决定哪类题走视觉 的数据地基。
+    """
+    try:
+        if not entries:
+            return
+        row = {'ts': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+               'model': (cfg.get('llm_model') or '').strip(),
+               'vision_model': (cfg.get('llm_vision_model') or '').strip(),
+               'n': 0, 'right': 0, 'items': []}
+        for e in entries:
+            mine = (e.get('mine') or '').strip()
+            right = (e.get('right') or '').strip()
+            if not mine or not right:
+                continue
+            ok = mine.replace(' ', '').upper() == right.replace(' ', '').upper()
+            row['n'] += 1
+            row['right'] += 1 if ok else 0
+            row['items'].append({'atype': e.get('atype') or '',
+                                 'ok': ok})
+        if not row['n']:
+            return
+        with open(_llm_stats_path(), 'a', encoding='utf-8') as f:
+            f.write(json.dumps(row, ensure_ascii=False) + '\n')
+    except Exception:
+        pass
+
+
 def _cache_graded(stem_map, graded, progress, opt_map=None):
     """把已批阅页的正确答案写回本地答案缓存（按题干归一后的哈希）。
 
@@ -6845,6 +7142,8 @@ def _cache_graded(stem_map, graded, progress, opt_map=None):
         return 0
     cache = _answer_cache_load()
     n = 0
+    # v6.33：顺手攒「模型答案 vs 平台标准答案」统计（mine 批阅页自己带了）
+    stats = []
     for g in graded:
         stem = stem_map.get(g['no'])
         right = _strip_blank_prefix(g.get('right') or '')
@@ -6858,6 +7157,10 @@ def _cache_graded(stem_map, graded, progress, opt_map=None):
         if cache.get(k) != val:
             cache[k] = val
             n += 1
+        stats.append({'stem': stem, 'mine': g.get('mine') or '',
+                      'right': right})
+    if stats:
+        _llm_stats_record(_CFG_LAST, stats)
     if n:
         _answer_cache_save(cache)
         progress('    已把平台给的 %d 条正确答案回灌本地缓存（下次同题直接命中）。'
@@ -8014,12 +8317,27 @@ def answer_one(page, c, cpi, kid, cfg, submit, progress, pre=None, detail=None,
     # 开卷先「读题」停留：开卷几秒内做完交卷是老师端和风控端都看得见的
     # 时序特征，停留时长随机、与题数无关地拉开
     time.sleep(random.uniform(4.0, 9.0))
+    # v6.33：字体反爬离线还原——在解析题目前把 Typr/md5 库注进页面、跑一次
+    # 全局还原，把 font-cxsecret 加密文本就地改回真字。成功的卷子整份进
+    # 文本通道（又快又省视觉模型的钱）；失败自动退回视觉通道，不多花一分。
+    _tbl = _inject_cx_font_tools(hw)
+    if _tbl:
+        try:
+            fixed = hw.evaluate(JS_CX_UNSCRAMBLE, _tbl)
+            if fixed:
+                log('    平台字体反爬已离线还原（乱码题干/选项改回真文本，'
+                    '走文本通道）。')
+        except Exception:
+            pass                        # 还原失败静默走老路
     timus = _poll(hw, JS_PARSE_TIMUS, lambda v: bool(v), 12000, 400) or []
     if not timus:
         log('    作业卡打开但没解析到题目（可能结构变了），跳过。', 'warn')
         return 'failed'
     # 视觉识别（可选）：主观题与带图/公式的题先截好图。没配视觉模型就什么都不做，
     # 后续全走纯文本——行为与之前完全一致。
+    # v6.33：先查缓存再截图——命中的题连图都不用截（重刷场景省掉整轮
+    # full_page 截图等待）。
+    _cache_prefilter(timus, progress)
     _attach_shots(hw, timus, cfg)
     # 题目分三类：客观题（选字母/对错）、文本主观题（LLM 写）、附件题（替不了）
     attach = [t for t in timus if t.get('upload') and t['atype'] in STYPES]
@@ -8381,8 +8699,26 @@ def answer_one(page, c, cpi, kid, cfg, submit, progress, pre=None, detail=None,
             # 数分钟后已批阅），轮询着等。窗口可在 config 调（submit_verify_window）。
             vwin = max(int(cfg.get('submit_verify_window') or 30), 10)
             deadline = time.time() + vwin
+            popup_logged = False
             while time.time() < deadline:
                 time.sleep(2)
+                # v6.33：把平台提交确认弹窗（#workpop）的文本捞进日志。
+                # 「作业含未作答题目」「还有题目未完成」这类拒绝原因以前是
+                # 黑盒——用户只看到 unverified，不知道平台为什么不收。
+                # 捞到了，retake/补答策略与人工排查都有依据。只记一次，
+                # 弹窗通常是静态文案，反复读没有新信息。
+                if not popup_logged:
+                    try:
+                        pop = hw.evaluate(r"""() => {
+                          const p = document.getElementById('workpop');
+                          if (!p || p.style.display === 'none') return '';
+                          return (p.innerText || '').replace(/\s+/g, ' ').trim().slice(0, 160);
+                        }""")
+                        if pop:
+                            popup_logged = True
+                            log('    平台提交弹窗：%s' % pop)
+                    except Exception:
+                        pass
                 if req_seen and _submit_ok(resp_seen):
                     break
     finally:
@@ -9774,6 +10110,15 @@ def _answer_one_activity(page, t, cfg, submit, progress, fid):
         return 'norender', {'url': url}
     # 开卷先「读题」停留，跟作业一个道理：开卷即交在时序上太扎眼
     time.sleep(random.uniform(3.0, 8.0))
+    # v6.33：与 answer_one 同口径——解析前先试字体反爬离线还原（活动答题页
+    # 也可能被平台加密；还原不了静默走老路）。
+    _tbl = _inject_cx_font_tools(page)
+    if _tbl:
+        try:
+            if page.evaluate(JS_CX_UNSCRAMBLE, _tbl):
+                log('    平台字体反爬已离线还原（走文本通道）。')
+        except Exception:
+            pass
     timus = page.evaluate(JS_PARSE_QUIZ) or []
     if not timus:
         # 解析时页面可能已经跳到结果页了 —— 再判一次，别当「结构变了」报错
