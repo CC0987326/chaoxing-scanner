@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-学习通（超星）未完成事项巡检工具  v6.34
+学习通（超星）未完成事项巡检工具  v6.35
 ================================================================
 把「登录 → 逐门课翻作业/考试/任务点/课堂活动 → 汇总成清单」这套流程固化成本地程序。
 
@@ -119,6 +119,26 @@ v6.24 要点（成绩与重刷 + 视觉通道的一处真错）：
    重刷**真的会消耗平台的剩余重做次数**，所以只在用户点按钮、且节点确实低于
    阈值时才做。平台重做时会**连题目顺序一起重排**（真机实测：批阅页第 10 题
    在重做后变成第 6 题，选项图 4/4 相同），所以不能照抄上次的答案，必须重答。
+
+v6.35 要点（v6.34 引入的**同一个视频反复从头重播**，两小时白烧）：
+真机日志 2026-11-05 10:45（数据库原理）：节点「32.6 MySQL 高级 - 存储过程」
+从 11:13 到 12:27，**同一个 10:08 的视频从 0 播到片尾、报「刷完了」，整整 8 遍**，
+进度一动不动；前一个节点更准，正好撞满外层 `for _ in range(12)` 的 12 次。
+① 根因：v6.34 为修「多段视频只刷第一段」，刷完一段后**清掉本地戳、等 3 秒、
+再问平台这张卡判完没有**。可平台的任务点标记是**心跳异步**翻的
+（reportTimeInterval 60 秒级），3 秒内必然还是「未完成」→ 清掉的戳被当成
+「没刷」→ 外层循环捞起同一帧、从 0 再播一遍，直到撞上循环上限。
+② 修法：判据从「问平台」改成**按视频身份记账**（新增 JS_VIDEO_ID：卡的
+objectid + 当前装载的文件地址；**不带 duration**——它在开播前是 NaN、开播后
+才变数字，带上就会把同一段判成换了段，等于把 bug 放回来）。播过一段就记进
+`played`，身份没变就不重播；只有播放器自己把下一段挂上来才继续刷。
+身份读不到时**保守当作同一段收工**——宁可少刷一段，也不原地打转。
+③ 顺带修掉两处 v6.34 的同类隐患：`nov_frames` 原来用 `frame.url` 当 key，
+而所有视频卡共用同一个 `/ananas/modules/video/index.html?v=…`——一张文档卡的
+novideo 会把**整个节点后面的视频卡**一起判死；现改按 frame 真实身份（`_guid`）
+记，并且要**连续两次**确认为空才拉黑（懒加载慢一拍很常见）。
+④ 已验证：回归 62/62 全绿、清洁度 ✓；`test_v619_brush` 55/55（新增 6 项，
+含「iframe 被平台重挂载、本地戳丢失」这个 v6.34 事故温床）；证伪 6/6 全红。
 
 v6.32 要点（阅读理解题组一道都答不上）：
   真机作业：线性代数B「求解线性方程组」，4 道题全是 answertype=15 的
@@ -431,7 +451,7 @@ ACTIVITY_TYPES = {
 # 的「进行中 / 已结束」分桶完全一致（Vue: activeList1=进行中 activeList2=已结束）。
 
 # 版本号：界面侧栏、启动日志、使用说明都引它，别再各处手写一份
-VERSION = 'v6.34'
+VERSION = 'v6.35'
 
 # 平台自身算「已完成」的状态；除此之外都视为未完成
 DONE_STATES = ('已完成', '已互评', '待批阅', '已提交', '待互评', '已结束', '已过期')
@@ -4369,6 +4389,88 @@ JS_VIDEO_CLAIM = r"""
   return true;
 }
 """
+
+
+# 这一帧里**当前装着的**是哪一个视频。多段视频共用同一个 iframe：播放器把
+# 上一段播完后会在内部把 <video> 换到下一段（currentSrc / duration 都变），
+# 但 iframe 元素本身的 data 属性不会变，平台的任务点标记也要等心跳上报
+# （reportTimeInterval 60 秒级）才会翻转。
+# 所以「播完一段了，接下来该不该继续刷」只能按**视频身份**判断，不能看平台标记
+# ——v6.34 拿平台标记当复查依据，3 秒内必然是「未完成」，于是同一段被当成
+# 「没刷」反复捞起、从头再播（真机 2026-11-05 10:45：一个 10:08 的视频连播
+# 8 遍，两小时零进度；节点 1 更准，正好撞满外层 12 次上限）。
+# ⚠ 身份只取「卡的 objectid」和「当前装载的文件地址」，**不能带 duration**：
+# duration 在开播前是 NaN、开播后才变数字，带上它就会把「同一个视频」判成
+# 「换段了」，等于又把 bug 放回来。
+JS_VIDEO_ID = r"""
+() => {
+  const v = document.querySelector('video');
+  if (!v) return {obj: '', src: ''};
+  let obj = '';
+  try {
+    const fe = window.frameElement;
+    if (fe) {
+      const d = fe.getAttribute('data') || '';
+      try {
+        const j = JSON.parse(d);
+        obj = String(j.objectid || j.mid || '');
+      } catch (e) {
+        obj = 'raw:' + d.slice(0, 160);
+      }
+    }
+  } catch (e) { /* 跨源取不到就算了，src 还能当身份 */ }
+  const src = String(v.currentSrc || v.getAttribute('src') || '');
+  return {obj: obj, src: src};
+}
+"""
+
+
+def _video_id(vf):
+    """读这一帧当前视频的身份 (obj, src)；读不到返回 ('', '')。
+
+    两段都是空字符串时调用方必须退回保守行为（当作「就是刚播的那段」）。
+    """
+    try:
+        v = vf.evaluate(JS_VIDEO_ID)
+    except Exception:
+        return ('', '')
+    if not isinstance(v, dict):
+        return ('', '')
+    return (str(v.get('obj') or ''), str(v.get('src') or ''))
+
+
+# 播完一段后，等播放器把下一段挂上来的最长时间（秒）。等不到就认定这一帧
+# 没有下一段，盖戳收工。抽成模块常量是为了测试能把它调小。
+VIDEO_SWITCH_WAIT = 8.0
+
+
+def _same_video(a, b) -> bool:
+    """两段视频是不是同一段。
+
+    规则：objectid 不同 → 不是；文件地址两边都有且不同 → 不是；
+    任何一边缺信息（懒加载还没挂出 src / 跨源读不到）→ 当作是同一段。
+    「当作同一段」是有意的保守选择：宁可少刷一段，也不要同一段反复重播。
+    """
+    ao, asrc = a
+    bo, bsrc = b
+    if ao and bo and ao != bo:
+        return False
+    if asrc and bsrc and asrc != bsrc:
+        return False
+    if not ao and not bo and not asrc and not bsrc:
+        return True          # 两边都认不出：当作同一段，交给上层按 done 收工
+    return True
+
+
+def _frame_key(f):
+    """给 frame 一个在本轮内稳定的身份，用来记「这帧已经确认没视频」。
+
+    ⚠ 不能用 f.url：所有视频卡用的都是同一个
+    `/ananas/modules/video/index.html?v=…`，拿 url 当 key 会让**一张**文档卡
+    的 novideo 把整个节点后面的视频卡一起判死（v6.34 遗留）。
+    """
+    g = getattr(getattr(f, '_impl_obj', None), '_guid', None)
+    return g if g else ('id:%d' % id(f))
 
 
 def fmt_t(sec):
@@ -9588,7 +9690,12 @@ def brush_node(page, c, cpi, kid, cfg, progress, control):
                ' / '.join('%d.%s' % (t['num'], t['title'] or '?') for t in _tabs)))
     done = fail = 0
     leftover = {}
-    nov_frames = set()      # 本格内 novideo 过的 frame：不再反复捞起白等
+    # 这两份按「本节点累计」记、不按选项卡清零：视频 frame 一旦在里面没捞到
+    # <video>，换到别的选项卡也不会好，留着只会白等。
+    # nov_frames 记「连续几次 novideo」而不是一次性判死：懒加载慢一拍很常见，
+    # v6.34 的「永久拉黑」会让多视频节点的后几张卡被误杀。
+    nov_frames = {}         # frame 身份 → 已 novideo 次数（按 frame 身份，不看 url）
+    played = []             # 本节点已确认播完的视频身份 [(obj, src), …]
     for _num in _nums:
         if _num != 0:
             try:
@@ -9609,31 +9716,34 @@ def brush_node(page, c, cpi, kid, cfg, progress, control):
                 page.wait_for_timeout(600)
             except Exception:
                 pass
+            # 挑一帧「还要刷」的：平台说未完成 **且** 这段视频本节点还没播过。
+            # played 是必须的：平台的任务点标记要等心跳（60 秒级）才翻转，
+            # 播完 3 秒内问它必然还是「未完成」——只看它就会把同一段反复重播
+            # 到外层循环上限（v6.34 真机事故，见 JS_VIDEO_ID 注释）。
             vf = None
-            for f in page.frames:
-                if 'modules/video' not in (f.url or ''):
-                    continue
-                try:
-                    if f.evaluate(JS_VIDEO_CLAIM):
-                        vf = f
-                        break
-                except Exception:
-                    continue
-            if vf is None:
-                time.sleep(2)
+            for _try in range(2):
                 for f in page.frames:
                     if 'modules/video' not in (f.url or ''):
                         continue
+                    if nov_frames.get(_frame_key(f), 0) >= 2:
+                        continue      # 连续两次都说没 <video>，这帧确实不是视频卡
                     try:
-                        if f.evaluate(JS_VIDEO_CLAIM):
-                            vf = f
-                            break
+                        if not f.evaluate(JS_VIDEO_CLAIM):
+                            continue
                     except Exception:
                         continue
+                    vid = _video_id(f)
+                    if any(_same_video(vid, p) for p in played):
+                        continue      # 这一段已经播完了，等播放器自己换下一段
+                    vf = f
+                    break
+                if vf is not None:
+                    break
+                if _try == 0:
+                    time.sleep(2)     # 懒加载慢一拍，再捞一次
             if vf is None:
                 break
-            if vf.url in nov_frames:
-                break
+            vid0 = _video_id(vf)     # 开播前记下这段视频的身份
             # 旧版在开刷前就盖 __cx_brushed 戳：一旦这帧 brush_video_frame
             # 返回 novideo（懒加载慢、<video> 15 秒没就绪很常见），这帧被
             # 永久跳过还不计数——多视频节点里第二个视频就这么被「跳过去、
@@ -9641,8 +9751,9 @@ def brush_node(page, c, cpi, kid, cfg, progress, control):
             # 下一轮扫描（含强制挂载）还能再捞起它。
             r = brush_video_frame(vf, cfg, progress, control)
             if r == 'novideo':
-                nov_frames.add(vf.url)   # 这帧真没有 <video>，别反复捞白等
-                continue
+                _fk = _frame_key(vf)
+                nov_frames[_fk] = nov_frames.get(_fk, 0) + 1
+                continue      # 连续两次都这样才算「这帧不是视频卡」，见挑选处
             try:
                 vf.evaluate("() => { window.__cx_brushed = true; }")
             except Exception:
@@ -9669,16 +9780,47 @@ def brush_node(page, c, cpi, kid, cfg, progress, control):
             if r == 'done':
                 done += 1
                 log('    ✓ 这个视频刷完了')
-                # 多段视频共用一个 iframe：播完一段播放器会自动装下一段。
-                # 清掉戳等几秒，若这帧又出现未完成视频（平台没判完成），
-                # 不盖戳、让外层循环继续刷；判了完成才盖戳收工（v6.34）。
-                try:
-                    vf.evaluate("() => { window.__cx_brushed = false; }")
-                    time.sleep(3)
-                    if not vf.evaluate(JS_VIDEO_CLAIM):
+                # ⚠ 这里以前会「清戳 → 等 3 秒 → 问平台判完没有」，理由是
+                # 「多段视频共用 iframe，播完一段要接着刷下一段」（v6.34）。
+                # 但平台的任务点标记是**心跳异步**翻的（reportTimeInterval
+                # 60 秒级），3 秒内必然是「未完成」→ 清掉的戳又被当成没刷 →
+                # 外层循环捞起同一帧、从 0 再播一遍。真机 2026-11-05 10:45：
+                # 一个 10:08 的视频连播 8 遍两个多小时，进度零增长。
+                # 现在改成按**视频身份**记账（played）：同一段播过就不再播，
+                # 播放器换来下一段（currentSrc/duration 变了）才继续刷。
+                # 拿不到身份就按 done 收工，宁可少刷也不原地打转。
+                # 认不出身份（跨源/懒加载早退）：不能往 played 里塞空身份，
+                # 否则会把这一格里**别的**视频也一起判成「已播过」。开刷前
+                # 已经盖过 __cx_brushed 戳，这一帧本身不会再被捞起，够了。
+                if not vid0[0] and not vid0[1]:
+                    continue
+                played.append(vid0)
+                # 换段要等播放器把下一段挂上来；等不到就退出这轮扫描
+                # （下一轮外层扫描还会再来看一次）。
+                nxt = vid0
+                deadline = time.time() + max(float(VIDEO_SWITCH_WAIT), 0.0)
+                while time.time() < deadline:
+                    if _wait_control(control, progress) == 'stop':
+                        return done, fail, True, {}
+                    time.sleep(min(1.0, max(float(VIDEO_SWITCH_WAIT), 0.0)))
+                    nxt = _video_id(vf)
+                    if not _same_video(nxt, vid0):
+                        break
+                if not _same_video(nxt, vid0):
+                    # 播放器自己换到下一段了 → 把本地戳清掉，让下一轮扫描
+                    # 捞起这一段接着刷（身份变了，played 里没有它）。
+                    try:
+                        vf.evaluate("() => { window.__cx_brushed = false; }")
+                    except Exception:
+                        pass
+                else:
+                    # 还是同一段（或读不到）→ 这帧没有下一段可刷了，收工盖戳。
+                    # 平台标记晚点自己会翻；盖戳是**本地**的去重，不让外层
+                    # 循环再把它捞起来重播。
+                    try:
                         vf.evaluate("() => { window.__cx_brushed = true; }")
-                except Exception:
-                    pass
+                    except Exception:
+                        pass
             elif r in ('stuck', 'timeout'):
                 fail += 1
             # 'novideo'：这卡是文档/音频之类，不算账
