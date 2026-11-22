@@ -3811,7 +3811,6 @@ async function run(action, opts){
 }
 
 function switchTab(t){
-  const wasDock = $('dockpane').style.display !== 'none';
   document.querySelectorAll('.tab').forEach(b => b.classList.toggle('on', b.dataset.t === t));
   $('viewQuery').style.display    = t === 'res' ? '' : 'none';
   $('logpane').style.display      = t === 'log' ? '' : 'none';
@@ -3819,10 +3818,13 @@ function switchTab(t){
   $('viewLink').style.display     = t === 'link' ? '' : 'none';
   $('viewSettings').style.display = t === 'settings' ? '' : 'none';
   postDockRect();
-  // 切到「预览」（或已在预览里点了别处又切回来）就把键盘焦点交给内嵌浏览器：
-  // 否则在预览里的登录页打字会落到工具侧栏的账号框（真机 2026-10-14）。
+  // 切到「预览」就把键盘焦点交给内嵌浏览器：否则在预览里的登录页打字会落到
+  // 工具侧栏的账号框（真机 2026-10-14）。v6.36：**每次**点「预览」都交一次，
+  // 不再只在「从别的页签切过来」时交——用户已经在预览页里再点一下左侧导航，
+  // 这一下会把焦点拉回 WebView2，以前 `!wasDock` 条件让这次点击白点。
+  // 预览区内部的鼠标点击由原生低层钩子接管（见 _preview_click_focus_loop）。
   // 焦点接管是「尽力而为」，面板还没矩形/还没入坞时后端会安静返回 false。
-  if (t === 'dock' && !wasDock) focusDockSoon();
+  if (t === 'dock') focusDockSoon();
 }
 // 结果页多级导航（v6.15）：切「主页面（总览）」与「任务页（进度/交卷面板）」。
 // 只动 #res 内部两个子视图的显隐，不碰 switchTab 的三页签语义——多级导航只在
@@ -6314,6 +6316,7 @@ def _wait_task(delay=0.6, timeout=10.0):
 
 def _teardown_ui():
     """「关窗口」这条路汇到这里：停服务、清记录。"""
+    _stop_preview_click_focus_hook()
     DESKTOP['win'] = None
     DESKTOP['quit'] = True
     h = DESKTOP.get('mutex')
@@ -6574,6 +6577,174 @@ def focus_docked():
     return _focus_child(docked[-1])
 
 
+def _docked_under(pt):
+    """屏幕点 (pt.x, pt.y) 是否落在当前显示的预览浏览器里；是则返回它的 hwnd。
+
+    判据与 focus_docked/_dock_layout 完全一致（面板开着 + 矩形够大 + 窗口还
+    活着），再做一次 GetWindowRect 命中测试。三者同一坐标系（物理像素）：
+    本进程是 system-DPI-aware，低层鼠标钩子给的 pt 也是物理像素。
+    """
+    import ctypes
+    from ctypes import wintypes
+    u32 = _u32()
+    with LOCK:
+        if not DESKTOP.get('mode'):
+            return 0
+        rect = DESKTOP.get('dock_rect') or {}
+        on = bool(DESKTOP.get('dock_on') and rect
+                  and rect.get('w', 0) > 4 and rect.get('h', 0) > 4)
+        docked = [h for h in DESKTOP['docked'] if u32.IsWindow(h)]
+    if not (on and docked):
+        return 0
+    h = docked[-1]
+    r = wintypes.RECT()
+    try:
+        if not u32.GetWindowRect(h, ctypes.byref(r)):
+            return 0
+    except Exception:
+        return 0
+    if not (r.left <= pt.x < r.right and r.top <= pt.y < r.bottom):
+        return 0
+    # 光看矩形不够：模态框 / 别的弹层可能盖在预览上面。取光标下真正的窗口，
+    # 沿父链确认它是预览浏览器（或它的子窗）——否则那一下点击不该算在预览头上。
+    u32.WindowFromPoint.restype = wintypes.HWND
+    u32.WindowFromPoint.argtypes = [wintypes.POINT]
+    hw = u32.WindowFromPoint(pt)
+    for _ in range(32):
+        if not hw:
+            return 0
+        if hw == h:
+            return h
+        hw = u32.GetParent(hw)
+    return 0
+
+
+# 预览点击焦点钩子的存活状态。proc 必须留引用——ctypes 回调被 GC 掉，
+# 钩子回调就成野指针，系统会静默摘钩或者直接崩进程。
+_PREVIEW_FOCUS_HOOK = {'hook': None, 'proc': None, 'thread': None, 'tid': None}
+
+
+def _preview_click_focus_loop():
+    """WH_MOUSE_LL：在预览浏览器里按下鼠标就把键盘焦点交给它（v6.36）。
+
+    真机 2026-11-22：答题页的简答框点进去有光标、字却打不进去（退格也没
+    反应），上传图片按钮倒正常。探针实测页面本身没毛病（textarea 的
+    readOnly=false，CDP 键盘能改值），坏在**OS 键盘焦点**：浏览器窗口是
+    SetParent 过来的跨进程 WS_CHILD，鼠标点进去只让 Chrome 的 DOM 起了
+    光标，Windows 的键盘焦点还留在工具的 WebView2 上，按键全被工具界面
+    吃掉。v6.10 的 _focus_child 只在「入坞那一刻 / 切预览页签」调用；用户
+    点一下工具别处（或者任务收尾把窗口提回前台）之后焦点就再也要不回来
+    ——预览区整个被原生子窗盖着，前端 #dockpane 的 mousedown 根本收不到。
+    低层钩子能看见这次点击（系统级），我们在点击投递**之前**把焦点交过
+    去，于是这次点击本身与后续按键都落在预览浏览器里。钩子只做一次屏幕
+    坐标命中测试，别处一律放行，不拦任何鼠标事件。
+
+    线程里跑消息循环（低层钩子要求）；句柄挂在 _PREVIEW_FOCUS_HOOK 上，
+    进程退出时随线程一起没。装不上就安静返回，不影响任何功能。
+    """
+    if os.name != 'nt' or _PREVIEW_FOCUS_HOOK.get('hook'):
+        return
+    import ctypes
+    from ctypes import wintypes
+    u32 = _u32()
+    WH_MOUSE_LL = 14
+    WM_LBUTTONDOWN, WM_RBUTTONDOWN, WM_MBUTTONDOWN = 0x0201, 0x0204, 0x0207
+
+    class MSLLHOOKSTRUCT(ctypes.Structure):
+        _fields_ = [('pt', wintypes.POINT), ('mouseData', wintypes.DWORD),
+                    ('flags', wintypes.DWORD), ('time', wintypes.DWORD),
+                    ('dwExtraInfo', ctypes.c_void_p)]
+
+    HOOKPROC = ctypes.WINFUNCTYPE(ctypes.c_ssize_t, ctypes.c_int,
+                                  wintypes.WPARAM, wintypes.LPARAM)
+    try:
+        u32.CallNextHookEx.restype = ctypes.c_ssize_t
+        u32.CallNextHookEx.argtypes = [ctypes.c_void_p, ctypes.c_int,
+                                       wintypes.WPARAM, wintypes.LPARAM]
+        u32.SetWindowsHookExW.restype = ctypes.c_void_p
+        u32.SetWindowsHookExW.argtypes = [ctypes.c_int, HOOKPROC,
+                                          ctypes.c_void_p, wintypes.DWORD]
+        u32.GetMessageW.argtypes = [ctypes.POINTER(wintypes.MSG),
+                                    ctypes.c_void_p, wintypes.UINT,
+                                    wintypes.UINT]
+        u32.TranslateMessage.argtypes = [ctypes.POINTER(wintypes.MSG)]
+        u32.DispatchMessageW.argtypes = [ctypes.POINTER(wintypes.MSG)]
+        k32 = ctypes.windll.kernel32
+        k32.GetModuleHandleW.restype = ctypes.c_void_p
+        hmod = k32.GetModuleHandleW(None)
+    except Exception:
+        return
+
+    def _proc(ncode, wparam, lparam):
+        try:
+            if ncode >= 0 and wparam in (WM_LBUTTONDOWN, WM_RBUTTONDOWN,
+                                         WM_MBUTTONDOWN):
+                info = ctypes.cast(lparam,
+                                   ctypes.POINTER(MSLLHOOKSTRUCT)).contents
+                h = _docked_under(info.pt)
+                if h:
+                    main = _main_hwnd()
+                    # 只在本工具是前台窗时接管：用户切到别的程序后别抢焦点
+                    if main and _is_foreground(main):
+                        _focus_child(h)
+        except Exception:
+            pass
+        return u32.CallNextHookEx(None, ncode, wparam, lparam)
+
+    proc = HOOKPROC(_proc)
+    hook = u32.SetWindowsHookExW(WH_MOUSE_LL, proc, hmod, 0)
+    if not hook:
+        return
+    _PREVIEW_FOCUS_HOOK['proc'] = proc
+    _PREVIEW_FOCUS_HOOK['hook'] = hook
+    _PREVIEW_FOCUS_HOOK['tid'] = ctypes.windll.kernel32.GetCurrentThreadId()
+    msg = wintypes.MSG()
+    try:
+        while u32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
+            u32.TranslateMessage(ctypes.byref(msg))
+            u32.DispatchMessageW(ctypes.byref(msg))
+    except Exception:
+        pass
+
+
+def _start_preview_click_focus_hook():
+    """起一条常驻线程装预览点击焦点钩子（只装一次）。"""
+    th = _PREVIEW_FOCUS_HOOK.get('thread')
+    if th is not None and th.is_alive():
+        return
+    th = threading.Thread(target=_preview_click_focus_loop,
+                          name='preview-click-focus', daemon=True)
+    _PREVIEW_FOCUS_HOOK['thread'] = th
+    th.start()
+
+
+def _stop_preview_click_focus_hook():
+    """摘钩子并让钩子线程退出（关界面时调用，别把回调留在解释器收尾阶段）。"""
+    import ctypes
+    from ctypes import wintypes
+    info = _PREVIEW_FOCUS_HOOK
+    hook, tid = info.get('hook'), info.get('tid')
+    info['hook'] = info['tid'] = None
+    # 先摘钩子再丢回调引用：顺序反了会出现「钩子还挂着、proc 已被 GC」的窗口。
+    if hook:
+        try:
+            u32 = _u32()
+            u32.UnhookWindowsHookEx.restype = ctypes.c_int
+            u32.UnhookWindowsHookEx.argtypes = [ctypes.c_void_p]
+            u32.UnhookWindowsHookEx(ctypes.c_void_p(hook))
+        except Exception:
+            pass
+    if tid:
+        try:
+            u32 = _u32()
+            u32.PostThreadMessageW.restype = ctypes.c_int
+            u32.PostThreadMessageW.argtypes = [wintypes.DWORD, wintypes.UINT,
+                                               wintypes.WPARAM, wintypes.LPARAM]
+            u32.PostThreadMessageW(tid, 0x0012, 0, 0)   # WM_QUIT
+        except Exception:
+            pass
+    info['proc'] = info['thread'] = None
+
 
 def _dock_new_windows():
     """发现新的**工具浏览器**窗口（属主 PID == 常驻浏览器 + 尚非子窗口）就嵌进预览面板。
@@ -6745,6 +6916,9 @@ def serve_desktop(port=8765):
     _write_ui_record(port)
     threading.Thread(target=_browser_keeper, name='browser-keeper',
                      daemon=True).start()
+    # 预览区是原生子窗盖着的，前端收不到 mousedown；用低层鼠标钩子把
+    # 「点进预览 → 键盘焦点交给浏览器」补上（见 _preview_click_focus_loop）。
+    _start_preview_click_focus_hook()
     cs.log('')
     cs.log('界面已就绪（%s，只监听本机）' % url)
     cs.log('用完退出：直接关掉这个窗口（右上角 ×）。')
